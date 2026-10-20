@@ -399,7 +399,10 @@ local function waitForResetWall(token)
 
 	print("[Auto_SAE] Mur de départ fermé : attente de son ouverture.")
 
-	while token == navigationToken and wallIsClosed(wall) do
+	while token == navigationToken and autoEnabled do
+		if not wallIsClosed(wall) then
+			break
+		end
 		RunService.Heartbeat:Wait()
 	end
 
@@ -570,20 +573,22 @@ local function activateEggPrompt(record, eggPosition, token)
 	activePrompt = prompt
 
 	print(string.format(
-		"[Auto_SAE] Activation du prompt de l'œuf | UID: %s | HoldDuration: %.1f | MaxDistance: %.1f",
-		record.Uid,
-		prompt.HoldDuration,
-		prompt.MaxActivationDistance
+		"[Auto_SAE] Déclenchement fireproximityprompt | UID: %s",
+		record.Uid
 	))
 
-	prompt:InputHoldBegin()
-	task.wait(math.max(prompt.HoldDuration, 0.05))
-
-	if activePrompt == prompt then
-		prompt:InputHoldEnd()
-		activePrompt = nil
+	-- Utilisation de fireproximityprompt
+	if fireproximityprompt then
+		fireproximityprompt(prompt)
+	else
+		prompt:InputHoldBegin()
+		task.wait(math.max(prompt.HoldDuration, 0.05))
+		if activePrompt == prompt then
+			prompt:InputHoldEnd()
+		end
 	end
 
+	activePrompt = nil
 	return token == navigationToken and autoEnabled
 end
 
@@ -789,7 +794,9 @@ local function stopAutomation()
 	activeUid = nil
 
 	if activePrompt then
-		activePrompt:InputHoldEnd()
+		if not fireproximityprompt then
+			activePrompt:InputHoldEnd()
+		end
 		activePrompt = nil
 	end
 
