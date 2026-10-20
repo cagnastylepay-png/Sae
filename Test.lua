@@ -8,10 +8,12 @@ local player = Players.LocalPlayer
 local SLOT_STATE = "Slot"
 local CARRY_PROMPT_NAME = "CarryAreaEgg"
 local PROMPT_SEARCH_RADIUS = 18
-local PROMPT_SEARCH_ATTEMPTS = 40
-local MOVE_ARRIVAL_DISTANCE = 0.25
-local MOVE_FINAL_CORRECTION_DISTANCE = 1.5
-local MOVE_REFRESH_SECONDS = 0.05
+local PROMPT_ACTIVATION_ATTEMPTS = 40
+local POSITION_ARRIVAL_DISTANCE = 4.5
+local EGG_ACTIVATION_DISTANCE = 2
+local PROMPT_DISPLAY_DISTANCE = 30
+local EGG_CORRECTION_SPEED = 35
+local EGG_MOVE_REFRESH_SECONDS = 0.1
 local MINIMUM_BILLIONS = 0.1
 local MAXIMUM_BILLIONS = 999
 local DEFAULT_BILLIONS = 2
@@ -89,6 +91,57 @@ local function configureEggPrompt(prompt)
 		and prompt.Name == CARRY_PROMPT_NAME
 		and isInsideEggPromptRoot(prompt)
 end
+
+local function setEggPromptDisplayDistance(prompt)
+	if not configureEggPrompt(prompt) then
+		return false
+	end
+
+	prompt.MaxActivationDistance = PROMPT_DISPLAY_DISTANCE
+	return true
+end
+
+local function configureAllEggPrompts()
+	local configured = 0
+	local renderedFolder = Workspace:FindFirstChild("AreaEggSlotsClient")
+
+	if renderedFolder then
+		for _, descendant in ipairs(renderedFolder:GetDescendants()) do
+			if setEggPromptDisplayDistance(descendant) then
+				configured += 1
+			end
+		end
+	end
+
+	for _, workspaceChild in ipairs(Workspace:GetChildren()) do
+		if workspaceChild.Name == "SmartPromptPart" then
+			for _, descendant in ipairs(workspaceChild:GetDescendants()) do
+				if setEggPromptDisplayDistance(descendant) then
+					configured += 1
+				end
+			end
+		end
+	end
+
+	return configured
+end
+
+Workspace.DescendantAdded:Connect(function(instance)
+	if instance:IsA("ProximityPrompt") and instance.Name == CARRY_PROMPT_NAME then
+		task.defer(function()
+			setEggPromptDisplayDistance(instance)
+		end)
+	end
+end)
+
+task.defer(function()
+	local configured = configureAllEggPrompts()
+	print(string.format(
+		"[Auto_SAE] %d prompt(s) d'œuf configuré(s) à %.0f studs.",
+		configured,
+		PROMPT_DISPLAY_DISTANCE
+	))
+end)
 
 local clientFolder = ReplicatedStorage:WaitForChild("Client", 10)
 local dataFolder = ReplicatedStorage:WaitForChild("Data", 10)
@@ -262,27 +315,20 @@ local function getEggPosition(record)
 	return nil, nil
 end
 
-local function popNearestQueueEntry()
-	local _, _, rootPart = getCharacterParts()
-	if not rootPart then
-		return table.remove(recordQueue, 1)
-	end
-
-	local origin = rootPart.Position
-	local nearestIndex = 1
-	local nearestDistance = math.huge
+local function popHighestRateQueueEntry()
+	local highestIndex = 1
+	local highestRate = -math.huge
 
 	for index, queueEntry in ipairs(recordQueue) do
-		local position = getEggPosition(queueEntry.Record)
-		local distance = position and (position - origin).Magnitude or math.huge
+		local rate = tonumber(queueEntry.Rate) or -math.huge
 
-		if distance < nearestDistance then
-			nearestDistance = distance
-			nearestIndex = index
+		if rate > highestRate then
+			highestRate = rate
+			highestIndex = index
 		end
 	end
 
-	return table.remove(recordQueue, nearestIndex)
+	return table.remove(recordQueue, highestIndex)
 end
 
 local function resolveResetWall()
@@ -339,63 +385,7 @@ local function moveDirect(destination, token, destinationLabel)
 	end
 
 	print(string.format(
-		"[Auto_SAE] Déplacement direct vers %s : %s.",
-		destinationLabel,
-		formatPosition(destination)
-	))
-
-	local lastMoveCommand = -math.huge
-
-	while token == navigationToken and autoEnabled do
-		if humanoid.Health <= 0 or not rootPart.Parent then
-			return false
-		end
-
-		local offset = destination - rootPart.Position
-		local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
-		local distance = horizontalOffset.Magnitude
-
-		if distance <= MOVE_ARRIVAL_DISTANCE then
-			humanoid:Move(Vector3.zero)
-			return true
-		end
-
-		if distance <= MOVE_FINAL_CORRECTION_DISTANCE then
-			local rotation = rootPart.CFrame - rootPart.Position
-			local verticalVelocity = rootPart.AssemblyLinearVelocity.Y
-
-			humanoid:Move(Vector3.zero)
-			rootPart.AssemblyLinearVelocity = Vector3.new(0, verticalVelocity, 0)
-			rootPart.CFrame = CFrame.new(
-				destination.X,
-				rootPart.Position.Y,
-				destination.Z
-			) * rotation
-			return true
-		end
-
-		local now = os.clock()
-		if now - lastMoveCommand >= MOVE_REFRESH_SECONDS then
-			humanoid:MoveTo(destination)
-			lastMoveCommand = now
-		end
-
-		RunService.Heartbeat:Wait()
-	end
-
-	return false
-end
-
-local function moveToThenPivot(destination, token, destinationLabel)
-	local character, humanoid, rootPart = getCharacterParts()
-
-	if not character or not humanoid or not rootPart then
-		warn("[Auto_SAE] Personnage ou HumanoidRootPart introuvable.")
-		return false
-	end
-
-	print(string.format(
-		"[Auto_SAE] MoveTo puis PivotTo vers %s : %s.",
+		"[Auto_SAE] MoveTo rapide vers %s : %s.",
 		destinationLabel,
 		formatPosition(destination)
 	))
@@ -407,20 +397,166 @@ local function moveToThenPivot(destination, token, destinationLabel)
 		return false
 	end
 
-	character, humanoid, rootPart = getCharacterParts()
-	if not character or not humanoid or not rootPart or humanoid.Health <= 0 then
+	local offsetAfterMove = destination - rootPart.Position
+	local distanceAfterMove = Vector3.new(offsetAfterMove.X, 0, offsetAfterMove.Z).Magnitude
+
+	if distanceAfterMove <= POSITION_ARRIVAL_DISTANCE then
+		humanoid:Move(Vector3.zero)
+		return true
+	end
+
+	local speedToRestore = humanoid.WalkSpeed
+	humanoid.WalkSpeed = math.min(speedToRestore, EGG_CORRECTION_SPEED)
+	local lastMoveCommand = -math.huge
+
+	print(string.format(
+		"[Auto_SAE] Ajustement retour à %.0f studs/s, distance restante : %.1f studs.",
+		humanoid.WalkSpeed,
+		distanceAfterMove
+	))
+
+	local function restoreSpeed()
+		if humanoid.Parent then
+			humanoid.WalkSpeed = speedToRestore
+		end
+	end
+
+	while token == navigationToken and autoEnabled do
+		if humanoid.Health <= 0 or not rootPart.Parent then
+			restoreSpeed()
+			return false
+		end
+
+		local offset = destination - rootPart.Position
+		local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
+
+		if distance <= POSITION_ARRIVAL_DISTANCE then
+			humanoid:Move(Vector3.zero)
+			restoreSpeed()
+			return true
+		end
+
+		local now = os.clock()
+		if now - lastMoveCommand >= EGG_MOVE_REFRESH_SECONDS then
+			humanoid:MoveTo(destination)
+			lastMoveCommand = now
+		end
+
+		RunService.Heartbeat:Wait()
+	end
+
+	humanoid:Move(Vector3.zero)
+	restoreSpeed()
+	return false
+end
+
+local function moveUntilPromptShown(destination, prompt, token, destinationLabel)
+	local _, humanoid, rootPart = getCharacterParts()
+
+	if not humanoid or not rootPart or not configureEggPrompt(prompt) or not prompt.Parent then
+		warn("[Auto_SAE] Personnage, HumanoidRootPart ou prompt indisponible.")
 		return false
 	end
 
-	local rotation = rootPart.CFrame - rootPart.Position
-	humanoid:Move(Vector3.zero)
-	character:PivotTo(CFrame.new(
-		destination.X,
-		destination.Y,
-		destination.Z
-	) * rotation)
+	print(string.format(
+		"[Auto_SAE] MoveTo rapide vers %s en attendant PromptShown : %s.",
+		destinationLabel,
+		formatPosition(destination)
+	))
 
-	return true
+	local promptShown = false
+	local moveFinished = false
+	local shownConnection = prompt.PromptShown:Connect(function()
+		promptShown = true
+	end)
+	local moveConnection = humanoid.MoveToFinished:Connect(function()
+		moveFinished = true
+	end)
+
+	local function disconnectEvents()
+		shownConnection:Disconnect()
+		moveConnection:Disconnect()
+	end
+
+	setEggPromptDisplayDistance(prompt)
+	RunService.Heartbeat:Wait()
+
+	local promptParent = prompt.Parent
+	local promptPosition = nil
+
+	if promptParent:IsA("Attachment") then
+		promptPosition = promptParent.WorldPosition
+	elseif promptParent:IsA("BasePart") then
+		promptPosition = promptParent.Position
+	end
+
+	if promptPosition
+		and (promptPosition - rootPart.Position).Magnitude <= prompt.MaxActivationDistance + 1 then
+		promptShown = true
+	end
+
+	humanoid:MoveTo(destination)
+
+	while token == navigationToken
+		and autoEnabled
+		and prompt.Parent
+		and not promptShown
+		and not moveFinished do
+		RunService.Heartbeat:Wait()
+	end
+
+	if token ~= navigationToken or not autoEnabled or not prompt.Parent then
+		disconnectEvents()
+		return false
+	end
+
+	local speedToRestore = humanoid.WalkSpeed
+	humanoid.WalkSpeed = math.min(speedToRestore, EGG_CORRECTION_SPEED)
+	local lastMoveCommand = -math.huge
+
+	print(string.format(
+		"[Auto_SAE] Approche finale de l'œuf à %.0f studs/s.",
+		humanoid.WalkSpeed
+	))
+
+	local function restoreSpeed()
+		if humanoid.Parent then
+			humanoid.WalkSpeed = speedToRestore
+		end
+	end
+
+	while token == navigationToken and autoEnabled and prompt.Parent do
+		if humanoid.Health <= 0 or not rootPart.Parent then
+			restoreSpeed()
+			disconnectEvents()
+			return false
+		end
+
+		local offset = destination - rootPart.Position
+		local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
+
+		if promptShown and distance <= EGG_ACTIVATION_DISTANCE then
+			humanoid:Move(Vector3.zero)
+			humanoid:MoveTo(rootPart.Position)
+			restoreSpeed()
+			disconnectEvents()
+			print("[Auto_SAE] PromptShown confirmé et distance d'activation atteinte.")
+			return true
+		end
+
+		local now = os.clock()
+		if now - lastMoveCommand >= EGG_MOVE_REFRESH_SECONDS then
+			humanoid:MoveTo(destination)
+			lastMoveCommand = now
+		end
+
+		RunService.Heartbeat:Wait()
+	end
+
+	humanoid:Move(Vector3.zero)
+	restoreSpeed()
+	disconnectEvents()
+	return false
 end
 
 local function getPromptPosition(prompt)
@@ -443,7 +579,7 @@ local function getPromptPosition(prompt)
 end
 
 local function promptIsUsable(prompt, rootPosition)
-	if not configureEggPrompt(prompt) or not prompt.Enabled then
+	if not setEggPromptDisplayDistance(prompt) or not prompt.Enabled then
 		return false
 	end
 
@@ -465,7 +601,7 @@ local function findCarryPromptNearEgg(record, eggPosition)
 	local cacheKey = promptSlotKey(eggPosition)
 	local cachedPrompt = promptCacheBySlot[cacheKey]
 
-	if configureEggPrompt(cachedPrompt)
+	if setEggPromptDisplayDistance(cachedPrompt)
 		and cachedPrompt.Enabled
 		and cachedPrompt.Parent then
 		local cachedPosition = getPromptPosition(cachedPrompt)
@@ -525,14 +661,25 @@ local function findCarryPromptNearEgg(record, eggPosition)
 end
 
 local function waitForCarryPromptNearEgg(record, eggPosition, token)
-	for _ = 1, PROMPT_SEARCH_ATTEMPTS do
-		if token ~= navigationToken or not autoEnabled then
-			return nil
-		end
+	local waitingLogged = false
 
+	while token == navigationToken and autoEnabled do
 		local prompt = findCarryPromptNearEgg(record, eggPosition)
 		if prompt then
 			return prompt
+		end
+
+		if not waitingLogged then
+			waitingLogged = true
+			print(string.format(
+				"[Auto_SAE] Prompt de %s pas encore rendu : attente de son SmartPromptPart.",
+				record.Uid
+			))
+		end
+
+		local readOk, currentRecord = pcall(EggState.ReadFieldEgg, record.Uid)
+		if readOk and (currentRecord == nil or currentRecord.State ~= SLOT_STATE) then
+			return nil
 		end
 
 		task.wait(0.1)
@@ -549,7 +696,7 @@ local function fireprompt(prompt)
 
 	for attempt = 1, 3 do
 		if not autoEnabled or not prompt.Parent or not prompt.Enabled then
-			return attempt > 1
+			return false
 		end
 
 		local triggered = false
@@ -592,7 +739,7 @@ local function fireprompt(prompt)
 		RunService.Heartbeat:Wait()
 		connection:Disconnect()
 
-		if triggered or not prompt.Parent or not prompt.Enabled then
+		if triggered then
 			print(string.format("[Auto_SAE] Prompt activé à la tentative %d.", attempt))
 			return true
 		end
@@ -605,7 +752,7 @@ local function fireprompt(prompt)
 end
 
 local function activateEggPrompt(record, prompt, token)
-	for _ = 1, PROMPT_SEARCH_ATTEMPTS do
+	for _ = 1, PROMPT_ACTIVATION_ATTEMPTS do
 		if token ~= navigationToken or not autoEnabled then
 			return false
 		end
@@ -683,19 +830,17 @@ local function runEgg(record, rate)
 			eggPosition.Z
 		)
 
-		if moveToThenPivot(eggDestination, token, "la zone de l'œuf") then
-			local prompt = waitForCarryPromptNearEgg(record, eggPosition, token)
+		local prompt = waitForCarryPromptNearEgg(record, eggPosition, token)
 
-			if not prompt then
-				warn(string.format("[Auto_SAE] Prompt %s introuvable près de %s pour %s.", CARRY_PROMPT_NAME, formatPosition(eggPosition), record.Uid))
-			else
-				promptActivated = activateEggPrompt(record, prompt, token)
-				task.wait(0.15)
-			end
+		if not prompt then
+			warn(string.format("[Auto_SAE] Prompt %s introuvable près de %s pour %s.", CARRY_PROMPT_NAME, formatPosition(eggPosition), record.Uid))
+		elseif moveUntilPromptShown(eggDestination, prompt, token, "la zone de l'œuf") then
+			promptActivated = activateEggPrompt(record, prompt, token)
+			task.wait(0.15)
 		end
 	end
 
-	if token == navigationToken and autoEnabled then
+	if promptActivated and token == navigationToken and autoEnabled then
 		local returned = moveDirect(savedStartPosition, token, "la position de départ mémorisée")
 
 		if returned then
@@ -730,7 +875,7 @@ local function processQueue()
 
 	task.spawn(function()
 		while autoEnabled and #recordQueue > 0 do
-			local queueEntry = popNearestQueueEntry()
+			local queueEntry = popHighestRateQueueEntry()
 			local record = queueEntry.Record
 			queuedUids[record.Uid] = nil
 
