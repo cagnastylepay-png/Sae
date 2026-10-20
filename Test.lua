@@ -1,4 +1,3 @@
-local CollectionService = game:GetService("CollectionService")
 local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -16,6 +15,7 @@ local SLOT_STATE = "Slot"
 local APPROACH_DISTANCE = 5
 local PROMPT_SEARCH_RADIUS = 14
 local PROMPT_SEARCH_ATTEMPTS = 40
+local MAX_PATH_SEGMENT_DISTANCE = 450
 
 local navigationToken = 0
 local activePrompt = nil
@@ -41,6 +41,84 @@ local function getCharacterParts()
 	end
 
 	return character, character:FindFirstChildOfClass("Humanoid"), character:FindFirstChild("HumanoidRootPart")
+end
+
+local function createPositionOverhead(character)
+	local head = character:WaitForChild("Head", 10)
+	local root = character:WaitForChild("HumanoidRootPart", 10)
+
+	if not head or not root then
+		return
+	end
+
+	local previous = head:FindFirstChild("AutoSAE_PositionOverhead")
+	if previous then
+		previous:Destroy()
+	end
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "AutoSAE_PositionOverhead"
+	billboard.Adornee = head
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.MaxDistance = 250
+	billboard.Size = UDim2.fromOffset(310, 42)
+	billboard.StudsOffsetWorldSpace = Vector3.new(0, 3.25, 0)
+	billboard.Parent = head
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Position"
+	label.BackgroundColor3 = Color3.fromRGB(12, 18, 28)
+	label.BackgroundTransparency = 0.2
+	label.BorderSizePixel = 0
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBold
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.TextSize = 18
+	label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+	label.TextStrokeTransparency = 0
+	label.Parent = billboard
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = label
+
+	local function updateText()
+		local position = root.Position
+		label.Text = string.format(
+			"X: %.1f   Y: %.1f   Z: %.1f",
+			position.X,
+			position.Y,
+			position.Z
+		)
+	end
+
+	updateText()
+
+	local elapsed = 0
+	local connection
+	connection = RunService.RenderStepped:Connect(function(deltaTime)
+		if player.Character ~= character or not root.Parent or not billboard.Parent then
+			connection:Disconnect()
+			return
+		end
+
+		elapsed += deltaTime
+		if elapsed < 0.1 then
+			return
+		end
+
+		elapsed = 0
+		updateText()
+	end)
+end
+
+player.CharacterAdded:Connect(function(character)
+	task.spawn(createPositionOverhead, character)
+end)
+
+if player.Character then
+	task.spawn(createPositionOverhead, player.Character)
 end
 
 local clientFolder = ReplicatedStorage:WaitForChild("Client", 10)
@@ -112,89 +190,6 @@ local function getEggPosition(record)
 	return nil, nil
 end
 
-local function getTreadmillPosition(treadmill)
-	if not treadmill or not treadmill.Parent then
-		return nil
-	end
-
-	local slot = string.match(treadmill.Name, "^TreadmillRender_(.+)$")
-	local plots = Workspace:FindFirstChild("Plots")
-	local plot = slot and plots and plots:FindFirstChild(slot)
-	local treadmillBottom = plot and plot:FindFirstChild("TreadmillBottom")
-
-	if treadmillBottom and treadmillBottom:IsA("BasePart") then
-		return treadmillBottom.Position + Vector3.new(0, 0.25, 0)
-	end
-
-	if treadmill:IsA("BasePart") then
-		return treadmill.Position + treadmill.CFrame.UpVector * (treadmill.Size.Y * 0.5 + 0.25)
-	end
-
-	if treadmill:IsA("Model") then
-		local success, boundingCFrame, boundingSize = pcall(treadmill.GetBoundingBox, treadmill)
-
-		if success then
-			return boundingCFrame.Position + Vector3.new(0, boundingSize.Y * 0.5 + 0.25, 0)
-		end
-	end
-
-	local root = treadmill:FindFirstChild("Root", true)
-
-	if root and root:IsA("BasePart") then
-		return root.Position + root.CFrame.UpVector * (root.Size.Y * 0.5 + 0.25)
-	end
-
-	local handle = treadmill:FindFirstChild("Handle", true)
-
-	if handle and handle:IsA("BasePart") then
-		return handle.Position + handle.CFrame.UpVector * (handle.Size.Y * 0.5 + 0.25)
-	end
-
-	return nil
-end
-
-local function findActiveTreadmill(rootPosition)
-	local bestTreadmill
-	local bestDistance = math.huge
-
-	for _, treadmill in ipairs(CollectionService:GetTagged("ActiveTreadmill")) do
-		if not treadmill:IsDescendantOf(Workspace) then
-			continue
-		end
-
-		local position = getTreadmillPosition(treadmill)
-		if not position then
-			continue
-		end
-
-		local distance = (
-			Vector3.new(position.X, 0, position.Z)
-			- Vector3.new(rootPosition.X, 0, rootPosition.Z)
-		).Magnitude
-
-		if distance < bestDistance then
-			bestDistance = distance
-			bestTreadmill = treadmill
-		end
-	end
-
-	return bestTreadmill
-end
-
-local function resolveTreadmillReturnPosition(preferredTreadmill, rootPosition)
-	local treadmill = preferredTreadmill
-
-	if not treadmill or not treadmill.Parent then
-		treadmill = findActiveTreadmill(rootPosition)
-	end
-
-	if not treadmill then
-		return nil, nil
-	end
-
-	return getTreadmillPosition(treadmill), treadmill
-end
-
 local function calculateApproachGoal(rootPosition, eggPosition)
 	local direction = Vector3.new(
 		rootPosition.X - eggPosition.X,
@@ -211,7 +206,7 @@ local function calculateApproachGoal(rootPosition, eggPosition)
 	return eggPosition + direction * APPROACH_DISTANCE
 end
 
-local function walkPath(destination, token, destinationLabel)
+local function followPathSegment(destination, token, destinationLabel, segmentIndex)
 	local _, humanoid, rootPart = getCharacterParts()
 
 	if not humanoid or not rootPart then
@@ -232,13 +227,19 @@ local function walkPath(destination, token, destinationLabel)
 	end)
 
 	if not success then
-		warn("[Auto_SAE] Calcul du chemin impossible:", errorMessage)
+		warn(string.format(
+			"[Auto_SAE] Calcul du segment %d impossible vers %s: %s",
+			segmentIndex,
+			destinationLabel,
+			tostring(errorMessage)
+		))
 		return false
 	end
 
 	if path.Status ~= Enum.PathStatus.Success then
 		warn(string.format(
-			"[Auto_SAE] Aucun chemin valide vers %s à %s.",
+			"[Auto_SAE] Aucun chemin valide pour le segment %d vers %s à %s.",
+			segmentIndex,
 			destinationLabel,
 			formatPosition(destination)
 		))
@@ -261,12 +262,92 @@ local function walkPath(destination, token, destinationLabel)
 		humanoid:MoveTo(waypoint.Position)
 
 		if not humanoid.MoveToFinished:Wait() then
-			warn(string.format("[Auto_SAE] Trajet interrompu vers %s.", destinationLabel))
+			warn(string.format(
+				"[Auto_SAE] Segment %d interrompu vers %s.",
+				segmentIndex,
+				destinationLabel
+			))
 			return false
 		end
 	end
 
 	return token == navigationToken
+end
+
+local function walkPath(destination, token, destinationLabel)
+	local segmentIndex = 0
+	local announcedLongRoute = false
+
+	while token == navigationToken do
+		local _, humanoid, rootPart = getCharacterParts()
+
+		if not humanoid or not rootPart then
+			return false
+		end
+
+		local currentPosition = rootPart.Position
+		local delta = destination - currentPosition
+		local remainingDistance = delta.Magnitude
+		local isFinalSegment = remainingDistance <= MAX_PATH_SEGMENT_DISTANCE
+
+		if not announcedLongRoute and not isFinalSegment then
+			announcedLongRoute = true
+			print(string.format(
+				"[Auto_SAE] Long trajet vers %s découpé en segments de %.0f studs.",
+				destinationLabel,
+				MAX_PATH_SEGMENT_DISTANCE
+			))
+		end
+
+		local segmentDestination
+
+		if isFinalSegment then
+			-- La destination finale conserve exactement le Y demandé.
+			segmentDestination = destination
+		else
+			local rawDestination = currentPosition + delta.Unit * MAX_PATH_SEGMENT_DISTANCE
+
+			-- Les sous-destinations gardent le Y actuel.
+			segmentDestination = Vector3.new(
+				rawDestination.X,
+				currentPosition.Y,
+				rawDestination.Z
+			)
+		end
+
+		segmentIndex += 1
+		local positionBeforeSegment = currentPosition
+
+		if not followPathSegment(
+			segmentDestination,
+			token,
+			destinationLabel,
+			segmentIndex
+		) then
+			return false
+		end
+
+		if isFinalSegment then
+			return token == navigationToken
+		end
+
+		local _, _, updatedRoot = getCharacterParts()
+
+		if not updatedRoot then
+			return false
+		end
+
+		if (updatedRoot.Position - positionBeforeSegment).Magnitude < 2 then
+			warn(string.format(
+				"[Auto_SAE] Aucun progrès sur le segment %d vers %s.",
+				segmentIndex,
+				destinationLabel
+			))
+			return false
+		end
+	end
+
+	return false
 end
 
 local function getPromptPosition(prompt)
@@ -404,39 +485,27 @@ local function activateEggPrompt(record, eggPosition, token)
 	return token == navigationToken
 end
 
-local function returnToTreadmill(treadmill, token)
-	local _, _, rootPart = getCharacterParts()
-
-	if not rootPart then
-		return false
-	end
-
-	local returnPosition, resolvedTreadmill = resolveTreadmillReturnPosition(
-		treadmill,
-		rootPart.Position
-	)
-
-	if not returnPosition or not resolvedTreadmill then
-		warn("[Auto_SAE] Le tapis ActiveTreadmill est introuvable pour le retour.")
+local function returnToStartPosition(returnPosition, token)
+	if typeof(returnPosition) ~= "Vector3" then
+		warn("[Auto_SAE] Position de retour absente.")
 		return false
 	end
 
 	print(string.format(
-		"[Auto_SAE] Retour vers %s à %s.",
-		resolvedTreadmill:GetFullName(),
+		"[Auto_SAE] Retour vers la position mémorisée %s.",
 		formatPosition(returnPosition)
 	))
 
-	local returned = walkPath(returnPosition, token, "le tapis roulant")
+	local returned = walkPath(returnPosition, token, "la position de départ")
 
 	if returned then
-		print("[Auto_SAE] Retour sur le tapis roulant terminé.")
+		print("[Auto_SAE] Retour à la position de départ terminé.")
 	end
 
 	return returned
 end
 
-local function runEgg(record, rarity)
+local function runEgg(record, rarity, detectedPosition)
 	local _, humanoid, rootPart = getCharacterParts()
 
 	if not humanoid or not rootPart then
@@ -444,12 +513,10 @@ local function runEgg(record, rarity)
 		return false
 	end
 
-	local treadmill = findActiveTreadmill(rootPart.Position)
-
-	if not treadmill then
-		warn("[Auto_SAE] Aucun objet portant le tag ActiveTreadmill n'a été trouvé.")
-		return false
-	end
+	-- Conserve le Vector3 exact détecté, Y compris.
+	local returnPosition = typeof(detectedPosition) == "Vector3"
+		and detectedPosition
+		or rootPart.Position
 
 	local eggPosition = getEggPosition(record)
 
@@ -462,15 +529,12 @@ local function runEgg(record, rarity)
 	local token = navigationToken
 
 	print(string.format(
-		"[Auto_SAE] Egg détecté | UID: %s | Rareté: %s | Position: %s",
+		"[Auto_SAE] Egg détecté | UID: %s | Rareté: %s | Position: %s | Retour: %s",
 		record.Uid,
 		rarity,
-		formatPosition(eggPosition)
+		formatPosition(eggPosition),
+		formatPosition(returnPosition)
 	))
-
-	humanoid.Jump = true
-	humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-	task.wait(0.15)
 
 	local promptActivated = false
 	local _, _, currentRoot = getCharacterParts()
@@ -486,7 +550,7 @@ local function runEgg(record, rarity)
 	end
 
 	if token == navigationToken then
-		returnToTreadmill(treadmill, token)
+		returnToStartPosition(returnPosition, token)
 	end
 
 	return promptActivated
@@ -516,7 +580,8 @@ local function processQueue()
 
 	task.spawn(function()
 		while #recordQueue > 0 do
-			local record = table.remove(recordQueue, 1)
+			local queueEntry = table.remove(recordQueue, 1)
+			local record = queueEntry.Record
 			queuedUids[record.Uid] = nil
 
 			local latestRecord = EggState.ReadFieldEgg(record.Uid)
@@ -525,7 +590,7 @@ local function processQueue()
 			if eligible then
 				activeUid = latestRecord.Uid
 
-				if runEgg(latestRecord, rarity) then
+				if runEgg(latestRecord, rarity, queueEntry.ReturnPosition) then
 					successfulVersions[latestRecord.Uid] = versionKey(latestRecord)
 				end
 
@@ -553,13 +618,20 @@ local function enqueueRecord(record)
 		return
 	end
 
+	local _, _, rootPart = getCharacterParts()
+	local returnPosition = rootPart and rootPart.Position or nil
+
 	queuedUids[uid] = true
-	table.insert(recordQueue, record)
+	table.insert(recordQueue, {
+		Record = record,
+		ReturnPosition = returnPosition,
+	})
 
 	print(string.format(
-		"[Auto_SAE] Cible ajoutée | UID: %s | Rareté: %s",
+		"[Auto_SAE] Cible ajoutée | UID: %s | Rareté: %s | Retour: %s",
 		uid,
-		rarity
+		rarity,
+		returnPosition and formatPosition(returnPosition) or "en attente du personnage"
 	))
 
 	processQueue()
