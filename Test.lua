@@ -1,100 +1,156 @@
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PathfindingService = game:GetService("PathfindingService")
+local Players = game:GetService("Players")
 
-local EggState = require(ReplicatedStorage.Client.EggState)
-local Assets = require(ReplicatedStorage.Data.Assets)
+local Auto_SAE = {}
 
-local eggCache = {}
+local LOGGED_RARITIES = {
+	Divine = true,
+	Eternal = true,
+	Secret = true,
+}
 
-local function getRarity(assetCategory)
-	local asset = Assets.Directory[assetCategory]
+local APPROACH_DISTANCE = 2
+local navigationToken = 0
 
-	if asset and asset.Rarity then
-		return asset.Rarity._id
-	end
-
-	return "Unknown"
+local function formatPosition(position)
+	return string.format(
+		"(%.1f, %.1f, %.1f)",
+		position.X,
+		position.Y,
+		position.Z
+	)
 end
 
-local function getPosition(record)
-	-- Position enregistrée dans EggState
-	if typeof(record.BottomCFrame) == "CFrame" then
-		return record.BottomCFrame.Position
+local function getCharacterParts()
+	local player = Players.LocalPlayer
+	if not player then
+		return nil, nil
 	end
 
-	-- Recherche du modèle 3D correspondant à l'UID
-	local model = workspace:FindFirstChild(record.Uid, true)
-
-	if model and model:IsA("Model") then
-		return model:GetPivot().Position
+	local character = player.Character
+	if not character then
+		return nil, nil
 	end
 
-	return nil
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+
+	return humanoid, rootPart
 end
 
-local function logEgg(changeType, record)
-	local position = getPosition(record)
+local function calculateGoal(rootPosition, eggPosition)
+	local direction = Vector3.new(
+		rootPosition.X - eggPosition.X,
+		0,
+		rootPosition.Z - eggPosition.Z
+	)
 
-	local positionText = position
-		and string.format(
-			"(%.1f, %.1f, %.1f)",
-			position.X,
-			position.Y,
-			position.Z
-		)
-		or "Inconnue"
+	if direction.Magnitude < 0.1 then
+		direction = Vector3.new(0, 0, 1)
+	else
+		direction = direction.Unit
+	end
 
-	local rarity = getRarity(record.AssetCategory)
-	local biome = record.AreaId or "Unknown"
-	local nest = record.NestId or "Unknown"
+	return eggPosition + direction * APPROACH_DISTANCE
+end
+
+local function followPath(eggPosition, token)
+	local humanoid, rootPart = getCharacterParts()
+	if not humanoid or not rootPart then
+		warn("[Auto_SAE] Personnage ou HumanoidRootPart introuvable.")
+		return
+	end
+
+	local goalPosition = calculateGoal(rootPart.Position, eggPosition)
+
+	local path = PathfindingService:CreatePath({
+		AgentRadius = 2,
+		AgentHeight = 5,
+		AgentCanJump = true,
+		AgentCanClimb = true,
+		WaypointSpacing = 4,
+	})
+
+	local success, errorMessage = pcall(function()
+		path:ComputeAsync(rootPart.Position, goalPosition)
+	end)
+
+	if not success then
+		warn("[Auto_SAE] Calcul du chemin impossible:", errorMessage)
+		return
+	end
+
+	if path.Status ~= Enum.PathStatus.Success then
+		warn(string.format(
+			"[Auto_SAE] Aucun chemin valide vers %s.",
+			formatPosition(eggPosition)
+		))
+		return
+	end
+
+	for _, waypoint in ipairs(path:GetWaypoints()) do
+		if token ~= navigationToken then
+			return
+		end
+
+		if humanoid.Health <= 0 or not rootPart.Parent then
+			return
+		end
+
+		if waypoint.Action == Enum.PathWaypointAction.Jump then
+			humanoid.Jump = true
+		end
+
+		humanoid:MoveTo(waypoint.Position)
+
+		local reached = humanoid.MoveToFinished:Wait()
+		if not reached then
+			warn("[Auto_SAE] Trajet interrompu avant l'œuf.")
+			return
+		end
+	end
 
 	print(string.format(
-		"[EggChange] %s | UID: %s | Rarity: %s | Biome: %s | Nest: %s | Position: %s",
-		changeType,
-		record.Uid,
-		rarity,
-		biome,
-		nest,
-		positionText
+		"[Auto_SAE] Arrivé près de l'œuf à %s.",
+		formatPosition(eggPosition)
 	))
 end
 
-local function registerEgg(changeType, record)
-	eggCache[record.Uid] = record
-	logEgg(changeType, record)
+function Auto_SAE.OnEggDetected(rarity, position)
+	if not LOGGED_RARITIES[rarity] then
+		return false
+	end
+
+	if typeof(position) == "CFrame" then
+		position = position.Position
+	end
+
+	if typeof(position) ~= "Vector3" then
+		warn("[Auto_SAE] Position invalide pour l'œuf", rarity)
+		return false
+	end
+
+	print(string.format(
+		"[Auto_SAE] Egg detected | Rarity: %s | Position: %s",
+		rarity,
+		formatPosition(position)
+	))
+
+	navigationToken += 1
+	local token = navigationToken
+
+	task.spawn(followPath, position, token)
+
+	return true
 end
 
--- Nouvelle liste complète reçue
-EggState.FieldRefreshed:Connect(function(snapshot)
-	table.clear(eggCache)
+function Auto_SAE.CancelNavigation()
+	navigationToken += 1
 
-	for _, record in ipairs(snapshot.Records or {}) do
-		registerEgg("REFRESHED", record)
+	local humanoid, rootPart = getCharacterParts()
+	if humanoid and rootPart then
+		humanoid:MoveTo(rootPart.Position)
 	end
-end)
-
--- Œuf apparu, déplacé ou modifié
-EggState.FieldShifted:Connect(function(record)
-	registerEgg("SHIFTED", record)
-end)
-
--- Œuf retiré du terrain
-EggState.FieldGone:Connect(function(uid)
-	local record = eggCache[uid]
-
-	if record then
-		logEgg("GONE", record)
-		eggCache[uid] = nil
-	else
-		print(string.format(
-			"[EggChange] GONE | UID: %s | Rarity: Unknown | Biome: Unknown | Nest: Unknown | Position: Inconnue",
-			uid
-		))
-	end
-end)
-
--- Affiche les œufs déjà présents au lancement
-local snapshot = EggState.ReadFieldEggs()
-
-for _, record in ipairs(snapshot.Records or {}) do
-	registerEgg("INITIAL", record)
 end
+
+return table.freeze(Auto_SAE)
