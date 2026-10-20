@@ -386,6 +386,43 @@ local function moveDirect(destination, token, destinationLabel)
 	return false
 end
 
+local function moveToThenPivot(destination, token, destinationLabel)
+	local character, humanoid, rootPart = getCharacterParts()
+
+	if not character or not humanoid or not rootPart then
+		warn("[Auto_SAE] Personnage ou HumanoidRootPart introuvable.")
+		return false
+	end
+
+	print(string.format(
+		"[Auto_SAE] MoveTo puis PivotTo vers %s : %s.",
+		destinationLabel,
+		formatPosition(destination)
+	))
+
+	humanoid:MoveTo(destination)
+	humanoid.MoveToFinished:Wait()
+
+	if token ~= navigationToken or not autoEnabled then
+		return false
+	end
+
+	character, humanoid, rootPart = getCharacterParts()
+	if not character or not humanoid or not rootPart or humanoid.Health <= 0 then
+		return false
+	end
+
+	local rotation = rootPart.CFrame - rootPart.Position
+	humanoid:Move(Vector3.zero)
+	character:PivotTo(CFrame.new(
+		destination.X,
+		destination.Y,
+		destination.Z
+	) * rotation)
+
+	return true
+end
+
 local function getPromptPosition(prompt)
 	local parent = prompt.Parent
 
@@ -505,6 +542,68 @@ local function waitForCarryPromptNearEgg(record, eggPosition, token)
 end
 
 
+local function fireprompt(prompt)
+	if not configureEggPrompt(prompt) or not prompt.Enabled or not prompt.Parent then
+		return false
+	end
+
+	for attempt = 1, 3 do
+		if not autoEnabled or not prompt.Parent or not prompt.Enabled then
+			return attempt > 1
+		end
+
+		local triggered = false
+		local connection = prompt.Triggered:Connect(function(triggeringPlayer)
+			if triggeringPlayer == nil or triggeringPlayer == player then
+				triggered = true
+			end
+		end)
+
+		activePrompt = prompt
+
+		local beginOk, beginError = pcall(function()
+			prompt:InputHoldBegin()
+		end)
+
+		if not beginOk then
+			connection:Disconnect()
+			activePrompt = nil
+			warn("[Auto_SAE] InputHoldBegin impossible :", beginError)
+			return false
+		end
+
+		local deadline = os.clock() + math.max(prompt.HoldDuration, 0) + 0.35
+		while activePrompt == prompt
+			and autoEnabled
+			and prompt.Parent
+			and prompt.Enabled
+			and not triggered
+			and os.clock() < deadline do
+			RunService.Heartbeat:Wait()
+		end
+
+		if activePrompt == prompt then
+			pcall(function()
+				prompt:InputHoldEnd()
+			end)
+			activePrompt = nil
+		end
+
+		RunService.Heartbeat:Wait()
+		connection:Disconnect()
+
+		if triggered or not prompt.Parent or not prompt.Enabled then
+			print(string.format("[Auto_SAE] Prompt activé à la tentative %d.", attempt))
+			return true
+		end
+
+		task.wait(0.1)
+	end
+
+	warn("[Auto_SAE] Le prompt n'a pas confirmé son activation après 3 tentatives.")
+	return false
+end
+
 local function activateEggPrompt(record, prompt, token)
 	for _ = 1, PROMPT_SEARCH_ATTEMPTS do
 		if token ~= navigationToken or not autoEnabled then
@@ -524,7 +623,7 @@ local function activateEggPrompt(record, prompt, token)
 				prompt.MaxActivationDistance
 			))
 
-			return fireproximityprompt(prompt)
+			return fireprompt(prompt)
 				and token == navigationToken
 				and autoEnabled
 		end
@@ -584,7 +683,7 @@ local function runEgg(record, rate)
 			eggPosition.Z
 		)
 
-		if moveDirect(eggDestination, token, "la zone de l'œuf") then
+		if moveToThenPivot(eggDestination, token, "la zone de l'œuf") then
 			local prompt = waitForCarryPromptNearEgg(record, eggPosition, token)
 
 			if not prompt then
