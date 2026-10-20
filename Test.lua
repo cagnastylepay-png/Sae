@@ -1,3 +1,6 @@
+-- Auto_SAE v2.2. Official EggState API; one client script.
+-- The live game must provide ReplicatedStorage.Client/Data/Shared.
+-- One outbound MoveTo; the carry request starts after MoveToFinished.
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -8,14 +11,13 @@ assert(player, "Auto_SAE doit etre execute sur le client")
 local CONFIG = {
 	Debug = true,
 	ProgressInterval = 0.5,
-	FlyStepCount = 16,
-	FlyStepDelay = 0.02,
-	FlySettleTime = 0.1,
-	FlyArrivalTolerance = 2,
+	MoveRefresh = 0.1,
 	ScanInterval = 0.25,
+	ReturnDistance = 3,
 	RequestTimeout = 10,
 	MaxCarryAttempts = 1,
 	ClaimTimeout = 12,
+	NoMovementTimeout = 10,
 	FailedTargetCooldown = 10,
 	RecoveryStateTimeout = 30,
 	RecoveryRetryDelay = 0.5,
@@ -35,7 +37,6 @@ local statusLabel, toggleButton, minimumInput
 local sequence = 0
 local renderControls
 local stopAutomation
-local carryWasLost
 
 local function log(stage, message, ...)
 	if not CONFIG.Debug and stage ~= "ERROR" and stage ~= "CLAIM_CONFIRMED" then
@@ -46,7 +47,7 @@ local function log(stage, message, ...)
 	if not ok then
 		text = message .. " | format=" .. tostring(text)
 	end
-	print(string.format("[Auto_SAE_SafeFly][%04d][%.3f][%s][%s] %s",
+	print(string.format("[Auto_SAE][%04d][%.3f][%s][%s] %s",
 		sequence, os.clock(), stage, currentCycle and currentCycle.uid or "-", text))
 end
 
@@ -197,13 +198,13 @@ local function getRatePerSecond(record)
 
 	local itemOk, itemData = pcall(EggRecords.ToAssetItemData, record)
 	if not itemOk then
-		warn("[Auto_SAE_SafeFly] Conversion impossible pour le revenu de", record.Uid, itemData)
+		warn("[Auto_SAE] Conversion impossible pour le revenu de", record.Uid, itemData)
 		return nil
 	end
 
 	local rateOk, rate = pcall(AssetEarnings.RatePerSecond, itemData)
 	if not rateOk or type(rate) ~= "number" then
-		warn("[Auto_SAE_SafeFly] Calcul du revenu impossible pour", record.Uid, rate)
+		warn("[Auto_SAE] Calcul du revenu impossible pour", record.Uid, rate)
 		return nil
 	end
 
@@ -268,7 +269,7 @@ local function logEgg(record)
 	local rate = getRatePerSecond(record)
 
 	print(string.format(
-		"[Auto_SAE_SafeFly][EGG] %s | %s | %s | %s | %s Kg | %s $/s | %s | %s",
+		"[Auto_SAE][EGG] %s | %s | %s | %s | %s Kg | %s $/s | %s | %s",
 		record.Uid,
 		getAnimalName(record),
 		getRarityName(record),
@@ -365,7 +366,7 @@ local function requestCarry(ctx)
 	return request
 end
 
--- Cancellable event wait for the single official server carry request.
+-- Event-driven waits: no repeated MoveTo and no polling during the outbound leg.
 local function awaitCycleOperation(ctx, timeout, start)
 	if not validCycle(ctx) then return false, "annule" end
 	local signal = Instance.new("BindableEvent")
@@ -399,7 +400,7 @@ local function traceMoveEnd(ctx, root, destination, reached)
 		EggPosition = eggPosition, PlayerPosition = playerPosition,
 		Reached = reached, At = measuredAt,
 	}
-	log("MOVE_END_POSITIONS", "Reached=%s | Oeuf=%s | Player=%s | DestinationSafeFly=%s | DistanceXZ=%.2f studs | Distance3D=%.2f studs | Vitesse=%.2f studs/s | SourceOeuf=%s",
+	log("MOVE_END_POSITIONS", "Reached=%s | Oeuf=%s | Player=%s | DestinationMoveTo=%s | DistanceXZ=%.2f studs | Distance3D=%.2f studs | Vitesse=%.2f studs/s | SourceOeuf=%s",
 		tostring(reached), formatPosition(eggPosition), formatPosition(playerPosition),
 		formatPosition(destination), distanceXZ(playerPosition, eggPosition),
 		(playerPosition - eggPosition).Magnitude, root.AssemblyLinearVelocity.Magnitude,
@@ -418,93 +419,30 @@ local function traceMoveEnd(ctx, root, destination, reached)
 	end
 end
 
--- Experimental local interpolation; server acceptance is still authoritative.
--- Target positions already use ctx.home.Y. Unlike the linked version, no +5/+6 Y offsets.
-local function safeFlyTeleport(ctx, targetPos, returning)
+local function moveOnceThenCarry(ctx, destination)
 	local _, humanoid, root = getCharacterParts()
 	if not humanoid or not root then return false, "personnage absent" end
-	local valid, invalidReason = validCycle(ctx)
-	if not valid then return false, invalidReason end
-	if ctx.cancelFlight then return false, "vol deja en cours" end
-
-	local oldAutoRotate = humanoid.AutoRotate
-	local oldState = humanoid:GetState()
-	local startPos, rotation = root.Position, root.CFrame.Rotation
-	local steps = math.max(1, math.floor(CONFIG.FlyStepCount))
-	local started, active = os.clock(), true
-	local cancel
-	local function restore()
-		if not active then return end
-		active = false
-		if ctx.cancelFlight == cancel then ctx.cancelFlight = nil end
-		-- Restore immediately on STOP, before a new cycle can use the same humanoid.
-		pcall(function()
-			humanoid.AutoRotate = oldAutoRotate
-			if humanoid.Health > 0 and humanoid:GetState() == Enum.HumanoidStateType.Freefall then
-				humanoid:ChangeState(oldState)
-			end
+	setPhase(ctx, "APPROACH", "Approche simple : " .. getAnimalName(ctx.record))
+	log("MOVE_SINGLE_START", "Destination=%s Pos=%s WalkSpeed=%.1f",
+		formatPosition(destination), formatPosition(root.Position), humanoid.WalkSpeed)
+	local finished, reached = awaitCycleOperation(ctx, 12, function(finish)
+		local connection = humanoid.MoveToFinished:Connect(function(didReach)
+			traceMoveEnd(ctx, root, destination, didReach)
+			finish(true, didReach)
 		end)
+		humanoid:MoveTo(destination)
+		return function() connection:Disconnect() end
+	end)
+	if not finished then
+		log("MOVE_SINGLE_CANCELLED", "%s", tostring(reached))
+		return false, "MoveTo interrompu : " .. tostring(reached)
 	end
-	cancel = restore
-	ctx.cancelFlight = cancel
-	local function canContinue()
-		local cycleValid, reason = validCycle(ctx)
-		if not active or not cycleValid then return false, reason or "annule" end
-		if returning and carryWasLost(ctx) then return false, CARRY_LOST end
-		if ctx.character:GetAttribute("IsTrapped") == true then
-			return false, "personnage immobilise par le serveur"
-		end
-		return true
-	end
-
-	log("FLY_START", "Phase=%s Depart=%s Destination=%s Etapes=%d Pause=%.3fs WalkSpeed=%.1f",
-		ctx.phase, formatPosition(startPos), formatPosition(targetPos),
-		steps, CONFIG.FlyStepDelay, humanoid.WalkSpeed)
-	local callOK, arrived, reason = xpcall(function()
-		stopMovement()
-		humanoid.AutoRotate = false
-		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
-		root.AssemblyLinearVelocity = Vector3.zero
-		for step = 1, steps do
-			local allowed, blockedReason = canContinue()
-			if not allowed then return false, blockedReason end
-			-- A CFrame is assigned, not the erroneous Vector3 assignment in the gist.
-			root.CFrame = CFrame.new(startPos:Lerp(targetPos, step / steps)) * rotation
-			log("FLY_STEP", "Phase=%s Etape=%d/%d Player=%s DistanceXZ=%.2f",
-				ctx.phase, step, steps, formatPosition(root.Position), distanceXZ(root.Position, targetPos))
-			task.wait(CONFIG.FlyStepDelay)
-		end
-		local allowed, blockedReason = canContinue()
-		if not allowed then return false, blockedReason end
-		root.AssemblyLinearVelocity = Vector3.zero
-		-- Allow replication/physics to advance; do not repeatedly snap back if corrected.
-		task.wait(CONFIG.FlySettleTime)
-		allowed, blockedReason = canContinue()
-		if not allowed then return false, blockedReason end
-		if (root.Position - targetPos).Magnitude > CONFIG.FlyArrivalTolerance then
-			return false, "arrivee non confirmee apres interpolation (physique / correction possible)"
-		end
-		return true
-	end, debug.traceback)
-	restore()
-	if not callOK then reason, arrived = tostring(arrived), false end
-	log("FLY_END", "Phase=%s Arrive=%s Player=%s Destination=%s DistanceXZ=%.2f Distance3D=%.2f Duree=%.3fs Raison=%s",
-		ctx.phase, tostring(arrived), formatPosition(root.Position), formatPosition(targetPos),
-		distanceXZ(root.Position, targetPos), (root.Position - targetPos).Magnitude,
-		os.clock() - started, tostring(reason))
-	return arrived == true, reason
-end
-
-local function flyThenCarry(ctx, destination)
-	local _, humanoid, root = getCharacterParts()
-	if not humanoid or not root then return false, "personnage absent" end
-	setPhase(ctx, "APPROACH", "SafeFly : " .. getAnimalName(ctx.record))
-	local arrived, moveReason = safeFlyTeleport(ctx, destination, false)
-	traceMoveEnd(ctx, root, destination, arrived)
-	if not arrived then return false, "SafeFly interrompu : " .. tostring(moveReason) end
 	if not validCycle(ctx) then return false, "annule" end
+	log("MOVE_SINGLE_FINISHED", "Reached=%s Pos=%s DistanceRestanteXZ=%.2f | une tentative serveur",
+		tostring(reached), formatPosition(root.Position), distanceXZ(root.Position, destination))
 	if updateCarryEvidence(ctx) then return true end
-	-- Reaching a local position is not proof of a grab; ask the server exactly once.
+	-- Even a native MoveTo timeout reports its final position to the server once.
+	-- The server remains responsible for accepting or refusing the carry request.
 	local replied, accepted, reason = awaitCycleOperation(ctx, CONFIG.RequestTimeout, function(finish)
 		ctx.onCarryReply = function(request)
 			finish(true, request.accepted, request.reason)
@@ -527,7 +465,7 @@ local function flyThenCarry(ctx, destination)
 	return false, "prise refusee : " .. tostring(reason)
 end
 
-carryWasLost = function(ctx)
+local function carryWasLost(ctx)
 	if not ctx.hadCarry then return false end
 	local latest = readField(ctx.uid)
 	local carry = readCarry()
@@ -617,7 +555,7 @@ local function recoverSameEgg(ctx)
 		ctx.carryLostAt, ctx.lossLogged, ctx.reacquiring = nil, false, true
 		ctx.attempts, ctx.lastRequest = 0, -math.huge
 		local destination = Vector3.new(ctx.eggPosition.X, ctx.home.Y, ctx.eggPosition.Z)
-		local grabbed, reason = flyThenCarry(ctx, destination)
+		local grabbed, reason = moveOnceThenCarry(ctx, destination)
 		if grabbed then
 			ctx.reacquiring, ctx.hadCarry = false, true
 			log("RECOVERY_GRABBED", "UID=%s Reprise=%d | nouveau retour vers la meme zone safe",
@@ -635,9 +573,44 @@ local function recoverSameEgg(ctx)
 	return false, "annule"
 end
 
-local function flyReturn(ctx, destination)
-	setPhase(ctx, "RETURN", "SafeFly : retour vers la zone sure")
-	return safeFlyTeleport(ctx, destination, true)
+local function moveReturnLoop(ctx, destination)
+	local _, humanoid, root = getCharacterParts()
+	if not humanoid or not root then return false, "personnage absent" end
+	local started, lastCommand, lastLog = os.clock(), -math.huge, -math.huge
+	local lastMoved, lastPosition = started, root.Position
+	local distance = distanceXZ(root.Position, destination)
+	local timeout = math.clamp(distance / math.max(humanoid.WalkSpeed, 1) * 4 + 15, 15, 150)
+	setPhase(ctx, "RETURN", "Retour vers la zone sure")
+	while true do
+		local valid, reason = validCycle(ctx)
+		if not valid then return false, reason end
+		if carryWasLost(ctx) then
+			stopMovement()
+			return false, CARRY_LOST
+		end
+		local now = os.clock()
+		distance = distanceXZ(root.Position, destination)
+		if distanceXZ(lastPosition, root.Position) >= 0.5 then
+			lastMoved, lastPosition = now, root.Position
+		end
+		if distance <= CONFIG.ReturnDistance then
+			stopMovement()
+			return true
+		end
+		if now - started > timeout then return false, "delai de retour depasse" end
+		if now - lastMoved > CONFIG.NoMovementTimeout then return false, "retour bloque" end
+		if now - lastCommand >= CONFIG.MoveRefresh then
+			humanoid:MoveTo(destination)
+			lastCommand = now
+		end
+		if now - lastLog >= CONFIG.ProgressInterval then
+			lastLog = now
+			log("MOVE_PROGRESS", "Phase=RETURN Pos=%s DistanceXZ=%.2f WalkSpeed=%.1f VitesseReelle=%.1f Safe=%s",
+				formatPosition(root.Position), distance, humanoid.WalkSpeed,
+				root.AssemblyLinearVelocity.Magnitude, tostring(isSafe(root.Position)))
+		end
+		RunService.Heartbeat:Wait()
+	end
 end
 
 local function waitForClaim(ctx)
@@ -670,7 +643,6 @@ end
 local function cleanupCycle(ctx)
 	if currentCycle ~= ctx then return end
 	if ctx.cancelPendingWait then ctx.cancelPendingWait() end
-	if ctx.cancelFlight then ctx.cancelFlight() end
 	stopMovement()
 	currentCycle = nil
 end
@@ -701,7 +673,7 @@ local function runCycle(record, rate, recovering)
 			return false, "position de l'oeuf absente"
 		else
 			local destination = Vector3.new(ctx.eggPosition.X, ctx.home.Y, ctx.eggPosition.Z)
-			grabbed, grabReason = flyThenCarry(ctx, destination)
+			grabbed, grabReason = moveOnceThenCarry(ctx, destination)
 		end
 		if not validCycle(ctx) then return false, "annule" end
 		if not grabbed and inFlightRequest and not inFlightRequest.done then
@@ -709,7 +681,7 @@ local function runCycle(record, rate, recovering)
 		end
 		ctx.hadCarry = grabbed == true
 		while validCycle(ctx) do
-			local returned, returnReason = flyReturn(ctx, ctx.home)
+			local returned, returnReason = moveReturnLoop(ctx, ctx.home)
 			if not returned and returnReason ~= CARRY_LOST then return false, returnReason end
 			if returned then
 				local _, _, currentRoot = getCharacterParts()
@@ -928,7 +900,7 @@ local function initialize()
 	snapshot(EggState.ReadFieldEggs())
 	ready = true
 	setStatus("Pret : demarre depuis la zone sure", Color3.fromRGB(96, 230, 145))
-	log("READY", "Build=SafeFly-1 | safeFlyTeleport -> CarryFieldEgg -> safeFlyTeleport -> inventaire | reprise du meme UID si perte")
+	log("READY", "Build=2.2 | MoveToFinished -> CarryFieldEgg -> retour -> inventaire | reprise automatique du meme UID si perte")
 end
 
 local function createInterface()
@@ -972,9 +944,9 @@ local function createInterface()
 	title.Size = UDim2.new(1, -28, 0, 28)
 	title.BackgroundTransparency = 1
 	title.Font = Enum.Font.GothamBold
-	title.Text = "AUTO EGG - SAFE FLY"
+	title.Text = "AUTO EGG"
 	title.TextColor3 = Color3.fromRGB(245, 248, 255)
-	title.TextSize = 18
+	title.TextSize = 20
 	title.TextXAlignment = Enum.TextXAlignment.Left
 	title.Parent = frame
 
@@ -1112,3 +1084,4 @@ task.spawn(function()
 		log("ERROR", "%s", tostring(failure))
 	end
 end)
+
