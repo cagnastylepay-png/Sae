@@ -110,9 +110,14 @@ local assetsModule = dataFolder:WaitForChild("Assets", 10)
 local utilFolder = sharedFolder:WaitForChild("Util", 10)
 local eggRecordsModule = utilFolder and utilFolder:WaitForChild("EggRecords", 10)
 local assetEarningsModule = utilFolder and utilFolder:WaitForChild("AssetEarnings", 10)
+local saveModule = sharedFolder:WaitForChild("Save", 10)
 
-if not eggStateModule or not assetsModule or not eggRecordsModule or not assetEarningsModule then
-	warn("[Auto_SAE] EggState, Assets, EggRecords ou AssetEarnings est introuvable.")
+if not eggStateModule
+	or not assetsModule
+	or not eggRecordsModule
+	or not assetEarningsModule
+	or not saveModule then
+	warn("[Auto_SAE] EggState, Assets, EggRecords, AssetEarnings ou Save est introuvable.")
 	return
 end
 
@@ -120,6 +125,7 @@ local EggState = require(eggStateModule)
 local Assets = require(assetsModule)
 local EggRecords = require(eggRecordsModule)
 local AssetEarnings = require(assetEarningsModule)
+local Save = require(saveModule)
 
 local function getAssetConfig(record)
 	if type(record) ~= "table" or type(record.AssetCategory) ~= "string" then
@@ -147,6 +153,78 @@ end
 local function getAnimalName(record)
 	local config = getAssetConfig(record)
 	return config and config.DisplayName or record.AssetCategory or "Inconnu"
+end
+
+local indexUnavailableWarned = false
+
+local function eggCategoryFromTool(tool)
+	if not tool:IsA("Tool") or tool:GetAttribute("ItemType") ~= "AssetEgg" then
+		return nil
+	end
+
+	return tool:GetAttribute("AssetCategory") or tool:GetAttribute("Category")
+end
+
+local function containerHasEggCategory(container, assetCategory)
+	if not container then
+		return false
+	end
+
+	for _, child in ipairs(container:GetChildren()) do
+		if eggCategoryFromTool(child) == assetCategory then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function hasEggForCategory(assetCategory)
+	local backpack = player:FindFirstChildOfClass("Backpack") or player:FindFirstChild("Backpack")
+
+	if containerHasEggCategory(backpack, assetCategory)
+		or containerHasEggCategory(player.Character, assetCategory) then
+		return true
+	end
+
+	local profile = Save.Peek()
+	local eggInventory = profile and profile.EggInventory
+
+	if type(eggInventory) == "table" then
+		for _, eggRecord in pairs(eggInventory) do
+			if type(eggRecord) == "table"
+				and eggRecord.AssetCategory == assetCategory
+				and eggRecord.Placement == nil then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+local function isMissingFromIndex(record)
+	if type(record) ~= "table" or type(record.AssetCategory) ~= "string" then
+		return false
+	end
+
+	if hasEggForCategory(record.AssetCategory) then
+		return false
+	end
+
+	local profile = Save.Peek() or Save.Await()
+	local index = profile and profile.Index
+
+	if type(index) ~= "table" then
+		if not indexUnavailableWarned then
+			indexUnavailableWarned = true
+			warn("[Auto_SAE] Index du joueur indisponible : le filtre d'index est temporairement ignoré.")
+		end
+		return false
+	end
+
+	indexUnavailableWarned = false
+	return index[record.AssetCategory] ~= true
 end
 
 local function getRatePerSecond(record)
@@ -263,6 +341,29 @@ local function getEggPosition(record)
 	end
 
 	return nil, nil
+end
+
+local function popNearestQueueEntry()
+	local _, _, rootPart = getCharacterParts()
+	if not rootPart then
+		return table.remove(recordQueue, 1)
+	end
+
+	local origin = rootPart.Position
+	local nearestIndex = 1
+	local nearestDistance = math.huge
+
+	for index, queueEntry in ipairs(recordQueue) do
+		local position = getEggPosition(queueEntry.Record)
+		local distance = position and (position - origin).Magnitude or math.huge
+
+		if distance < nearestDistance then
+			nearestDistance = distance
+			nearestIndex = index
+		end
+	end
+
+	return table.remove(recordQueue, nearestIndex)
 end
 
 local function resolveResetWall()
@@ -495,7 +596,7 @@ local function setStatus(text, color)
 	end
 end
 
-local function runEgg(record, rate)
+local function runEgg(record, rate, missingFromIndex)
 	local _, humanoid, rootPart = getCharacterParts()
 
 	if not humanoid or not rootPart then
@@ -518,16 +619,26 @@ local function runEgg(record, rate)
 		eggPosition.Z
 	)
 
+	local targetReason
+	if missingFromIndex and rate >= minimumRatePerSecond then
+		targetReason = "revenu + absent de l'index"
+	elseif missingFromIndex then
+		targetReason = "absent de l'index"
+	else
+		targetReason = "revenu minimum"
+	end
+
 	setStatus(
-		string.format("Cible : %s $/s", formatNumber(rate)),
+		string.format("Cible : %s (%s)", getAnimalName(record), targetReason),
 		Color3.fromRGB(255, 209, 82)
 	)
 
 	print(string.format(
-		"[Auto_SAE] Cible sélectionnée | UID: %s | Animal: %s | Revenu: %s $/s | Départ: %s",
+		"[Auto_SAE] Cible sélectionnée | UID: %s | Animal: %s | Revenu: %s $/s | Motif: %s | Départ: %s",
 		record.Uid,
 		getAnimalName(record),
 		formatNumber(rate),
+		targetReason,
 		formatPosition(savedStartPosition)
 	))
 
@@ -558,11 +669,12 @@ local function eligibleRecord(record)
 		or type(record) ~= "table"
 		or type(record.Uid) ~= "string"
 		or record.State ~= SLOT_STATE then
-		return false, nil
+		return false, nil, false
 	end
 
-	local rate = getRatePerSecond(record)
-	return rate ~= nil and rate >= minimumRatePerSecond, rate
+	local rate = getRatePerSecond(record) or 0
+	local missingFromIndex = isMissingFromIndex(record)
+	return rate >= minimumRatePerSecond or missingFromIndex, rate, missingFromIndex
 end
 
 local function processQueue()
@@ -574,17 +686,17 @@ local function processQueue()
 
 	task.spawn(function()
 		while autoEnabled and #recordQueue > 0 do
-			local queueEntry = table.remove(recordQueue, 1)
+			local queueEntry = popNearestQueueEntry()
 			local record = queueEntry.Record
 			queuedUids[record.Uid] = nil
 
 			local latestRecord = EggState.ReadFieldEgg(record.Uid)
-			local eligible, rate = eligibleRecord(latestRecord)
+			local eligible, rate, missingFromIndex = eligibleRecord(latestRecord)
 
 			if eligible then
 				activeUid = latestRecord.Uid
 
-				if runEgg(latestRecord, rate) then
+				if runEgg(latestRecord, rate, missingFromIndex) then
 					successfulVersions[latestRecord.Uid] = versionKey(latestRecord)
 				end
 
@@ -596,7 +708,7 @@ local function processQueue()
 
 		if autoEnabled then
 			setStatus(
-				string.format("Actif : minimum %s $/s", formatNumber(minimumRatePerSecond)),
+				string.format("Actif : minimum %s $/s OU absent de l'index", formatNumber(minimumRatePerSecond)),
 				Color3.fromRGB(96, 230, 145)
 			)
 		end
@@ -604,7 +716,7 @@ local function processQueue()
 end
 
 local function enqueueRecord(record)
-	local eligible, rate = eligibleRecord(record)
+	local eligible, rate, missingFromIndex = eligibleRecord(record)
 
 	if not eligible then
 		return
@@ -623,17 +735,15 @@ local function enqueueRecord(record)
 	table.insert(recordQueue, {
 		Record = record,
 		Rate = rate,
+		MissingFromIndex = missingFromIndex,
 	})
 
-	table.sort(recordQueue, function(a, b)
-		return (a.Rate or 0) > (b.Rate or 0)
-	end)
-
 	print(string.format(
-		"[Auto_SAE] Cible ajoutée | UID: %s | Animal: %s | Revenu: %s $/s",
+		"[Auto_SAE] Cible ajoutée | UID: %s | Animal: %s | Revenu: %s $/s | Index: %s",
 		uid,
 		getAnimalName(record),
-		formatNumber(rate)
+		formatNumber(rate),
+		missingFromIndex and "MANQUANT" or "présent"
 	))
 
 	processQueue()
@@ -661,6 +771,15 @@ EggState.FieldGone:Connect(function(uid)
 	successfulVersions[uid] = nil
 	loggedVersions[uid] = nil
 end)
+
+local function refreshEggCandidates()
+	if autoEnabled then
+		handleSnapshot(EggState.ReadFieldEggs())
+	end
+end
+
+Save.Watch("Index"):Connect(refreshEggCandidates)
+Save.Watch("EggInventory"):Connect(refreshEggCandidates)
 
 local function stopAutomation()
 	autoEnabled = false
@@ -838,7 +957,7 @@ local function createInterface()
 		toggleButton.BackgroundColor3 = Color3.fromRGB(214, 73, 73)
 		input.TextEditable = false
 		setStatus(
-			string.format("Actif : minimum %s $/s", formatNumber(minimumRatePerSecond)),
+			string.format("Actif : minimum %s $/s OU absent de l'index", formatNumber(minimumRatePerSecond)),
 			Color3.fromRGB(96, 230, 145)
 		)
 
@@ -855,4 +974,4 @@ end
 
 createInterface()
 handleSnapshot(EggState.ReadFieldEggs())
-print("[Auto_SAE] Prêt : logs complets actifs. Configurez 1 à 999 milliards puis appuyez sur START.")
+print("[Auto_SAE] Prêt : récupère les œufs au-dessus du minimum OU absents de l'index.")
