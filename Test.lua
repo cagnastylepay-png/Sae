@@ -5,12 +5,6 @@ local Workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
 
-local TARGET_RARITIES = {
-	Divine = true,
-	Eternal = true,
-	Secret = true,
-}
-
 local SLOT_STATE = "Slot"
 local CARRY_PROMPT_NAME = "CarryAreaEgg"
 local PROMPT_SEARCH_RADIUS = 18
@@ -19,6 +13,9 @@ local PROMPT_HOLD_DURATION = 0
 local PROMPT_MAX_ACTIVATION_DISTANCE = 16
 local MOVE_ARRIVAL_DISTANCE = 6
 local MOVE_REFRESH_SECONDS = 0.25
+local MINIMUM_BILLIONS = 1
+local MAXIMUM_BILLIONS = 999
+local DEFAULT_BILLIONS = 2
 
 local PROMPT_ROOT_NAMES = {
 	AreaEggSlotsClient = true,
@@ -29,8 +26,11 @@ local navigationToken = 0
 local activePrompt = nil
 local activeUid = nil
 local workerRunning = false
+local autoEnabled = false
+local minimumRatePerSecond = DEFAULT_BILLIONS * 1e9
 local queuedUids = {}
 local successfulVersions = {}
+local loggedVersions = {}
 local recordQueue = {}
 
 local function formatPosition(position)
@@ -40,6 +40,24 @@ local function formatPosition(position)
 		position.Y,
 		position.Z
 	)
+end
+
+local function formatNumber(value)
+	local absolute = math.abs(value)
+
+	if absolute >= 1e15 then
+		return string.format("%.3gQa", value / 1e15)
+	elseif absolute >= 1e12 then
+		return string.format("%.3gT", value / 1e12)
+	elseif absolute >= 1e9 then
+		return string.format("%.3gB", value / 1e9)
+	elseif absolute >= 1e6 then
+		return string.format("%.3gM", value / 1e6)
+	elseif absolute >= 1e3 then
+		return string.format("%.3gK", value / 1e3)
+	end
+
+	return tostring(math.round(value))
 end
 
 local function getCharacterParts()
@@ -80,29 +98,39 @@ end
 
 local clientFolder = ReplicatedStorage:WaitForChild("Client", 10)
 local dataFolder = ReplicatedStorage:WaitForChild("Data", 10)
+local sharedFolder = ReplicatedStorage:WaitForChild("Shared", 10)
 
-if not clientFolder or not dataFolder then
-	warn("[Auto_SAE] Client ou Data est introuvable dans ReplicatedStorage.")
+if not clientFolder or not dataFolder or not sharedFolder then
+	warn("[Auto_SAE] Client, Data ou Shared est introuvable dans ReplicatedStorage.")
 	return
 end
 
 local eggStateModule = clientFolder:WaitForChild("EggState", 10)
 local assetsModule = dataFolder:WaitForChild("Assets", 10)
+local utilFolder = sharedFolder:WaitForChild("Util", 10)
+local eggRecordsModule = utilFolder and utilFolder:WaitForChild("EggRecords", 10)
+local assetEarningsModule = utilFolder and utilFolder:WaitForChild("AssetEarnings", 10)
 
-if not eggStateModule or not assetsModule then
-	warn("[Auto_SAE] EggState ou Data.Assets est introuvable.")
+if not eggStateModule or not assetsModule or not eggRecordsModule or not assetEarningsModule then
+	warn("[Auto_SAE] EggState, Assets, EggRecords ou AssetEarnings est introuvable.")
 	return
 end
 
 local EggState = require(eggStateModule)
 local Assets = require(assetsModule)
+local EggRecords = require(eggRecordsModule)
+local AssetEarnings = require(assetEarningsModule)
 
-local function getRarityName(record)
+local function getAssetConfig(record)
 	if type(record) ~= "table" or type(record.AssetCategory) ~= "string" then
 		return nil
 	end
 
-	local config = Assets.Directory[record.AssetCategory]
+	return Assets.Directory[record.AssetCategory]
+end
+
+local function getRarityName(record)
+	local config = getAssetConfig(record)
 	local rarity = config and config.Rarity
 
 	if type(rarity) == "string" then
@@ -113,7 +141,102 @@ local function getRarityName(record)
 		return rarity._id or rarity.Id or rarity.Name
 	end
 
+	return "Inconnue"
+end
+
+local function getAnimalName(record)
+	local config = getAssetConfig(record)
+	return config and config.DisplayName or record.AssetCategory or "Inconnu"
+end
+
+local function getRatePerSecond(record)
+	if type(record) ~= "table" then
+		return nil
+	end
+
+	local itemOk, itemData = pcall(EggRecords.ToAssetItemData, record)
+	if not itemOk then
+		warn("[Auto_SAE] Conversion impossible pour le revenu de", record.Uid, itemData)
+		return nil
+	end
+
+	local rateOk, rate = pcall(AssetEarnings.RatePerSecond, itemData)
+	if not rateOk or type(rate) ~= "number" then
+		warn("[Auto_SAE] Calcul du revenu impossible pour", record.Uid, rate)
+		return nil
+	end
+
+	return rate
+end
+
+local function getWeightKg(record)
+	if type(record) ~= "table"
+		or type(record.AssetCategory) ~= "string"
+		or type(record.AssetScale) ~= "number" then
+		return nil
+	end
+
+	local ok, weight = pcall(
+		EggRecords.WeightKgForScale,
+		record.AssetCategory,
+		record.AssetScale
+	)
+
+	if ok and type(weight) == "number" then
+		return weight
+	end
+
 	return nil
+end
+
+local function getRecordPosition(record)
+	if type(record) == "table" and typeof(record.BottomCFrame) == "CFrame" then
+		return record.BottomCFrame.Position
+	end
+
+	return nil
+end
+
+local function mutationLabel(record)
+	if type(record) ~= "table"
+		or type(record.Mutations) ~= "table"
+		or #record.Mutations == 0 then
+		return "Aucune"
+	end
+
+	return table.concat(record.Mutations, ", ")
+end
+
+local function versionKey(record)
+	return tostring(record and record.Version or 0)
+end
+
+local function logEgg(record)
+	if type(record) ~= "table" or type(record.Uid) ~= "string" then
+		return
+	end
+
+	local currentVersion = versionKey(record)
+	if loggedVersions[record.Uid] == currentVersion then
+		return
+	end
+	loggedVersions[record.Uid] = currentVersion
+
+	local position = getRecordPosition(record)
+	local weight = getWeightKg(record)
+	local rate = getRatePerSecond(record)
+
+	print(string.format(
+		"[Auto_SAE][EGG] %s | %s | %s | %s | %s Kg | %s $/s | %s | %s",
+		record.Uid,
+		getAnimalName(record),
+		getRarityName(record),
+		tostring(record.AreaId or "Inconnu"),
+		weight and string.format("%.2f", weight) or "Inconnu",
+		rate and formatNumber(rate) or "Inconnu",
+		mutationLabel(record),
+		position and formatPosition(position) or "Inconnue"
+	))
 end
 
 local function resolveEggModel(uid)
@@ -134,8 +257,9 @@ local function getEggPosition(record)
 		return model:GetPivot().Position, model
 	end
 
-	if typeof(record.BottomCFrame) == "CFrame" then
-		return record.BottomCFrame.Position, nil
+	local recordPosition = getRecordPosition(record)
+	if recordPosition then
+		return recordPosition, nil
 	end
 
 	return nil, nil
@@ -165,17 +289,14 @@ local function wallIsClosed(wall)
 	return false
 end
 
-local function waitForResetWall(token, phaseLabel)
+local function waitForResetWall(token)
 	local wall = resolveResetWall()
 
 	if not wall or not wallIsClosed(wall) then
 		return token == navigationToken
 	end
 
-	print(string.format(
-		"[Auto_SAE] Mur de départ fermé avant %s : attente de son ouverture.",
-		phaseLabel
-	))
+	print("[Auto_SAE] Mur de départ fermé : attente de son ouverture.")
 
 	while token == navigationToken and wallIsClosed(wall) do
 		RunService.Heartbeat:Wait()
@@ -205,7 +326,7 @@ local function moveDirect(destination, token, destinationLabel)
 
 	local lastMoveCommand = -math.huge
 
-	while token == navigationToken do
+	while token == navigationToken and autoEnabled do
 		if humanoid.Health <= 0 or not rootPart.Parent then
 			return false
 		end
@@ -298,7 +419,7 @@ local function activateEggPrompt(record, eggPosition, token)
 	local prompt
 
 	for _ = 1, PROMPT_SEARCH_ATTEMPTS do
-		if token ~= navigationToken then
+		if token ~= navigationToken or not autoEnabled then
 			return false
 		end
 
@@ -362,10 +483,19 @@ local function activateEggPrompt(record, eggPosition, token)
 		activePrompt = nil
 	end
 
-	return token == navigationToken
+	return token == navigationToken and autoEnabled
 end
 
-local function runEgg(record, rarity)
+local statusLabel
+
+local function setStatus(text, color)
+	if statusLabel then
+		statusLabel.Text = text
+		statusLabel.TextColor3 = color
+	end
+end
+
+local function runEgg(record, rate)
 	local _, humanoid, rootPart = getCharacterParts()
 
 	if not humanoid or not rootPart then
@@ -388,23 +518,28 @@ local function runEgg(record, rarity)
 		eggPosition.Z
 	)
 
+	setStatus(
+		string.format("Cible : %s $/s", formatNumber(rate)),
+		Color3.fromRGB(255, 209, 82)
+	)
+
 	print(string.format(
-		"[Auto_SAE] Egg détecté | UID: %s | Rareté: %s | Œuf: %s | Départ mémorisé: %s",
+		"[Auto_SAE] Cible sélectionnée | UID: %s | Animal: %s | Revenu: %s $/s | Départ: %s",
 		record.Uid,
-		rarity,
-		formatPosition(eggDestination),
+		getAnimalName(record),
+		formatNumber(rate),
 		formatPosition(savedStartPosition)
 	))
 
 	local promptActivated = false
 
-	if waitForResetWall(token, "l'aller vers l'œuf")
+	if waitForResetWall(token)
 		and moveDirect(eggDestination, token, "l'œuf") then
 		promptActivated = activateEggPrompt(record, eggPosition, token)
 		task.wait(0.15)
 	end
 
-	if token == navigationToken then
+	if token == navigationToken and autoEnabled then
 		local returned = moveDirect(savedStartPosition, token, "la position de départ mémorisée")
 
 		if returned then
@@ -419,18 +554,15 @@ local function runEgg(record, rarity)
 end
 
 local function eligibleRecord(record)
-	if type(record) ~= "table"
+	if not autoEnabled
+		or type(record) ~= "table"
 		or type(record.Uid) ~= "string"
 		or record.State ~= SLOT_STATE then
 		return false, nil
 	end
 
-	local rarity = getRarityName(record)
-	return rarity ~= nil and TARGET_RARITIES[rarity] == true, rarity
-end
-
-local function versionKey(record)
-	return tostring(record.Version or 0)
+	local rate = getRatePerSecond(record)
+	return rate ~= nil and rate >= minimumRatePerSecond, rate
 end
 
 local function processQueue()
@@ -441,18 +573,18 @@ local function processQueue()
 	workerRunning = true
 
 	task.spawn(function()
-		while #recordQueue > 0 do
+		while autoEnabled and #recordQueue > 0 do
 			local queueEntry = table.remove(recordQueue, 1)
 			local record = queueEntry.Record
 			queuedUids[record.Uid] = nil
 
 			local latestRecord = EggState.ReadFieldEgg(record.Uid)
-			local eligible, rarity = eligibleRecord(latestRecord)
+			local eligible, rate = eligibleRecord(latestRecord)
 
 			if eligible then
 				activeUid = latestRecord.Uid
 
-				if runEgg(latestRecord, rarity) then
+				if runEgg(latestRecord, rate) then
 					successfulVersions[latestRecord.Uid] = versionKey(latestRecord)
 				end
 
@@ -461,11 +593,18 @@ local function processQueue()
 		end
 
 		workerRunning = false
+
+		if autoEnabled then
+			setStatus(
+				string.format("Actif : minimum %s $/s", formatNumber(minimumRatePerSecond)),
+				Color3.fromRGB(96, 230, 145)
+			)
+		end
 	end)
 end
 
 local function enqueueRecord(record)
-	local eligible, rarity = eligibleRecord(record)
+	local eligible, rate = eligibleRecord(record)
 
 	if not eligible then
 		return
@@ -483,238 +622,237 @@ local function enqueueRecord(record)
 	queuedUids[uid] = true
 	table.insert(recordQueue, {
 		Record = record,
+		Rate = rate,
 	})
 
-	print(string.format(
-		"[Auto_SAE] Cible ajoutée | UID: %s | Rareté: %s",
-		uid,
-		rarity
-	))
-
-	processQueue()
-end
-
-local function applySnapshot(snapshot)
-	if type(snapshot) ~= "table" then
-		return
-	end
-
-	for _, record in ipairs(snapshot.Records or {}) do
-		enqueueRecord(record)
-	end
-end
-
-EggState.FieldRefreshed:Connect(applySnapshot)
-EggState.FieldShifted:Connect(enqueueRecord)
-EggState.FieldGone:Connect(function(uid)
-	queuedUids[uid] = nil
-	successfulVersions[uid] = nil
-end)
-
-player.CharacterRemoving:Connect(function()
-	navigationToken += 1
-	activeUid = nil
-
-	if activePrompt then
-		activePrompt:InputHoldEnd()
-		activePrompt = nil
-	end
-end)
-
-applySnapshot(EggState.ReadFieldEggs())
-print("[Auto_SAE] Actif : trajet direct, retour mémorisé, attente du mur et prompts d'œufs uniquement.")
-local function returnToStartPosition(outboundRoute, token)
-	print(string.format(
-		"[Auto_SAE] Retour par les points vers le départ %s.",
-		formatPosition(ROUTE_POSITIONS[1])
-	))
-
-	for index = #outboundRoute, 2, -1 do
-		if not walkPath(
-			outboundRoute[index],
-			token,
-			string.format("le point de retour %d", index)
-		) then
-			return false
-		end
-	end
-
-	local returned = walkPath(
-		ROUTE_POSITIONS[1],
-		token,
-		"la position 1 de départ"
-	)
-
-	if returned then
-		print("[Auto_SAE] Retour à la position 1 terminé.")
-	end
-
-	return returned
-end
-
-local function runEgg(record, rarity)
-	local _, humanoid, rootPart = getCharacterParts()
-
-	if not humanoid or not rootPart then
-		warn("[Auto_SAE] Personnage indisponible pour l'œuf", record.Uid)
-		return false
-	end
-
-	local eggPosition = getEggPosition(record)
-
-	if not eggPosition then
-		warn("[Auto_SAE] Position introuvable pour l'œuf", record.Uid)
-		return false
-	end
-
-	navigationToken += 1
-	local token = navigationToken
-
-	print(string.format(
-		"[Auto_SAE] Egg détecté | UID: %s | Rareté: %s | Position: %s | Départ/retour: %s",
-		record.Uid,
-		rarity,
-		formatPosition(eggPosition),
-		formatPosition(ROUTE_POSITIONS[1])
-	))
-
-	local promptActivated = false
-	local reachedRoute = {}
-	local _, _, currentRoot = getCharacterParts()
-
-	if currentRoot and token == navigationToken then
-		local arrived, traversedRoute, eggGoal = walkRouteToEgg(eggPosition, token)
-		reachedRoute = traversedRoute
-
-		if arrived then
-			print(string.format(
-				"[Auto_SAE] Arrivé à la position de l'œuf %s: %s.",
-				record.Uid,
-				formatPosition(eggGoal)
-			))
-			promptActivated = activateEggPrompt(record, eggPosition, token)
-			task.wait(0.15)
-		end
-	end
-
-	if token == navigationToken then
-		returnToStartPosition(reachedRoute, token)
-	end
-
-	return promptActivated
-end
-
-local function eligibleRecord(record)
-	if type(record) ~= "table"
-		or type(record.Uid) ~= "string"
-		or record.State ~= SLOT_STATE then
-		return false, nil
-	end
-
-	local rarity = getRarityName(record)
-	return rarity ~= nil and TARGET_RARITIES[rarity] == true, rarity
-end
-
-local function versionKey(record)
-	return tostring(record.Version or 0)
-end
-
-local function processQueue()
-	if workerRunning then
-		return
-	end
-
-	workerRunning = true
-
-	task.spawn(function()
-		while #recordQueue > 0 do
-			local queueEntry = table.remove(recordQueue, 1)
-			local record = queueEntry.Record
-			queuedUids[record.Uid] = nil
-
-			local latestRecord = EggState.ReadFieldEgg(record.Uid)
-			local eligible, rarity = eligibleRecord(latestRecord)
-
-			if eligible then
-				activeUid = latestRecord.Uid
-
-				if runEgg(latestRecord, rarity) then
-					successfulVersions[latestRecord.Uid] = versionKey(latestRecord)
-				end
-
-				activeUid = nil
-			end
-		end
-
-		workerRunning = false
+	table.sort(recordQueue, function(a, b)
+		return (a.Rate or 0) > (b.Rate or 0)
 	end)
-end
-
-local function enqueueRecord(record)
-	local eligible, rarity = eligibleRecord(record)
-
-	if not eligible then
-		return
-	end
-
-	local uid = record.Uid
-	local key = versionKey(record)
-
-	if queuedUids[uid]
-		or activeUid == uid
-		or successfulVersions[uid] == key then
-		return
-	end
-
-	local configuredPromptCount = configureAllPrompts()
-	print(string.format(
-		"[Auto_SAE] Détection: %d prompt(s) configuré(s) | HoldDuration: %.1f | Distance: %.1f",
-		configuredPromptCount,
-		PROMPT_HOLD_DURATION,
-		PROMPT_MAX_ACTIVATION_DISTANCE
-	))
-
-	queuedUids[uid] = true
-	table.insert(recordQueue, {
-		Record = record,
-	})
 
 	print(string.format(
-		"[Auto_SAE] Cible ajoutée | UID: %s | Rareté: %s | Départ/retour: %s",
+		"[Auto_SAE] Cible ajoutée | UID: %s | Animal: %s | Revenu: %s $/s",
 		uid,
-		rarity,
-		formatPosition(ROUTE_POSITIONS[1])
+		getAnimalName(record),
+		formatNumber(rate)
 	))
 
 	processQueue()
 end
 
-local function applySnapshot(snapshot)
+local function handleRecord(record)
+	logEgg(record)
+	enqueueRecord(record)
+end
+
+local function handleSnapshot(snapshot)
 	if type(snapshot) ~= "table" then
 		return
 	end
 
 	for _, record in ipairs(snapshot.Records or {}) do
-		enqueueRecord(record)
+		handleRecord(record)
 	end
 end
 
-EggState.FieldRefreshed:Connect(applySnapshot)
-EggState.FieldShifted:Connect(enqueueRecord)
+EggState.FieldRefreshed:Connect(handleSnapshot)
+EggState.FieldShifted:Connect(handleRecord)
 EggState.FieldGone:Connect(function(uid)
 	queuedUids[uid] = nil
 	successfulVersions[uid] = nil
+	loggedVersions[uid] = nil
 end)
 
-player.CharacterRemoving:Connect(function()
+local function stopAutomation()
+	autoEnabled = false
 	navigationToken += 1
+	recordQueue = {}
+	queuedUids = {}
 	activeUid = nil
 
 	if activePrompt then
 		activePrompt:InputHoldEnd()
 		activePrompt = nil
 	end
+
+	local _, humanoid = getCharacterParts()
+	if humanoid then
+		humanoid:Move(Vector3.zero)
+	end
+end
+
+player.CharacterRemoving:Connect(function()
+	stopAutomation()
 end)
 
-applySnapshot(EggState.ReadFieldEggs())
-print("[Auto_SAE] Actif : EggState surveille Divine, Eternal et Secret.")
+local function createInterface()
+	local playerGui = player:WaitForChild("PlayerGui")
+	local oldGui = playerGui:FindFirstChild("AutoSAEGui")
+
+	if oldGui then
+		oldGui:Destroy()
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "AutoSAEGui"
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.Parent = playerGui
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Panel"
+	frame.AnchorPoint = Vector2.new(1, 0)
+	frame.Position = UDim2.new(1, -24, 0, 120)
+	frame.Size = UDim2.fromOffset(280, 178)
+	frame.BackgroundColor3 = Color3.fromRGB(20, 24, 34)
+	frame.BorderSizePixel = 0
+	frame.Active = true
+	frame.Draggable = true
+	frame.Parent = gui
+
+	local frameCorner = Instance.new("UICorner")
+	frameCorner.CornerRadius = UDim.new(0, 12)
+	frameCorner.Parent = frame
+
+	local frameStroke = Instance.new("UIStroke")
+	frameStroke.Color = Color3.fromRGB(71, 119, 255)
+	frameStroke.Thickness = 2
+	frameStroke.Transparency = 0.2
+	frameStroke.Parent = frame
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.Position = UDim2.fromOffset(14, 10)
+	title.Size = UDim2.new(1, -28, 0, 28)
+	title.BackgroundTransparency = 1
+	title.Font = Enum.Font.GothamBold
+	title.Text = "AUTO EGG"
+	title.TextColor3 = Color3.fromRGB(245, 248, 255)
+	title.TextSize = 20
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = frame
+
+	local inputLabel = Instance.new("TextLabel")
+	inputLabel.Name = "InputLabel"
+	inputLabel.Position = UDim2.fromOffset(14, 43)
+	inputLabel.Size = UDim2.new(1, -28, 0, 20)
+	inputLabel.BackgroundTransparency = 1
+	inputLabel.Font = Enum.Font.Gotham
+	inputLabel.Text = "Minimum $/s en milliards (1 à 999)"
+	inputLabel.TextColor3 = Color3.fromRGB(174, 183, 204)
+	inputLabel.TextSize = 13
+	inputLabel.TextXAlignment = Enum.TextXAlignment.Left
+	inputLabel.Parent = frame
+
+	local input = Instance.new("TextBox")
+	input.Name = "MinimumBillions"
+	input.Position = UDim2.fromOffset(14, 67)
+	input.Size = UDim2.fromOffset(112, 38)
+	input.BackgroundColor3 = Color3.fromRGB(35, 41, 57)
+	input.BorderSizePixel = 0
+	input.ClearTextOnFocus = false
+	input.Font = Enum.Font.GothamBold
+	input.PlaceholderText = "1 - 999"
+	input.Text = tostring(DEFAULT_BILLIONS)
+	input.TextColor3 = Color3.fromRGB(255, 255, 255)
+	input.TextSize = 18
+	input.Parent = frame
+
+	local inputCorner = Instance.new("UICorner")
+	inputCorner.CornerRadius = UDim.new(0, 8)
+	inputCorner.Parent = input
+
+	local suffix = Instance.new("TextLabel")
+	suffix.Name = "Suffix"
+	suffix.Position = UDim2.fromOffset(132, 67)
+	suffix.Size = UDim2.fromOffset(44, 38)
+	suffix.BackgroundTransparency = 1
+	suffix.Font = Enum.Font.GothamBold
+	suffix.Text = "B/s"
+	suffix.TextColor3 = Color3.fromRGB(174, 183, 204)
+	suffix.TextSize = 17
+	suffix.TextXAlignment = Enum.TextXAlignment.Left
+	suffix.Parent = frame
+
+	local toggleButton = Instance.new("TextButton")
+	toggleButton.Name = "Toggle"
+	toggleButton.Position = UDim2.new(1, -104, 0, 67)
+	toggleButton.Size = UDim2.fromOffset(90, 38)
+	toggleButton.BackgroundColor3 = Color3.fromRGB(48, 181, 102)
+	toggleButton.BorderSizePixel = 0
+	toggleButton.Font = Enum.Font.GothamBold
+	toggleButton.Text = "START"
+	toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	toggleButton.TextSize = 15
+	toggleButton.Parent = frame
+
+	local buttonCorner = Instance.new("UICorner")
+	buttonCorner.CornerRadius = UDim.new(0, 8)
+	buttonCorner.Parent = toggleButton
+
+	statusLabel = Instance.new("TextLabel")
+	statusLabel.Name = "Status"
+	statusLabel.Position = UDim2.fromOffset(14, 118)
+	statusLabel.Size = UDim2.new(1, -28, 0, 43)
+	statusLabel.BackgroundColor3 = Color3.fromRGB(28, 33, 46)
+	statusLabel.BorderSizePixel = 0
+	statusLabel.Font = Enum.Font.GothamMedium
+	statusLabel.Text = "Arrêté"
+	statusLabel.TextColor3 = Color3.fromRGB(255, 114, 114)
+	statusLabel.TextSize = 13
+	statusLabel.TextWrapped = true
+	statusLabel.Parent = frame
+
+	local statusCorner = Instance.new("UICorner")
+	statusCorner.CornerRadius = UDim.new(0, 8)
+	statusCorner.Parent = statusLabel
+
+	toggleButton.Activated:Connect(function()
+		if autoEnabled then
+			stopAutomation()
+			toggleButton.Text = "START"
+			toggleButton.BackgroundColor3 = Color3.fromRGB(48, 181, 102)
+			input.TextEditable = true
+			setStatus("Arrêté", Color3.fromRGB(255, 114, 114))
+			print("[Auto_SAE] STOP.")
+			return
+		end
+
+		local billions = tonumber(input.Text)
+		if not billions then
+			setStatus("Valeur invalide : entre 1 et 999", Color3.fromRGB(255, 114, 114))
+			return
+		end
+
+		billions = math.clamp(billions, MINIMUM_BILLIONS, MAXIMUM_BILLIONS)
+		input.Text = tostring(billions)
+		minimumRatePerSecond = billions * 1e9
+
+		navigationToken += 1
+		recordQueue = {}
+		queuedUids = {}
+		successfulVersions = {}
+		activeUid = nil
+		autoEnabled = true
+
+		toggleButton.Text = "STOP"
+		toggleButton.BackgroundColor3 = Color3.fromRGB(214, 73, 73)
+		input.TextEditable = false
+		setStatus(
+			string.format("Actif : minimum %s $/s", formatNumber(minimumRatePerSecond)),
+			Color3.fromRGB(96, 230, 145)
+		)
+
+		print(string.format(
+			"[Auto_SAE] START | Minimum configuré : %s $/s.",
+			formatNumber(minimumRatePerSecond)
+		))
+
+		handleSnapshot(EggState.ReadFieldEggs())
+	end)
+
+	return gui
+end
+
+createInterface()
+handleSnapshot(EggState.ReadFieldEggs())
+print("[Auto_SAE] Prêt : logs complets actifs. Configurez 1 à 999 milliards puis appuyez sur START.")
