@@ -9,9 +9,10 @@ local SLOT_STATE = "Slot"
 local CARRY_PROMPT_NAME = "CarryAreaEgg"
 local PROMPT_SEARCH_RADIUS = 18
 local PROMPT_SEARCH_ATTEMPTS = 40
-local PROMPT_HOLD_DURATION = 0
-local PROMPT_MAX_ACTIVATION_DISTANCE = 16
-local MINIMUM_BILLIONS = 1
+local MOVE_ARRIVAL_DISTANCE = 0.25
+local MOVE_FINAL_CORRECTION_DISTANCE = 1.5
+local MOVE_REFRESH_SECONDS = 0.05
+local MINIMUM_BILLIONS = 0.1
 local MAXIMUM_BILLIONS = 999
 local DEFAULT_BILLIONS = 2
 
@@ -82,16 +83,10 @@ local function isInsideEggPromptRoot(instance)
 end
 
 local function configureEggPrompt(prompt)
-	if not prompt
-		or not prompt:IsA("ProximityPrompt")
-		or prompt.Name ~= CARRY_PROMPT_NAME
-		or not isInsideEggPromptRoot(prompt) then
-		return false
-	end
-
-	prompt.HoldDuration = PROMPT_HOLD_DURATION
-	prompt.MaxActivationDistance = PROMPT_MAX_ACTIVATION_DISTANCE
-	return true
+	return prompt ~= nil
+		and prompt:IsA("ProximityPrompt")
+		and prompt.Name == CARRY_PROMPT_NAME
+		and isInsideEggPromptRoot(prompt)
 end
 
 local clientFolder = ReplicatedStorage:WaitForChild("Client", 10)
@@ -108,12 +103,14 @@ local assetsModule = dataFolder:WaitForChild("Assets", 10)
 local utilFolder = sharedFolder:WaitForChild("Util", 10)
 local eggRecordsModule = utilFolder and utilFolder:WaitForChild("EggRecords", 10)
 local assetEarningsModule = utilFolder and utilFolder:WaitForChild("AssetEarnings", 10)
+local saveModule = sharedFolder:WaitForChild("Save", 10)
 
 if not eggStateModule
 	or not assetsModule
 	or not eggRecordsModule
-	or not assetEarningsModule then
-	warn("[Auto_SAE] EggState, Assets, EggRecords ou AssetEarnings est introuvable.")
+	or not assetEarningsModule
+	or not saveModule then
+	warn("[Auto_SAE] EggState, Assets, EggRecords, AssetEarnings ou Save est introuvable.")
 	return
 end
 
@@ -121,6 +118,7 @@ local EggState = require(eggStateModule)
 local Assets = require(assetsModule)
 local EggRecords = require(eggRecordsModule)
 local AssetEarnings = require(assetEarningsModule)
+local Save = require(saveModule)
 
 local function getAssetConfig(record)
 	if type(record) ~= "table" or type(record.AssetCategory) ~= "string" then
@@ -150,6 +148,78 @@ local function getAnimalName(record)
 	return config and config.DisplayName or record.AssetCategory or "Inconnu"
 end
 
+local indexUnavailableWarned = false
+
+local function eggCategoryFromTool(tool)
+	if not tool:IsA("Tool") or tool:GetAttribute("ItemType") ~= "AssetEgg" then
+		return nil
+	end
+
+	return tool:GetAttribute("AssetCategory") or tool:GetAttribute("Category")
+end
+
+local function containerHasEggCategory(container, assetCategory)
+	if not container then
+		return false
+	end
+
+	for _, child in ipairs(container:GetChildren()) do
+		if eggCategoryFromTool(child) == assetCategory then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function hasEggForCategory(assetCategory)
+	local backpack = player:FindFirstChildOfClass("Backpack") or player:FindFirstChild("Backpack")
+
+	if containerHasEggCategory(backpack, assetCategory)
+		or containerHasEggCategory(player.Character, assetCategory) then
+		return true
+	end
+
+	local profile = Save.Peek()
+	local eggInventory = profile and profile.EggInventory
+
+	if type(eggInventory) == "table" then
+		for _, eggRecord in pairs(eggInventory) do
+			if type(eggRecord) == "table"
+				and eggRecord.AssetCategory == assetCategory
+				and eggRecord.Placement == nil then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+local function isMissingFromIndex(record)
+	if type(record) ~= "table" or type(record.AssetCategory) ~= "string" then
+		return false
+	end
+
+	if hasEggForCategory(record.AssetCategory) then
+		return false
+	end
+
+	local profile = Save.Peek() or Save.Await()
+	local index = profile and profile.Index
+
+	if type(index) ~= "table" then
+		if not indexUnavailableWarned then
+			indexUnavailableWarned = true
+			warn("[Auto_SAE] Index du joueur indisponible : le filtre d'index est temporairement ignoré.")
+		end
+		return false
+	end
+
+	indexUnavailableWarned = false
+	return index[record.AssetCategory] ~= true
+end
+
 local function getRatePerSecond(record)
 	if type(record) ~= "table" then
 		return nil
@@ -157,11 +227,13 @@ local function getRatePerSecond(record)
 
 	local itemOk, itemData = pcall(EggRecords.ToAssetItemData, record)
 	if not itemOk then
+		warn("[Auto_SAE] Conversion impossible pour le revenu de", record.Uid, itemData)
 		return nil
 	end
 
 	local rateOk, rate = pcall(AssetEarnings.RatePerSecond, itemData)
 	if not rateOk or type(rate) ~= "number" then
+		warn("[Auto_SAE] Calcul du revenu impossible pour", record.Uid, rate)
 		return nil
 	end
 
@@ -287,6 +359,107 @@ local function popNearestQueueEntry()
 	return table.remove(recordQueue, nearestIndex)
 end
 
+local function resolveResetWall()
+	local world = Workspace:FindFirstChild("World")
+	local areas = world and world:FindFirstChild("Areas")
+	return areas and areas:FindFirstChild("WallStartCollision")
+end
+
+local function wallIsClosed(wall)
+	if not wall or not wall.Parent then
+		return false
+	end
+
+	if wall:IsA("BasePart") and wall.CanCollide then
+		return true
+	end
+
+	for _, descendant in ipairs(wall:GetDescendants()) do
+		if descendant:IsA("BasePart") and descendant.CanCollide then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function waitForResetWall(token)
+	local wall = resolveResetWall()
+
+	if not wall or not wallIsClosed(wall) then
+		return token == navigationToken
+	end
+
+	print("[Auto_SAE] Mur de départ fermé : attente de son ouverture.")
+
+	while token == navigationToken and wallIsClosed(wall) do
+		RunService.Heartbeat:Wait()
+	end
+
+	if token ~= navigationToken then
+		return false
+	end
+
+	print("[Auto_SAE] Mur de départ ouvert.")
+	return true
+end
+
+local function moveDirect(destination, token, destinationLabel)
+	local _, humanoid, rootPart = getCharacterParts()
+
+	if not humanoid or not rootPart then
+		warn("[Auto_SAE] Personnage ou HumanoidRootPart introuvable.")
+		return false
+	end
+
+	print(string.format(
+		"[Auto_SAE] Déplacement direct vers %s : %s.",
+		destinationLabel,
+		formatPosition(destination)
+	))
+
+	local lastMoveCommand = -math.huge
+
+	while token == navigationToken and autoEnabled do
+		if humanoid.Health <= 0 or not rootPart.Parent then
+			return false
+		end
+
+		local offset = destination - rootPart.Position
+		local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
+		local distance = horizontalOffset.Magnitude
+
+		if distance <= MOVE_ARRIVAL_DISTANCE then
+			humanoid:Move(Vector3.zero)
+			return true
+		end
+
+		if distance <= MOVE_FINAL_CORRECTION_DISTANCE then
+			local rotation = rootPart.CFrame - rootPart.Position
+			local verticalVelocity = rootPart.AssemblyLinearVelocity.Y
+
+			humanoid:Move(Vector3.zero)
+			rootPart.AssemblyLinearVelocity = Vector3.new(0, verticalVelocity, 0)
+			rootPart.CFrame = CFrame.new(
+				destination.X,
+				rootPart.Position.Y,
+				destination.Z
+			) * rotation
+			return true
+		end
+
+		local now = os.clock()
+		if now - lastMoveCommand >= MOVE_REFRESH_SECONDS then
+			humanoid:MoveTo(destination)
+			lastMoveCommand = now
+		end
+
+		RunService.Heartbeat:Wait()
+	end
+
+	return false
+end
+
 local function getPromptPosition(prompt)
 	local parent = prompt.Parent
 
@@ -316,7 +489,14 @@ local function promptIsUsable(prompt, rootPosition)
 		and (promptPosition - rootPosition).Magnitude <= prompt.MaxActivationDistance + 1
 end
 
-local function findNearestCarryPrompt(eggPosition, rootPosition)
+local function findCarryPromptNearEgg(record, eggPosition)
+	local eggModel = resolveEggModel(record.Uid)
+	local exactPrompt = eggModel and eggModel:FindFirstChild(CARRY_PROMPT_NAME, true)
+
+	if configureEggPrompt(exactPrompt) and exactPrompt.Enabled then
+		return exactPrompt
+	end
+
 	local bestPrompt
 	local bestDistance = math.huge
 
@@ -325,17 +505,13 @@ local function findNearestCarryPrompt(eggPosition, rootPosition)
 
 		if root then
 			for _, descendant in ipairs(root:GetDescendants()) do
-				if descendant:IsA("ProximityPrompt")
-					and descendant.Name == CARRY_PROMPT_NAME
-					and descendant.Enabled then
+				if configureEggPrompt(descendant) and descendant.Enabled then
 					local promptPosition = getPromptPosition(descendant)
 
 					if promptPosition then
 						local eggDistance = (promptPosition - eggPosition).Magnitude
-						local playerDistance = (promptPosition - rootPosition).Magnitude
 
 						if eggDistance <= PROMPT_SEARCH_RADIUS
-							and playerDistance <= PROMPT_MAX_ACTIVATION_DISTANCE + 1
 							and eggDistance < bestDistance then
 							bestDistance = eggDistance
 							bestPrompt = descendant
@@ -346,16 +522,45 @@ local function findNearestCarryPrompt(eggPosition, rootPosition)
 		end
 	end
 
-	if bestPrompt then
-		configureEggPrompt(bestPrompt)
-	end
-
 	return bestPrompt
 end
 
-local function activateEggPrompt(record, eggPosition, token)
-	local prompt
+local function waitForCarryPromptNearEgg(record, eggPosition, token)
+	for _ = 1, PROMPT_SEARCH_ATTEMPTS do
+		if token ~= navigationToken or not autoEnabled then
+			return nil
+		end
 
+		local prompt = findCarryPromptNearEgg(record, eggPosition)
+		if prompt then
+			return prompt
+		end
+
+		task.wait(0.1)
+	end
+
+	return nil
+end
+
+local function fireproximityprompt(prompt)
+	if not configureEggPrompt(prompt) or not prompt.Enabled then
+		return false
+	end
+
+	activePrompt = prompt
+	prompt:InputHoldBegin()
+	task.wait(math.max(prompt.HoldDuration, 0.05))
+
+	local completed = activePrompt == prompt
+	if completed then
+		prompt:InputHoldEnd()
+		activePrompt = nil
+	end
+
+	return completed
+end
+
+local function activateEggPrompt(record, prompt, token)
 	for _ = 1, PROMPT_SEARCH_ATTEMPTS do
 		if token ~= navigationToken or not autoEnabled then
 			return false
@@ -366,43 +571,33 @@ local function activateEggPrompt(record, eggPosition, token)
 			return false
 		end
 
-		local eggModel = resolveEggModel(record.Uid)
-		local exactPrompt = eggModel and eggModel:FindFirstChild(CARRY_PROMPT_NAME, true)
+		if prompt and prompt.Parent and promptIsUsable(prompt, rootPart.Position) then
+			local promptPosition = getPromptPosition(prompt)
+			if promptPosition then
+				local lookTarget = Vector3.new(promptPosition.X, rootPart.Position.Y, promptPosition.Z)
 
-		if exactPrompt
-			and exactPrompt:IsA("ProximityPrompt")
-			and promptIsUsable(exactPrompt, rootPart.Position) then
-			prompt = exactPrompt
-			break
+				if (lookTarget - rootPart.Position).Magnitude > 0.01 then
+					rootPart.CFrame = CFrame.lookAt(rootPart.Position, lookTarget)
+				end
+			end
+
+			print(string.format(
+				"[Auto_SAE] Activation du prompt de l'œuf | UID: %s | HoldDuration: %.1f | MaxDistance: %.1f",
+				record.Uid,
+				prompt.HoldDuration,
+				prompt.MaxActivationDistance
+			))
+
+			return fireproximityprompt(prompt)
+				and token == navigationToken
+				and autoEnabled
 		end
 
-		prompt = findNearestCarryPrompt(eggPosition, rootPart.Position)
-		if prompt then
-			break
-		end
-
-		task.wait(0.05)
+		task.wait(0.1)
 	end
 
-	if not prompt then
-		warn(string.format("[Auto_SAE] Prompt %s introuvable pour %s.", CARRY_PROMPT_NAME, record.Uid))
-		return false
-	end
-
-	configureEggPrompt(prompt)
-	activePrompt = prompt
-
-	-- Activation instantanée via Delta
-	if fireproximityprompt then
-		fireproximityprompt(prompt)
-	else
-		prompt:InputHoldBegin()
-		task.wait(0.05)
-		prompt:InputHoldEnd()
-	end
-
-	activePrompt = nil
-	return token == navigationToken and autoEnabled
+	warn(string.format("[Auto_SAE] Prompt %s inutilisable pour %s.", CARRY_PROMPT_NAME, record.Uid))
+	return false
 end
 
 local statusLabel
@@ -414,10 +609,10 @@ local function setStatus(text, color)
 	end
 end
 
-local function runEgg(record, rate)
-	local character, humanoid, rootPart = getCharacterParts()
+local function runEgg(record, rate, missingFromIndex)
+	local _, humanoid, rootPart = getCharacterParts()
 
-	if not character or not humanoid or not rootPart then
+	if not humanoid or not rootPart then
 		warn("[Auto_SAE] Personnage indisponible pour l'œuf", record.Uid)
 		return false
 	end
@@ -431,36 +626,63 @@ local function runEgg(record, rate)
 	navigationToken += 1
 	local token = navigationToken
 	local savedStartPosition = rootPart.Position
+	local targetReason
+	if missingFromIndex and rate >= minimumRatePerSecond then
+		targetReason = "revenu + absent de l'index"
+	elseif missingFromIndex then
+		targetReason = "absent de l'index"
+	else
+		targetReason = "revenu minimum"
+	end
 
 	setStatus(
-		string.format("Cible : %s (%s $/s)", getAnimalName(record), formatNumber(rate)),
+		string.format("Cible : %s (%s)", getAnimalName(record), targetReason),
 		Color3.fromRGB(255, 209, 82)
 	)
 
 	print(string.format(
-		"[Auto_SAE] Téléportation vers l'œuf | UID: %s | Animal: %s | Revenu: %s $/s",
+		"[Auto_SAE] Cible sélectionnée | UID: %s | Animal: %s | Revenu: %s $/s | Motif: %s | Départ: %s",
 		record.Uid,
 		getAnimalName(record),
-		formatNumber(rate)
+		formatNumber(rate),
+		targetReason,
+		formatPosition(savedStartPosition)
 	))
 
-	-- 1. Arrêter le mouvement et téléporter à l'œuf
-	humanoid:Move(Vector3.zero)
-	character:PivotTo(CFrame.new(eggPosition + Vector3.new(0, 2.5, 0)))
-	rootPart.AssemblyLinearVelocity = Vector3.zero
-	rootPart.AssemblyAngularVelocity = Vector3.zero
+	local promptActivated = false
 
-	task.wait(0.08)
+	if waitForResetWall(token) then
+		local prompt = waitForCarryPromptNearEgg(record, eggPosition, token)
 
-	-- 2. Déclencher le prompt
-	local promptActivated = activateEggPrompt(record, eggPosition, token)
-	task.wait(0.05)
+		if not prompt then
+			warn(string.format("[Auto_SAE] Prompt %s introuvable pour %s.", CARRY_PROMPT_NAME, record.Uid))
+		else
+			local promptPosition = getPromptPosition(prompt)
 
-	-- 3. Téléportation de retour au point de départ
+			if promptPosition then
+				local promptDestination = Vector3.new(
+					promptPosition.X,
+					savedStartPosition.Y,
+					promptPosition.Z
+				)
+
+				if moveDirect(promptDestination, token, "le prompt de l'œuf") then
+					promptActivated = activateEggPrompt(record, prompt, token)
+					task.wait(0.15)
+				end
+			end
+		end
+	end
+
 	if token == navigationToken and autoEnabled then
-		character:PivotTo(CFrame.new(savedStartPosition))
-		rootPart.AssemblyLinearVelocity = Vector3.zero
-		rootPart.AssemblyAngularVelocity = Vector3.zero
+		local returned = moveDirect(savedStartPosition, token, "la position de départ mémorisée")
+
+		if returned then
+			print(string.format(
+				"[Auto_SAE] Retour terminé : %s.",
+				formatPosition(savedStartPosition)
+			))
+		end
 	end
 
 	return promptActivated
@@ -471,12 +693,12 @@ local function eligibleRecord(record)
 		or type(record) ~= "table"
 		or type(record.Uid) ~= "string"
 		or record.State ~= SLOT_STATE then
-		return false, nil
+		return false, nil, false
 	end
 
 	local rate = getRatePerSecond(record) or 0
-	-- Uniquement les œufs atteignant le montant configuré
-	return rate >= minimumRatePerSecond, rate
+	local missingFromIndex = isMissingFromIndex(record)
+	return rate >= minimumRatePerSecond or missingFromIndex, rate, missingFromIndex
 end
 
 local function processQueue()
@@ -493,12 +715,12 @@ local function processQueue()
 			queuedUids[record.Uid] = nil
 
 			local latestRecord = EggState.ReadFieldEgg(record.Uid)
-			local eligible, rate = eligibleRecord(latestRecord)
+			local eligible, rate, missingFromIndex = eligibleRecord(latestRecord)
 
 			if eligible then
 				activeUid = latestRecord.Uid
 
-				if runEgg(latestRecord, rate) then
+				if runEgg(latestRecord, rate, missingFromIndex) then
 					successfulVersions[latestRecord.Uid] = versionKey(latestRecord)
 				end
 
@@ -510,7 +732,7 @@ local function processQueue()
 
 		if autoEnabled then
 			setStatus(
-				string.format("Actif : recherche >= %s $/s", formatNumber(minimumRatePerSecond)),
+				string.format("Actif : minimum %s $/s OU absent de l'index", formatNumber(minimumRatePerSecond)),
 				Color3.fromRGB(96, 230, 145)
 			)
 		end
@@ -518,7 +740,7 @@ local function processQueue()
 end
 
 local function enqueueRecord(record)
-	local eligible, rate = eligibleRecord(record)
+	local eligible, rate, missingFromIndex = eligibleRecord(record)
 
 	if not eligible then
 		return
@@ -537,13 +759,15 @@ local function enqueueRecord(record)
 	table.insert(recordQueue, {
 		Record = record,
 		Rate = rate,
+		MissingFromIndex = missingFromIndex,
 	})
 
 	print(string.format(
-		"[Auto_SAE] Cible ajoutée | UID: %s | Animal: %s | Revenu: %s $/s",
+		"[Auto_SAE] Cible ajoutée | UID: %s | Animal: %s | Revenu: %s $/s | Index: %s",
 		uid,
 		getAnimalName(record),
-		formatNumber(rate)
+		formatNumber(rate),
+		missingFromIndex and "MANQUANT" or "présent"
 	))
 
 	processQueue()
@@ -572,6 +796,15 @@ EggState.FieldGone:Connect(function(uid)
 	loggedVersions[uid] = nil
 end)
 
+local function refreshEggCandidates()
+	if autoEnabled then
+		handleSnapshot(EggState.ReadFieldEggs())
+	end
+end
+
+Save.Watch("Index"):Connect(refreshEggCandidates)
+Save.Watch("EggInventory"):Connect(refreshEggCandidates)
+
 local function stopAutomation()
 	autoEnabled = false
 	navigationToken += 1
@@ -579,7 +812,10 @@ local function stopAutomation()
 	queuedUids = {}
 	activeUid = nil
 
-	activePrompt = nil
+	if activePrompt then
+		activePrompt:InputHoldEnd()
+		activePrompt = nil
+	end
 
 	local _, humanoid = getCharacterParts()
 	if humanoid then
@@ -644,7 +880,7 @@ local function createInterface()
 	inputLabel.Size = UDim2.new(1, -28, 0, 20)
 	inputLabel.BackgroundTransparency = 1
 	inputLabel.Font = Enum.Font.Gotham
-	inputLabel.Text = "Minimum $/s en milliards (1 à 999)"
+	inputLabel.Text = "Minimum $/s en milliards (0.1 à 999)"
 	inputLabel.TextColor3 = Color3.fromRGB(174, 183, 204)
 	inputLabel.TextSize = 13
 	inputLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -658,7 +894,7 @@ local function createInterface()
 	input.BorderSizePixel = 0
 	input.ClearTextOnFocus = false
 	input.Font = Enum.Font.GothamBold
-	input.PlaceholderText = "1 - 999"
+	input.PlaceholderText = "0.1 - 999"
 	input.Text = tostring(DEFAULT_BILLIONS)
 	input.TextColor3 = Color3.fromRGB(255, 255, 255)
 	input.TextSize = 18
@@ -724,9 +960,10 @@ local function createInterface()
 			return
 		end
 
-		local billions = tonumber(input.Text)
+		local normalizedInput = string.gsub(input.Text, ",", ".")
+		local billions = tonumber(normalizedInput)
 		if not billions then
-			setStatus("Valeur invalide : entre 1 et 999", Color3.fromRGB(255, 114, 114))
+			setStatus("Valeur invalide : entre 0.1 et 999", Color3.fromRGB(255, 114, 114))
 			return
 		end
 
@@ -745,7 +982,7 @@ local function createInterface()
 		toggleButton.BackgroundColor3 = Color3.fromRGB(214, 73, 73)
 		input.TextEditable = false
 		setStatus(
-			string.format("Actif : recherche >= %s $/s", formatNumber(minimumRatePerSecond)),
+			string.format("Actif : minimum %s $/s OU absent de l'index", formatNumber(minimumRatePerSecond)),
 			Color3.fromRGB(96, 230, 145)
 		)
 
@@ -762,4 +999,4 @@ end
 
 createInterface()
 handleSnapshot(EggState.ReadFieldEggs())
-print("[Auto_SAE] Prêt : téléportation et récupération d'œufs au-dessus du seuil configuré.")
+print("[Auto_SAE] Prêt : récupère les œufs au-dessus du minimum OU absents de l'index.")
