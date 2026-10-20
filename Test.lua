@@ -31,6 +31,7 @@ local queuedUids = {}
 local successfulVersions = {}
 local loggedVersions = {}
 local recordQueue = {}
+local promptCacheBySlot = {}
 
 local function formatPosition(position)
 	return string.format(
@@ -414,37 +415,73 @@ local function promptIsUsable(prompt, rootPosition)
 		and (promptPosition - rootPosition).Magnitude <= prompt.MaxActivationDistance + 1
 end
 
-local function findCarryPromptNearEgg(record, eggPosition)
-	local eggModel = resolveEggModel(record.Uid)
-	local exactPrompt = eggModel and eggModel:FindFirstChild(CARRY_PROMPT_NAME, true)
+local function promptSlotKey(eggPosition)
+	return string.format("%.1f|%.1f", eggPosition.X, eggPosition.Z)
+end
 
-	if configureEggPrompt(exactPrompt) and exactPrompt.Enabled then
-		return exactPrompt
+local function horizontalDistance(firstPosition, secondPosition)
+	local offset = firstPosition - secondPosition
+	return Vector2.new(offset.X, offset.Z).Magnitude
+end
+
+local function findCarryPromptNearEgg(record, eggPosition)
+	local cacheKey = promptSlotKey(eggPosition)
+	local cachedPrompt = promptCacheBySlot[cacheKey]
+
+	if configureEggPrompt(cachedPrompt)
+		and cachedPrompt.Enabled
+		and cachedPrompt.Parent then
+		local cachedPosition = getPromptPosition(cachedPrompt)
+
+		if cachedPosition
+			and horizontalDistance(cachedPosition, eggPosition) <= PROMPT_SEARCH_RADIUS then
+			return cachedPrompt
+		end
 	end
+
+	promptCacheBySlot[cacheKey] = nil
 
 	local bestPrompt
 	local bestDistance = math.huge
 
-	for _, rootName in ipairs({ "AreaEggSlotsClient", "SmartPromptPart" }) do
-		local root = Workspace:FindFirstChild(rootName)
+	local function considerPrompt(prompt)
+		if not configureEggPrompt(prompt) or not prompt.Enabled then
+			return
+		end
 
-		if root then
-			for _, descendant in ipairs(root:GetDescendants()) do
-				if configureEggPrompt(descendant) and descendant.Enabled then
-					local promptPosition = getPromptPosition(descendant)
+		local promptPosition = getPromptPosition(prompt)
+		if not promptPosition then
+			return
+		end
 
-					if promptPosition then
-						local eggDistance = (promptPosition - eggPosition).Magnitude
+		local distance = horizontalDistance(promptPosition, eggPosition)
+		if distance <= PROMPT_SEARCH_RADIUS and distance < bestDistance then
+			bestDistance = distance
+			bestPrompt = prompt
+		end
+	end
 
-						if eggDistance <= PROMPT_SEARCH_RADIUS
-							and eggDistance < bestDistance then
-							bestDistance = eggDistance
-							bestPrompt = descendant
-						end
-					end
-				end
+	local eggModel = resolveEggModel(record.Uid)
+	local exactPrompt = eggModel and eggModel:FindFirstChild(CARRY_PROMPT_NAME, true)
+	considerPrompt(exactPrompt)
+
+	local renderedFolder = Workspace:FindFirstChild("AreaEggSlotsClient")
+	if renderedFolder then
+		for _, descendant in ipairs(renderedFolder:GetDescendants()) do
+			considerPrompt(descendant)
+		end
+	end
+
+	for _, workspaceChild in ipairs(Workspace:GetChildren()) do
+		if workspaceChild.Name == "SmartPromptPart" then
+			for _, descendant in ipairs(workspaceChild:GetDescendants()) do
+				considerPrompt(descendant)
 			end
 		end
+	end
+
+	if bestPrompt then
+		promptCacheBySlot[cacheKey] = bestPrompt
 	end
 
 	return bestPrompt
@@ -497,15 +534,6 @@ local function activateEggPrompt(record, prompt, token)
 		end
 
 		if prompt and prompt.Parent and promptIsUsable(prompt, rootPart.Position) then
-			local promptPosition = getPromptPosition(prompt)
-			if promptPosition then
-				local lookTarget = Vector3.new(promptPosition.X, rootPart.Position.Y, promptPosition.Z)
-
-				if (lookTarget - rootPart.Position).Magnitude > 0.01 then
-					rootPart.CFrame = CFrame.lookAt(rootPart.Position, lookTarget)
-				end
-			end
-
 			print(string.format(
 				"[Auto_SAE] Activation du prompt de l'œuf | UID: %s | HoldDuration: %.1f | MaxDistance: %.1f",
 				record.Uid,
@@ -567,24 +595,20 @@ local function runEgg(record, rate)
 	local promptActivated = false
 
 	if waitForResetWall(token) then
-		local prompt = waitForCarryPromptNearEgg(record, eggPosition, token)
+		local eggDestination = Vector3.new(
+			eggPosition.X,
+			savedStartPosition.Y,
+			eggPosition.Z
+		)
 
-		if not prompt then
-			warn(string.format("[Auto_SAE] Prompt %s introuvable pour %s.", CARRY_PROMPT_NAME, record.Uid))
-		else
-			local promptPosition = getPromptPosition(prompt)
+		if moveDirect(eggDestination, token, "la zone de l'œuf") then
+			local prompt = waitForCarryPromptNearEgg(record, eggPosition, token)
 
-			if promptPosition then
-				local promptDestination = Vector3.new(
-					promptPosition.X,
-					savedStartPosition.Y,
-					promptPosition.Z
-				)
-
-				if moveDirect(promptDestination, token, "le prompt de l'œuf") then
-					promptActivated = activateEggPrompt(record, prompt, token)
-					task.wait(0.15)
-				end
+			if not prompt then
+				warn(string.format("[Auto_SAE] Prompt %s introuvable près de %s pour %s.", CARRY_PROMPT_NAME, formatPosition(eggPosition), record.Uid))
+			else
+				promptActivated = activateEggPrompt(record, prompt, token)
+				task.wait(0.15)
 			end
 		end
 	end
