@@ -10,9 +10,9 @@ local CARRY_PROMPT_NAME = "CarryAreaEgg"
 local PROMPT_SEARCH_RADIUS = 18
 local PROMPT_SEARCH_ATTEMPTS = 40
 local PROMPT_HOLD_DURATION = 0
-local PROMPT_MAX_ACTIVATION_DISTANCE = 16
-local MOVE_ARRIVAL_DISTANCE = 6
-local MOVE_REFRESH_SECONDS = 0.25
+local PROMPT_MAX_ACTIVATION_DISTANCE = 30
+local MOVE_ARRIVAL_DISTANCE = 1.5
+local MOVE_REFRESH_SECONDS = 0.05
 local MINIMUM_BILLIONS = 1
 local MAXIMUM_BILLIONS = 999
 local DEFAULT_BILLIONS = 2
@@ -399,10 +399,7 @@ local function waitForResetWall(token)
 
 	print("[Auto_SAE] Mur de départ fermé : attente de son ouverture.")
 
-	while token == navigationToken and autoEnabled do
-		if not wallIsClosed(wall) then
-			break
-		end
+	while token == navigationToken and wallIsClosed(wall) do
 		RunService.Heartbeat:Wait()
 	end
 
@@ -573,22 +570,20 @@ local function activateEggPrompt(record, eggPosition, token)
 	activePrompt = prompt
 
 	print(string.format(
-		"[Auto_SAE] Déclenchement fireproximityprompt | UID: %s",
-		record.Uid
+		"[Auto_SAE] Activation du prompt de l'œuf | UID: %s | HoldDuration: %.1f | MaxDistance: %.1f",
+		record.Uid,
+		prompt.HoldDuration,
+		prompt.MaxActivationDistance
 	))
 
-	-- Utilisation de fireproximityprompt
-	if fireproximityprompt then
-		fireproximityprompt(prompt)
-	else
-		prompt:InputHoldBegin()
-		task.wait(math.max(prompt.HoldDuration, 0.05))
-		if activePrompt == prompt then
-			prompt:InputHoldEnd()
-		end
+	prompt:InputHoldBegin()
+	task.wait(math.max(prompt.HoldDuration, 0.05))
+
+	if activePrompt == prompt then
+		prompt:InputHoldEnd()
+		activePrompt = nil
 	end
 
-	activePrompt = nil
 	return token == navigationToken and autoEnabled
 end
 
@@ -618,26 +613,52 @@ local function runEgg(record, rate, missingFromIndex)
 	navigationToken += 1
 	local token = navigationToken
 	local savedStartPosition = rootPart.Position
+	local eggDestination = Vector3.new(
+		eggPosition.X,
+		savedStartPosition.Y,
+		eggPosition.Z
+	)
 
-	-- Target positionnée 2 studs au-dessus pour éviter d'être coincé dans le sol
-	local targetCFrame = CFrame.new(eggPosition + Vector3.new(0, 2, 0))
+	local targetReason
+	if missingFromIndex and rate >= minimumRatePerSecond then
+		targetReason = "revenu + absent de l'index"
+	elseif missingFromIndex then
+		targetReason = "absent de l'index"
+	else
+		targetReason = "revenu minimum"
+	end
 
-	-- 1. Réinitialisation de la vitesse et téléportation directe à l'œuf
-	rootPart.AssemblyLinearVelocity = Vector3.zero
-	rootPart.AssemblyAngularVelocity = Vector3.zero
-	rootPart.CFrame = targetCFrame
+	setStatus(
+		string.format("Cible : %s (%s)", getAnimalName(record), targetReason),
+		Color3.fromRGB(255, 209, 82)
+	)
 
-	task.wait(0.05) -- Courte pause pour stabiliser le serveur
+	print(string.format(
+		"[Auto_SAE] Cible sélectionnée | UID: %s | Animal: %s | Revenu: %s $/s | Motif: %s | Départ: %s",
+		record.Uid,
+		getAnimalName(record),
+		formatNumber(rate),
+		targetReason,
+		formatPosition(savedStartPosition)
+	))
 
-	-- 2. Activation du prompt
-	local promptActivated = activateEggPrompt(record, eggPosition, token)
-	task.wait(0.05)
+	local promptActivated = false
 
-	-- 3. Retour immédiat à la position de départ
+	if waitForResetWall(token)
+		and moveDirect(eggDestination, token, "l'œuf") then
+		promptActivated = activateEggPrompt(record, eggPosition, token)
+		task.wait(0.15)
+	end
+
 	if token == navigationToken and autoEnabled then
-		rootPart.AssemblyLinearVelocity = Vector3.zero
-		rootPart.AssemblyAngularVelocity = Vector3.zero
-		rootPart.CFrame = CFrame.new(savedStartPosition)
+		local returned = moveDirect(savedStartPosition, token, "la position de départ mémorisée")
+
+		if returned then
+			print(string.format(
+				"[Auto_SAE] Retour terminé : %s.",
+				formatPosition(savedStartPosition)
+			))
+		end
 	end
 
 	return promptActivated
@@ -768,9 +789,7 @@ local function stopAutomation()
 	activeUid = nil
 
 	if activePrompt then
-		if not fireproximityprompt then
-			activePrompt:InputHoldEnd()
-		end
+		activePrompt:InputHoldEnd()
 		activePrompt = nil
 	end
 
