@@ -12,8 +12,10 @@ local PROMPT_ACTIVATION_ATTEMPTS = 40
 local POSITION_ARRIVAL_DISTANCE = 4.5
 local EGG_ACTIVATION_DISTANCE = 2
 local PROMPT_DISPLAY_DISTANCE = 30
+local TARGET_PROMPT_DISTANCE = 100
 local EGG_CORRECTION_SPEED = 35
 local EGG_MOVE_REFRESH_SECONDS = 0.1
+local DEBUG_PROGRESS_INTERVAL = 0.5
 local MINIMUM_BILLIONS = 0.1
 local MAXIMUM_BILLIONS = 999
 local DEFAULT_BILLIONS = 2
@@ -34,6 +36,43 @@ local successfulVersions = {}
 local loggedVersions = {}
 local recordQueue = {}
 local promptCacheBySlot = {}
+local activeTargetPrompt = nil
+local suspendedEggPromptStates = {}
+local debugSequence = 0
+
+local function debugLog(stage, message, ...)
+	debugSequence += 1
+	local ok, rendered = pcall(string.format, message, ...)
+
+	if not ok then
+		rendered = message .. " | ERREUR_FORMAT=" .. tostring(rendered)
+	end
+
+	print(string.format(
+		"[Auto_SAE][DEBUG][%04d][%.3f][%s] %s",
+		debugSequence,
+		os.clock(),
+		stage,
+		rendered
+	))
+end
+
+local function debugWarn(stage, message, ...)
+	debugSequence += 1
+	local ok, rendered = pcall(string.format, message, ...)
+
+	if not ok then
+		rendered = message .. " | ERREUR_FORMAT=" .. tostring(rendered)
+	end
+
+	warn(string.format(
+		"[Auto_SAE][DEBUG][%04d][%.3f][%s] %s",
+		debugSequence,
+		os.clock(),
+		stage,
+		rendered
+	))
+end
 
 local function formatPosition(position)
 	return string.format(
@@ -101,6 +140,93 @@ local function setEggPromptDisplayDistance(prompt)
 	return true
 end
 
+local function suspendOtherEggPrompts(targetPrompt)
+	activeTargetPrompt = targetPrompt
+	table.clear(suspendedEggPromptStates)
+
+	local disabledCount = 0
+
+	local function suspend(prompt)
+		if not configureEggPrompt(prompt) or prompt == targetPrompt then
+			return
+		end
+
+		if suspendedEggPromptStates[prompt] == nil then
+			suspendedEggPromptStates[prompt] = prompt.Enabled
+		end
+
+		if prompt.Enabled then
+			prompt.Enabled = false
+		end
+
+		disabledCount += 1
+	end
+
+	local renderedFolder = Workspace:FindFirstChild("AreaEggSlotsClient")
+	if renderedFolder then
+		for _, descendant in ipairs(renderedFolder:GetDescendants()) do
+			suspend(descendant)
+		end
+	end
+
+	for _, workspaceChild in ipairs(Workspace:GetChildren()) do
+		if workspaceChild.Name == "SmartPromptPart" then
+			for _, descendant in ipairs(workspaceChild:GetDescendants()) do
+				suspend(descendant)
+			end
+		end
+	end
+
+	debugLog(
+		"PROMPT_ISOLATION",
+		"%d prompt(s) non cible(s) suspendu(s). Cible=%s Parent=%s",
+		disabledCount,
+		targetPrompt and targetPrompt:GetFullName() or "nil",
+		targetPrompt and targetPrompt.Parent and targetPrompt.Parent:GetFullName() or "nil"
+	)
+end
+
+local function enforceOtherEggPromptsDisabled()
+	local disabledAgain = 0
+
+	for prompt in pairs(suspendedEggPromptStates) do
+		if prompt.Parent and prompt.Enabled then
+			prompt.Enabled = false
+			disabledAgain += 1
+		end
+	end
+
+	if disabledAgain > 0 then
+		debugLog(
+			"PROMPT_ISOLATION",
+			"%d prompt(s) non cible(s) reactive(s) par le jeu puis redésactive(s).",
+			disabledAgain
+		)
+	end
+end
+
+local function restoreOtherEggPrompts(afterTriggered)
+	local restoredCount = 0
+
+	for prompt, wasEnabled in pairs(suspendedEggPromptStates) do
+		if prompt.Parent then
+			prompt.Enabled = afterTriggered and true or wasEnabled
+			restoredCount += 1
+		end
+	end
+
+	table.clear(suspendedEggPromptStates)
+	activeTargetPrompt = nil
+
+	debugLog(
+		"PROMPT_ISOLATION",
+		"%d prompt(s) restaure(s) | Triggered=%s | EtatApres=%s",
+		restoredCount,
+		tostring(afterTriggered),
+		afterTriggered and "Enabled" or "etat initial"
+	)
+end
+
 local function configureAllEggPrompts()
 	local configured = 0
 	local renderedFolder = Workspace:FindFirstChild("AreaEggSlotsClient")
@@ -129,7 +255,27 @@ end
 Workspace.DescendantAdded:Connect(function(instance)
 	if instance:IsA("ProximityPrompt") and instance.Name == CARRY_PROMPT_NAME then
 		task.defer(function()
-			setEggPromptDisplayDistance(instance)
+			if not setEggPromptDisplayDistance(instance) then
+				return
+			end
+
+			debugLog(
+				"PROMPT_ADDED",
+				"Nouveau prompt detecte : %s | Enabled=%s | MaxDistance=%.1f | HoldDuration=%.2f",
+				instance:GetFullName(),
+				tostring(instance.Enabled),
+				instance.MaxActivationDistance,
+				instance.HoldDuration
+			)
+
+			if activeTargetPrompt and instance ~= activeTargetPrompt then
+				if suspendedEggPromptStates[instance] == nil then
+					suspendedEggPromptStates[instance] = instance.Enabled
+				end
+
+				instance.Enabled = false
+				debugLog("PROMPT_ISOLATION", "Nouveau prompt non cible desactive : %s", instance:GetFullName())
+			end
 		end)
 	end
 end)
@@ -450,116 +596,221 @@ local function moveDirect(destination, token, destinationLabel)
 	return false
 end
 
-local function moveUntilPromptShown(destination, prompt, token, destinationLabel)
+local fireprompt
+local getPromptPosition
+
+local function moveUntilPromptTriggered(destination, prompt, token, destinationLabel)
 	local _, humanoid, rootPart = getCharacterParts()
 
 	if not humanoid or not rootPart or not configureEggPrompt(prompt) or not prompt.Parent then
-		warn("[Auto_SAE] Personnage, HumanoidRootPart ou prompt indisponible.")
+		debugWarn(
+			"MOVE_INIT",
+			"Demarrage refuse | Humanoid=%s | Root=%s | Prompt=%s | Parent=%s",
+			tostring(humanoid ~= nil),
+			tostring(rootPart ~= nil),
+			tostring(prompt ~= nil),
+			tostring(prompt and prompt.Parent ~= nil)
+		)
 		return false
 	end
 
-	print(string.format(
-		"[Auto_SAE] MoveTo rapide vers %s en attendant PromptShown : %s.",
-		destinationLabel,
-		formatPosition(destination)
-	))
+	prompt.MaxActivationDistance = TARGET_PROMPT_DISTANCE
+	prompt.HoldDuration = 0
+	suspendOtherEggPrompts(prompt)
 
+	local promptTriggered = false
 	local promptShown = false
-	local moveFinished = false
-	local shownConnection = prompt.PromptShown:Connect(function()
-		promptShown = true
+	local activationInProgress = false
+	local moveCommandCount = 0
+	local shownCount = 0
+	local hiddenCount = 0
+	local lastProgressLog = -math.huge
+	local lastMoveCommand = -math.huge
+
+	debugLog(
+		"MOVE_INIT",
+		"Cible preparee | Destination=%s | Prompt=%s | Enabled=%s | MaxDistance=%.1f | HoldDuration=%.2f | Root=%s",
+		formatPosition(destination),
+		prompt:GetFullName(),
+		tostring(prompt.Enabled),
+		prompt.MaxActivationDistance,
+		prompt.HoldDuration,
+		formatPosition(rootPart.Position)
+	)
+
+	local function requestActivation(reason)
+		if activationInProgress or promptTriggered or not prompt.Parent or not autoEnabled then
+			debugLog(
+				"ACTIVATION_SKIP",
+				"Activation ignoree | Raison=%s | InProgress=%s | Triggered=%s | Parent=%s | Auto=%s",
+				reason,
+				tostring(activationInProgress),
+				tostring(promptTriggered),
+				tostring(prompt.Parent ~= nil),
+				tostring(autoEnabled)
+			)
+			return
+		end
+
+		activationInProgress = true
+		debugLog("ACTIVATION_REQUEST", "fireprompt lance | Raison=%s", reason)
+
+		task.defer(function()
+			local activationResult = fireprompt(prompt)
+			debugLog(
+				"ACTIVATION_RESULT",
+				"fireprompt termine | Resultat=%s | TriggeredObserve=%s | Enabled=%s | Parent=%s",
+				tostring(activationResult),
+				tostring(promptTriggered),
+				tostring(prompt.Enabled),
+				tostring(prompt.Parent ~= nil)
+			)
+			activationInProgress = false
+		end)
+	end
+
+	local triggeredConnection = prompt.Triggered:Connect(function(triggeringPlayer)
+		debugLog(
+			"TRIGGERED_EVENT",
+			"Evenement recu | Joueur=%s | LocalPlayer=%s",
+			triggeringPlayer and triggeringPlayer.Name or "nil",
+			player.Name
+		)
+
+		if triggeringPlayer == nil or triggeringPlayer == player then
+			promptTriggered = true
+			debugLog("TRIGGERED_EVENT", "Confirmation acceptee : la boucle MoveTo peut s'arreter.")
+		else
+			debugWarn("TRIGGERED_EVENT", "Confirmation ignoree car elle vient d'un autre joueur.")
+		end
 	end)
-	local moveConnection = humanoid.MoveToFinished:Connect(function()
-		moveFinished = true
+
+	local shownConnection = prompt.PromptShown:Connect(function(inputType)
+		shownCount += 1
+		promptShown = true
+		prompt.MaxActivationDistance = TARGET_PROMPT_DISTANCE
+		prompt.HoldDuration = 0
+
+		debugLog(
+			"PROMPT_SHOWN",
+			"Affichage #%d | Input=%s | Enabled=%s | MaxDistance=%.1f | HoldDuration=%.2f | Boucle continue jusqu'a Triggered",
+			shownCount,
+			tostring(inputType),
+			tostring(prompt.Enabled),
+			prompt.MaxActivationDistance,
+			prompt.HoldDuration
+		)
+
+		requestActivation("PromptShown #" .. tostring(shownCount))
+	end)
+
+	local hiddenConnection = prompt.PromptHidden:Connect(function()
+		hiddenCount += 1
+		promptShown = false
+		debugWarn(
+			"PROMPT_HIDDEN",
+			"Disparition #%d | Enabled=%s | Parent=%s | La boucle MoveTo continue.",
+			hiddenCount,
+			tostring(prompt.Enabled),
+			tostring(prompt.Parent ~= nil)
+		)
 	end)
 
 	local function disconnectEvents()
+		triggeredConnection:Disconnect()
 		shownConnection:Disconnect()
-		moveConnection:Disconnect()
+		hiddenConnection:Disconnect()
 	end
 
-	setEggPromptDisplayDistance(prompt)
 	RunService.Heartbeat:Wait()
 
-	local promptParent = prompt.Parent
-	local promptPosition = nil
-
-	if promptParent:IsA("Attachment") then
-		promptPosition = promptParent.WorldPosition
-	elseif promptParent:IsA("BasePart") then
-		promptPosition = promptParent.Position
-	end
-
-	if promptPosition
+	local promptPosition = getPromptPosition(prompt)
+	if prompt.Enabled
+		and promptPosition
 		and (promptPosition - rootPart.Position).Magnitude <= prompt.MaxActivationDistance + 1 then
 		promptShown = true
+		debugLog(
+			"PROMPT_VISIBLE_FALLBACK",
+			"Prompt deja visible a la connexion | Distance3D=%.2f | Activation lancee.",
+			(promptPosition - rootPart.Position).Magnitude
+		)
+		requestActivation("prompt deja visible")
 	end
 
-	humanoid:MoveTo(destination)
-
-	while token == navigationToken
-		and autoEnabled
-		and prompt.Parent
-		and not promptShown
-		and not moveFinished do
-		RunService.Heartbeat:Wait()
-	end
-
-	if token ~= navigationToken or not autoEnabled or not prompt.Parent then
-		disconnectEvents()
-		return false
-	end
-
-	local speedToRestore = humanoid.WalkSpeed
-	humanoid.WalkSpeed = math.min(speedToRestore, EGG_CORRECTION_SPEED)
-	local lastMoveCommand = -math.huge
-
-	print(string.format(
-		"[Auto_SAE] Approche finale de l'œuf à %.0f studs/s.",
-		humanoid.WalkSpeed
-	))
-
-	local function restoreSpeed()
-		if humanoid.Parent then
-			humanoid.WalkSpeed = speedToRestore
-		end
-	end
-
-	while token == navigationToken and autoEnabled and prompt.Parent do
+	while token == navigationToken and autoEnabled and not promptTriggered do
 		if humanoid.Health <= 0 or not rootPart.Parent then
-			restoreSpeed()
-			disconnectEvents()
-			return false
+			debugWarn(
+				"MOVE_ABORT",
+				"Personnage invalide | Health=%.1f | RootParent=%s",
+				humanoid.Health,
+				tostring(rootPart.Parent ~= nil)
+			)
+			break
 		end
 
-		local offset = destination - rootPart.Position
-		local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
-
-		if promptShown and distance <= EGG_ACTIVATION_DISTANCE then
-			humanoid:Move(Vector3.zero)
-			humanoid:MoveTo(rootPart.Position)
-			restoreSpeed()
-			disconnectEvents()
-			print("[Auto_SAE] PromptShown confirmé et distance d'activation atteinte.")
-			return true
+		if not prompt.Parent then
+			debugWarn("MOVE_ABORT", "Le prompt cible a perdu son Parent avant Triggered.")
+			break
 		end
 
 		local now = os.clock()
+		local offset = destination - rootPart.Position
+		local horizontalDistanceToEgg = Vector2.new(offset.X, offset.Z).Magnitude
+		local promptPositionNow = getPromptPosition(prompt)
+		local promptDistance = promptPositionNow and (promptPositionNow - rootPart.Position).Magnitude or -1
+
 		if now - lastMoveCommand >= EGG_MOVE_REFRESH_SECONDS then
+			enforceOtherEggPromptsDisabled()
 			humanoid:MoveTo(destination)
 			lastMoveCommand = now
+			moveCommandCount += 1
+		end
+
+		if now - lastProgressLog >= DEBUG_PROGRESS_INTERVAL then
+			lastProgressLog = now
+			debugLog(
+				"MOVE_PROGRESS",
+				"Commande=%d | Position=%s | DistanceEggXZ=%.2f | DistancePrompt3D=%.2f | Shown=%s | Enabled=%s | Activation=%s | Triggered=%s",
+				moveCommandCount,
+				formatPosition(rootPart.Position),
+				horizontalDistanceToEgg,
+				promptDistance,
+				tostring(promptShown),
+				tostring(prompt.Enabled),
+				tostring(activationInProgress),
+				tostring(promptTriggered)
+			)
 		end
 
 		RunService.Heartbeat:Wait()
 	end
 
 	humanoid:Move(Vector3.zero)
-	restoreSpeed()
+	humanoid:MoveTo(rootPart.Position)
 	disconnectEvents()
+	restoreOtherEggPrompts(promptTriggered)
+
+	if promptTriggered and token == navigationToken and autoEnabled then
+		debugLog(
+			"MOVE_COMPLETE",
+			"Triggered confirme apres %d commande(s) MoveTo | Position finale=%s | Retour autorise.",
+			moveCommandCount,
+			formatPosition(rootPart.Position)
+		)
+		return true
+	end
+
+	debugWarn(
+		"MOVE_FAILED",
+		"Fin sans Triggered | TokenValide=%s | Auto=%s | PromptParent=%s | Commandes=%d",
+		tostring(token == navigationToken),
+		tostring(autoEnabled),
+		tostring(prompt.Parent ~= nil),
+		moveCommandCount
+	)
 	return false
 end
-
-local function getPromptPosition(prompt)
+getPromptPosition = function(prompt)
 	local parent = prompt.Parent
 
 	if not parent then
@@ -579,7 +830,7 @@ local function getPromptPosition(prompt)
 end
 
 local function promptIsUsable(prompt, rootPosition)
-	if not setEggPromptDisplayDistance(prompt) or not prompt.Enabled then
+	if not configureEggPrompt(prompt) or not prompt.Enabled then
 		return false
 	end
 
@@ -602,7 +853,6 @@ local function findCarryPromptNearEgg(record, eggPosition)
 	local cachedPrompt = promptCacheBySlot[cacheKey]
 
 	if setEggPromptDisplayDistance(cachedPrompt)
-		and cachedPrompt.Enabled
 		and cachedPrompt.Parent then
 		local cachedPosition = getPromptPosition(cachedPrompt)
 
@@ -618,7 +868,7 @@ local function findCarryPromptNearEgg(record, eggPosition)
 	local bestDistance = math.huge
 
 	local function considerPrompt(prompt)
-		if not configureEggPrompt(prompt) or not prompt.Enabled then
+		if not configureEggPrompt(prompt) or not prompt.Parent then
 			return
 		end
 
@@ -662,10 +912,33 @@ end
 
 local function waitForCarryPromptNearEgg(record, eggPosition, token)
 	local waitingLogged = false
+	local searchCount = 0
+	local lastDebugLog = -math.huge
+
+	debugLog(
+		"PROMPT_SEARCH",
+		"Debut recherche | UID=%s | EggPosition=%s | Rayon=%.1f",
+		record.Uid,
+		formatPosition(eggPosition),
+		PROMPT_SEARCH_RADIUS
+	)
 
 	while token == navigationToken and autoEnabled do
+		searchCount += 1
 		local prompt = findCarryPromptNearEgg(record, eggPosition)
+
 		if prompt then
+			local promptPosition = getPromptPosition(prompt)
+			debugLog(
+				"PROMPT_FOUND",
+				"Trouve apres %d scan(s) | Path=%s | Position=%s | Enabled=%s | MaxDistance=%.1f | HoldDuration=%.2f",
+				searchCount,
+				prompt:GetFullName(),
+				promptPosition and formatPosition(promptPosition) or "nil",
+				tostring(prompt.Enabled),
+				prompt.MaxActivationDistance,
+				prompt.HoldDuration
+			)
 			return prompt
 		end
 
@@ -677,36 +950,91 @@ local function waitForCarryPromptNearEgg(record, eggPosition, token)
 			))
 		end
 
+		if os.clock() - lastDebugLog >= 1 then
+			lastDebugLog = os.clock()
+			debugLog(
+				"PROMPT_SEARCH",
+				"Scan #%d sans resultat | UID=%s | TokenValide=%s | Auto=%s",
+				searchCount,
+				record.Uid,
+				tostring(token == navigationToken),
+				tostring(autoEnabled)
+			)
+		end
+
 		local readOk, currentRecord = pcall(EggState.ReadFieldEgg, record.Uid)
 		if readOk and (currentRecord == nil or currentRecord.State ~= SLOT_STATE) then
+			debugWarn(
+				"PROMPT_SEARCH",
+				"Recherche abandonnee : l'oeuf n'est plus dans l'etat Slot | UID=%s",
+				record.Uid
+			)
 			return nil
 		end
 
 		task.wait(0.1)
 	end
 
+	debugWarn(
+		"PROMPT_SEARCH",
+		"Recherche interrompue | UID=%s | TokenValide=%s | Auto=%s",
+		record.Uid,
+		tostring(token == navigationToken),
+		tostring(autoEnabled)
+	)
 	return nil
 end
 
-
-local function fireprompt(prompt)
+fireprompt = function(prompt)
 	if not configureEggPrompt(prompt) or not prompt.Enabled or not prompt.Parent then
+		debugWarn(
+			"FIRE_REJECTED",
+			"Prompt inutilisable | Configure=%s | Enabled=%s | Parent=%s",
+			tostring(configureEggPrompt(prompt)),
+			tostring(prompt and prompt.Enabled),
+			tostring(prompt and prompt.Parent ~= nil)
+		)
 		return false
 	end
 
+	debugLog(
+		"FIRE_START",
+		"Debut | Prompt=%s | Enabled=%s | MaxDistance=%.1f | HoldDuration=%.2f",
+		prompt:GetFullName(),
+		tostring(prompt.Enabled),
+		prompt.MaxActivationDistance,
+		prompt.HoldDuration
+	)
+
 	for attempt = 1, 3 do
 		if not autoEnabled or not prompt.Parent or not prompt.Enabled then
+			debugWarn(
+				"FIRE_ABORT",
+				"Tentative %d annulee | Auto=%s | Parent=%s | Enabled=%s",
+				attempt,
+				tostring(autoEnabled),
+				tostring(prompt.Parent ~= nil),
+				tostring(prompt.Enabled)
+			)
 			return false
 		end
 
 		local triggered = false
 		local connection = prompt.Triggered:Connect(function(triggeringPlayer)
+			debugLog(
+				"FIRE_TRIGGERED",
+				"Tentative %d | Joueur=%s",
+				attempt,
+				triggeringPlayer and triggeringPlayer.Name or "nil"
+			)
+
 			if triggeringPlayer == nil or triggeringPlayer == player then
 				triggered = true
 			end
 		end)
 
 		activePrompt = prompt
+		debugLog("FIRE_ATTEMPT", "Tentative %d/3 : InputHoldBegin.", attempt)
 
 		local beginOk, beginError = pcall(function()
 			prompt:InputHoldBegin()
@@ -715,11 +1043,19 @@ local function fireprompt(prompt)
 		if not beginOk then
 			connection:Disconnect()
 			activePrompt = nil
-			warn("[Auto_SAE] InputHoldBegin impossible :", beginError)
+			debugWarn("FIRE_ERROR", "InputHoldBegin impossible | Tentative=%d | Erreur=%s", attempt, tostring(beginError))
 			return false
 		end
 
 		local deadline = os.clock() + math.max(prompt.HoldDuration, 0) + 0.35
+		debugLog(
+			"FIRE_WAIT",
+			"Tentative %d | DeadlineDans=%.3f | HoldDuration=%.2f",
+			attempt,
+			deadline - os.clock(),
+			prompt.HoldDuration
+		)
+
 		while activePrompt == prompt
 			and autoEnabled
 			and prompt.Parent
@@ -730,27 +1066,41 @@ local function fireprompt(prompt)
 		end
 
 		if activePrompt == prompt then
-			pcall(function()
+			local endOk, endError = pcall(function()
 				prompt:InputHoldEnd()
 			end)
 			activePrompt = nil
+			debugLog(
+				"FIRE_HOLD_END",
+				"Tentative %d | InputHoldEndOk=%s | Erreur=%s",
+				attempt,
+				tostring(endOk),
+				tostring(endError)
+			)
 		end
 
 		RunService.Heartbeat:Wait()
 		connection:Disconnect()
 
 		if triggered then
-			print(string.format("[Auto_SAE] Prompt activé à la tentative %d.", attempt))
+			debugLog("FIRE_SUCCESS", "Triggered confirme a la tentative %d.", attempt)
 			return true
 		end
 
+		debugWarn(
+			"FIRE_RETRY",
+			"Echec tentative %d | Enabled=%s | Parent=%s | Auto=%s",
+			attempt,
+			tostring(prompt.Enabled),
+			tostring(prompt.Parent ~= nil),
+			tostring(autoEnabled)
+		)
 		task.wait(0.1)
 	end
 
-	warn("[Auto_SAE] Le prompt n'a pas confirmé son activation après 3 tentatives.")
+	debugWarn("FIRE_FAILED", "Aucun Triggered apres 3 tentatives.")
 	return false
 end
-
 local function activateEggPrompt(record, prompt, token)
 	for _ = 1, PROMPT_ACTIVATION_ATTEMPTS do
 		if token ~= navigationToken or not autoEnabled then
@@ -763,6 +1113,9 @@ local function activateEggPrompt(record, prompt, token)
 		end
 
 		if prompt and prompt.Parent and promptIsUsable(prompt, rootPart.Position) then
+			prompt.MaxActivationDistance = TARGET_PROMPT_DISTANCE
+			prompt.HoldDuration = 0
+
 			print(string.format(
 				"[Auto_SAE] Activation du prompt de l'œuf | UID: %s | HoldDuration: %.1f | MaxDistance: %.1f",
 				record.Uid,
@@ -834,8 +1187,23 @@ local function runEgg(record, rate)
 
 		if not prompt then
 			warn(string.format("[Auto_SAE] Prompt %s introuvable près de %s pour %s.", CARRY_PROMPT_NAME, formatPosition(eggPosition), record.Uid))
-		elseif moveUntilPromptShown(eggDestination, prompt, token, "la zone de l'œuf") then
-			promptActivated = activateEggPrompt(record, prompt, token)
+		else
+			debugLog(
+				"TARGET_PROMPT",
+				"Prompt cible retenu | UID=%s | Path=%s | Enabled=%s | MaxDistanceAvant=%.1f | HoldDurationAvant=%.2f",
+				record.Uid,
+				prompt:GetFullName(),
+				tostring(prompt.Enabled),
+				prompt.MaxActivationDistance,
+				prompt.HoldDuration
+			)
+
+			promptActivated = moveUntilPromptTriggered(
+				eggDestination,
+				prompt,
+				token,
+				"la zone de l'œuf"
+			)
 			task.wait(0.15)
 		end
 	end
