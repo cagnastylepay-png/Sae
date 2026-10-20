@@ -1,6 +1,3 @@
--- Auto_SAE v2. Official EggState API; one client script.
--- The live game must provide ReplicatedStorage.Client/Data/Shared.
--- Display range is cosmetic: server carry validation remains authoritative.
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -11,33 +8,34 @@ assert(player, "Auto_SAE doit etre execute sur le client")
 local CONFIG = {
 	Debug = true,
 	ProgressInterval = 0.5,
-	MoveRefresh = 0.1,
+	FlyStepCount = 16,
+	FlyStepDelay = 0.02,
+	FlySettleTime = 0.1,
+	FlyArrivalTolerance = 2,
 	ScanInterval = 0.25,
-	GrabDistance = 2,
-	ReturnDistance = 3,
-	TargetPromptDistance = 100,
-	IsolateOtherEggPrompts = true,
 	RequestTimeout = 10,
-	RequestInterval = 1,
-	MaxCarryAttempts = 3,
+	MaxCarryAttempts = 1,
 	ClaimTimeout = 12,
-	NoMovementTimeout = 10,
 	FailedTargetCooldown = 10,
+	RecoveryStateTimeout = 30,
+	RecoveryRetryDelay = 0.5,
 }
 local MINIMUM_BILLIONS, MAXIMUM_BILLIONS, DEFAULT_BILLIONS = 0.1, 999, 2
 local SLOT_STATE = "Slot"
+local CARRY_LOST = "CARRY_LOST"
 local EggState, Assets, EggRecords, AssetEarnings, SlotIdentity, GuardGeometry, Save
 local ready, destroyed, autoEnabled = false, false, false
 local generation = 0
 local minimumRatePerSecond = DEFAULT_BILLIONS * 1e9
 local records, loggedVersions, cooldowns = {}, {}, {}
-local prompts, lifetimeConnections = {}, {}
+local lifetimeConnections = {}
 local currentCycle, safeHome
 local inFlightRequest = shared.__AutoSAERemoteLock
 local statusLabel, toggleButton, minimumInput
 local sequence = 0
 local renderControls
 local stopAutomation
+local carryWasLost
 
 local function log(stage, message, ...)
 	if not CONFIG.Debug and stage ~= "ERROR" and stage ~= "CLAIM_CONFIRMED" then
@@ -48,7 +46,7 @@ local function log(stage, message, ...)
 	if not ok then
 		text = message .. " | format=" .. tostring(text)
 	end
-	print(string.format("[Auto_SAE][%04d][%.3f][%s][%s] %s",
+	print(string.format("[Auto_SAE_SafeFly][%04d][%.3f][%s][%s] %s",
 		sequence, os.clock(), stage, currentCycle and currentCycle.uid or "-", text))
 end
 
@@ -199,13 +197,13 @@ local function getRatePerSecond(record)
 
 	local itemOk, itemData = pcall(EggRecords.ToAssetItemData, record)
 	if not itemOk then
-		warn("[Auto_SAE] Conversion impossible pour le revenu de", record.Uid, itemData)
+		warn("[Auto_SAE_SafeFly] Conversion impossible pour le revenu de", record.Uid, itemData)
 		return nil
 	end
 
 	local rateOk, rate = pcall(AssetEarnings.RatePerSecond, itemData)
 	if not rateOk or type(rate) ~= "number" then
-		warn("[Auto_SAE] Calcul du revenu impossible pour", record.Uid, rate)
+		warn("[Auto_SAE_SafeFly] Calcul du revenu impossible pour", record.Uid, rate)
 		return nil
 	end
 
@@ -270,7 +268,7 @@ local function logEgg(record)
 	local rate = getRatePerSecond(record)
 
 	print(string.format(
-		"[Auto_SAE][EGG] %s | %s | %s | %s | %s Kg | %s $/s | %s | %s",
+		"[Auto_SAE_SafeFly][EGG] %s | %s | %s | %s | %s Kg | %s $/s | %s | %s",
 		record.Uid,
 		getAnimalName(record),
 		getRarityName(record),
@@ -282,159 +280,6 @@ local function logEgg(record)
 	))
 end
 
-
-local function isEggPrompt(prompt)
-	if not prompt:IsA("ProximityPrompt") or prompt.Name ~= "CarryAreaEgg" then return false end
-	local ancestor = prompt.Parent
-	while ancestor and ancestor ~= Workspace do
-		if ancestor.Name == "SmartPromptPart" or ancestor.Name == "AreaEggSlotsClient" then
-			return true
-		end
-		ancestor = ancestor.Parent
-	end
-	return false
-end
-
-local function promptPosition(prompt)
-	local parent = prompt.Parent
-	if not parent then return nil end
-	if parent:IsA("Attachment") then return parent.WorldPosition end
-	if parent:IsA("BasePart") then return parent.Position end
-	if parent:IsA("Model") then return parent:GetPivot().Position end
-	return nil
-end
-
-local function enforcePrompt(prompt, entry)
-	local ctx = currentCycle
-	if entry.writing or not ctx or not prompt.Parent then return end
-	local target = prompt == ctx.prompt
-	if not target and not CONFIG.IsolateOtherEggPrompts then return end
-	if not entry.saved then
-		entry.saved = {
-			Enabled = prompt.Enabled,
-			MaxActivationDistance = prompt.MaxActivationDistance,
-			HoldDuration = prompt.HoldDuration,
-		}
-	end
-	entry.writing = true
-	if target then
-		if prompt.MaxActivationDistance ~= CONFIG.TargetPromptDistance then
-			prompt.MaxActivationDistance = CONFIG.TargetPromptDistance
-		end
-		if prompt.HoldDuration ~= 0 then prompt.HoldDuration = 0 end
-	else
-		if prompt.Enabled then prompt.Enabled = false end
-	end
-	entry.writing = false
-end
-
-local function restorePrompts()
-	for prompt, entry in pairs(prompts) do
-		if entry.saved then
-			entry.writing = true
-			if prompt.Parent then
-				prompt.Enabled = entry.saved.Enabled
-				prompt.MaxActivationDistance = entry.saved.MaxActivationDistance
-				prompt.HoldDuration = entry.saved.HoldDuration
-			end
-			entry.writing = false
-			entry.saved = nil
-		end
-	end
-	log("PROMPTS_RESTORED", "Proprietes externes restaurees")
-end
-
-local function registerPrompt(prompt)
-	if destroyed or prompts[prompt] or not isEggPrompt(prompt) then return end
-	local entry = {writing = false, connections = {}, overwrites = 0}
-	prompts[prompt] = entry
-	for _, property in ipairs({"Enabled", "MaxActivationDistance", "HoldDuration"}) do
-		table.insert(entry.connections, prompt:GetPropertyChangedSignal(property):Connect(function()
-			if entry.writing then return end
-			local expected
-			local ctx = currentCycle
-			if ctx and ctx.prompt == prompt then
-				if property == "MaxActivationDistance" then expected = CONFIG.TargetPromptDistance end
-				if property == "HoldDuration" then expected = 0 end
-			elseif ctx and CONFIG.IsolateOtherEggPrompts and property == "Enabled" then
-				expected = false
-			end
-			-- Deferred signals may arrive after our writing flag has been cleared.
-			if entry.saved and (expected == nil or prompt[property] ~= expected) then
-				entry.saved[property] = prompt[property]
-				entry.overwrites += 1
-			end
-			enforcePrompt(prompt, entry)
-		end))
-	end
-	for _, event in ipairs({"PromptShown", "PromptHidden", "Triggered"}) do
-		table.insert(entry.connections, prompt[event]:Connect(function(value)
-			local ctx = currentCycle
-			if not ctx or ctx.prompt ~= prompt then return end
-			if event == "PromptShown" then ctx.promptShown = true end
-			if event == "PromptHidden" then ctx.promptShown = false end
-			log("PROMPT_" .. string.upper(event), "Value=%s Enabled=%s Hold=%.2f Max=%.1f",
-				tostring(value), tostring(prompt.Enabled), prompt.HoldDuration, prompt.MaxActivationDistance)
-			-- These local events are diagnostics. They never confirm ownership.
-		end))
-	end
-	table.insert(entry.connections, prompt.Destroying:Connect(function()
-		for _, connection in ipairs(entry.connections) do connection:Disconnect() end
-		prompts[prompt] = nil
-		if currentCycle and currentCycle.prompt == prompt then
-			currentCycle.prompt = nil
-			log("PROMPT_DESTROYED", "La prise par UID reste disponible")
-		end
-	end))
-	enforcePrompt(prompt, entry)
-	log("PROMPT_REGISTERED", "%s Enabled=%s", prompt:GetFullName(), tostring(prompt.Enabled))
-end
-
-local function startPromptRegistry()
-	-- One initial scan restricted to official egg roots, then event-driven updates.
-	local folder = Workspace:FindFirstChild("AreaEggSlotsClient")
-	if folder then
-		for _, instance in ipairs(folder:GetDescendants()) do registerPrompt(instance) end
-	end
-	for _, child in ipairs(Workspace:GetChildren()) do
-		if child.Name == "SmartPromptPart" then
-			for _, instance in ipairs(child:GetDescendants()) do registerPrompt(instance) end
-		end
-	end
-	connect(Workspace.DescendantAdded, function(instance)
-		if instance:IsA("ProximityPrompt") and instance.Name == "CarryAreaEgg" then
-			task.defer(registerPrompt, instance)
-		end
-	end)
-end
-
-local function findTargetPrompt(ctx)
-	if ctx.prompt and ctx.prompt.Parent then return end
-	local best, bestDistance, secondDistance = nil, 18, math.huge
-	for prompt in pairs(prompts) do
-		local position = promptPosition(prompt)
-		if position then
-			local distance = distanceXZ(position, ctx.eggPosition)
-			if distance < bestDistance then
-				secondDistance, bestDistance, best = best and bestDistance or math.huge, distance, prompt
-			elseif distance < secondDistance then
-				secondDistance = distance
-			end
-		end
-	end
-	if best and secondDistance - bestDistance > 0.5 then
-		ctx.prompt = best
-		local entry = prompts[best]
-		if entry.saved then
-			entry.writing = true
-			best.Enabled = entry.saved.Enabled
-			entry.writing = false
-		end
-		enforcePrompt(best, prompts[best])
-		log("TARGET_PROMPT", "%s OffsetXZ=%.2f | prise serveur ciblee par UID",
-			best:GetFullName(), bestDistance)
-	end
-end
 
 local function ownerSnapshot()
 	local ok, inventory = pcall(EggState.ReadOwnerEggs, player.UserId)
@@ -472,6 +317,13 @@ local function updateCarryEvidence(ctx)
 	end
 	local carry = readCarry()
 	if carry and carry.IsCarrying and carry.Uid == ctx.uid then
+		if ctx.reacquiring and not ctx.sawCarry then
+			local latest = readField(ctx.uid)
+			local freshTransport = latest and latest.State == "Carried"
+				and latest.CarrierUserId == player.UserId
+				and (not ctx.pickupVersion or latest.Version > ctx.pickupVersion)
+			if not freshTransport then return ctx.remoteAccepted == true end
+		end
 		ctx.sawCarry = true
 		return true
 	end
@@ -508,88 +360,284 @@ local function requestCarry(ctx)
 		if not validCycle(ctx) then return end
 		ctx.remoteAccepted = request.accepted
 		ctx.denial = request.reason
+		if ctx.onCarryReply then ctx.onCarryReply(request) end
 	end)
+	return request
 end
 
-local function moveLoop(ctx, destination, phase)
+-- Cancellable event wait for the single official server carry request.
+local function awaitCycleOperation(ctx, timeout, start)
+	if not validCycle(ctx) then return false, "annule" end
+	local signal = Instance.new("BindableEvent")
+	local completed, result = false, nil
+	local function finish(...)
+		if completed then return end
+		completed = true
+		result = table.pack(...)
+		signal:Fire()
+	end
+	local cancel = function() finish(false, "annule") end
+	ctx.cancelPendingWait = cancel
+	local timer = task.delay(timeout, function() finish(false, "delai depasse") end)
+	local startOK, dispose = pcall(start, finish)
+	if not startOK then finish(false, tostring(dispose)) end
+	if not completed then signal.Event:Wait() end
+	if ctx.cancelPendingWait == cancel then ctx.cancelPendingWait = nil end
+	pcall(task.cancel, timer)
+	if startOK and type(dispose) == "function" then pcall(dispose) end
+	signal:Destroy()
+	return table.unpack(result, 1, result.n)
+end
+
+local function traceMoveEnd(ctx, root, destination, reached)
+	local latest = readField(ctx.uid)
+	local fromRecord = latest and typeof(latest.BottomCFrame) == "CFrame"
+	local eggPosition = fromRecord and latest.BottomCFrame.Position or ctx.eggPosition or destination
+	local playerPosition = root.Position
+	local measuredAt = os.clock()
+	ctx.moveEndTrace = {
+		EggPosition = eggPosition, PlayerPosition = playerPosition,
+		Reached = reached, At = measuredAt,
+	}
+	log("MOVE_END_POSITIONS", "Reached=%s | Oeuf=%s | Player=%s | DestinationSafeFly=%s | DistanceXZ=%.2f studs | Distance3D=%.2f studs | Vitesse=%.2f studs/s | SourceOeuf=%s",
+		tostring(reached), formatPosition(eggPosition), formatPosition(playerPosition),
+		formatPosition(destination), distanceXZ(playerPosition, eggPosition),
+		(playerPosition - eggPosition).Magnitude, root.AssemblyLinearVelocity.Magnitude,
+		fromRecord and "EggState" or "memorisee")
+	for _, delaySeconds in ipairs({0.1, 0.25, 0.5}) do
+		task.delay(delaySeconds, function()
+			if not validCycle(ctx) or (ctx.phase ~= "APPROACH" and ctx.phase ~= "CARRY_PENDING") then return end
+			local _, _, currentRoot = getCharacterParts()
+			if currentRoot ~= root then return end
+			local position = root.Position
+			log("MOVE_END_DRIFT", "ApresFin=%.3fs | Phase=%s | Oeuf=%s | Player=%s | DistanceXZ=%.2f studs | DeplacementDepuisFinXZ=%.2f studs | Vitesse=%.2f studs/s",
+				os.clock() - measuredAt, tostring(ctx.phase), formatPosition(eggPosition),
+				formatPosition(position), distanceXZ(position, eggPosition),
+				distanceXZ(position, playerPosition), root.AssemblyLinearVelocity.Magnitude)
+		end)
+	end
+end
+
+-- Experimental local interpolation; server acceptance is still authoritative.
+-- Target positions already use ctx.home.Y. Unlike the linked version, no +5/+6 Y offsets.
+local function safeFlyTeleport(ctx, targetPos, returning)
 	local _, humanoid, root = getCharacterParts()
 	if not humanoid or not root then return false, "personnage absent" end
-	local started, lastCommand, lastLog = os.clock(), -math.huge, -math.huge
-	local lastMoved, lastPosition = started, root.Position
-	local distance = distanceXZ(root.Position, destination)
-	local timeout = math.clamp(distance / math.max(humanoid.WalkSpeed, 1) * 4 + 15, 15, 150)
-	setPhase(ctx, phase, phase == "RETURN" and "Retour vers la zone sure" or "Approche : " .. getAnimalName(ctx.record))
-	while true do
-		local valid, reason = validCycle(ctx)
-		if not valid then return false, reason end
-		local now = os.clock()
-		distance = distanceXZ(root.Position, destination)
-		if distanceXZ(lastPosition, root.Position) >= 0.5 then
-			lastMoved, lastPosition = now, root.Position
+	local valid, invalidReason = validCycle(ctx)
+	if not valid then return false, invalidReason end
+	if ctx.cancelFlight then return false, "vol deja en cours" end
+
+	local oldAutoRotate = humanoid.AutoRotate
+	local oldState = humanoid:GetState()
+	local startPos, rotation = root.Position, root.CFrame.Rotation
+	local steps = math.max(1, math.floor(CONFIG.FlyStepCount))
+	local started, active = os.clock(), true
+	local cancel
+	local function restore()
+		if not active then return end
+		active = false
+		if ctx.cancelFlight == cancel then ctx.cancelFlight = nil end
+		-- Restore immediately on STOP, before a new cycle can use the same humanoid.
+		pcall(function()
+			humanoid.AutoRotate = oldAutoRotate
+			if humanoid.Health > 0 and humanoid:GetState() == Enum.HumanoidStateType.Freefall then
+				humanoid:ChangeState(oldState)
+			end
+		end)
+	end
+	cancel = restore
+	ctx.cancelFlight = cancel
+	local function canContinue()
+		local cycleValid, reason = validCycle(ctx)
+		if not active or not cycleValid then return false, reason or "annule" end
+		if returning and carryWasLost(ctx) then return false, CARRY_LOST end
+		if ctx.character:GetAttribute("IsTrapped") == true then
+			return false, "personnage immobilise par le serveur"
 		end
+		return true
+	end
+
+	log("FLY_START", "Phase=%s Depart=%s Destination=%s Etapes=%d Pause=%.3fs WalkSpeed=%.1f",
+		ctx.phase, formatPosition(startPos), formatPosition(targetPos),
+		steps, CONFIG.FlyStepDelay, humanoid.WalkSpeed)
+	local callOK, arrived, reason = xpcall(function()
+		stopMovement()
+		humanoid.AutoRotate = false
+		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+		root.AssemblyLinearVelocity = Vector3.zero
+		for step = 1, steps do
+			local allowed, blockedReason = canContinue()
+			if not allowed then return false, blockedReason end
+			-- A CFrame is assigned, not the erroneous Vector3 assignment in the gist.
+			root.CFrame = CFrame.new(startPos:Lerp(targetPos, step / steps)) * rotation
+			log("FLY_STEP", "Phase=%s Etape=%d/%d Player=%s DistanceXZ=%.2f",
+				ctx.phase, step, steps, formatPosition(root.Position), distanceXZ(root.Position, targetPos))
+			task.wait(CONFIG.FlyStepDelay)
+		end
+		local allowed, blockedReason = canContinue()
+		if not allowed then return false, blockedReason end
+		root.AssemblyLinearVelocity = Vector3.zero
+		-- Allow replication/physics to advance; do not repeatedly snap back if corrected.
+		task.wait(CONFIG.FlySettleTime)
+		allowed, blockedReason = canContinue()
+		if not allowed then return false, blockedReason end
+		if (root.Position - targetPos).Magnitude > CONFIG.FlyArrivalTolerance then
+			return false, "arrivee non confirmee apres interpolation (physique / correction possible)"
+		end
+		return true
+	end, debug.traceback)
+	restore()
+	if not callOK then reason, arrived = tostring(arrived), false end
+	log("FLY_END", "Phase=%s Arrive=%s Player=%s Destination=%s DistanceXZ=%.2f Distance3D=%.2f Duree=%.3fs Raison=%s",
+		ctx.phase, tostring(arrived), formatPosition(root.Position), formatPosition(targetPos),
+		distanceXZ(root.Position, targetPos), (root.Position - targetPos).Magnitude,
+		os.clock() - started, tostring(reason))
+	return arrived == true, reason
+end
+
+local function flyThenCarry(ctx, destination)
+	local _, humanoid, root = getCharacterParts()
+	if not humanoid or not root then return false, "personnage absent" end
+	setPhase(ctx, "APPROACH", "SafeFly : " .. getAnimalName(ctx.record))
+	local arrived, moveReason = safeFlyTeleport(ctx, destination, false)
+	traceMoveEnd(ctx, root, destination, arrived)
+	if not arrived then return false, "SafeFly interrompu : " .. tostring(moveReason) end
+	if not validCycle(ctx) then return false, "annule" end
+	if updateCarryEvidence(ctx) then return true end
+	-- Reaching a local position is not proof of a grab; ask the server exactly once.
+	local replied, accepted, reason = awaitCycleOperation(ctx, CONFIG.RequestTimeout, function(finish)
+		ctx.onCarryReply = function(request)
+			finish(true, request.accepted, request.reason)
+		end
+		local request = requestCarry(ctx)
+		if not request then
+			finish(false, false, "requete deja en cours ou indisponible")
+		elseif request.done then
+			finish(true, request.accepted, request.reason)
+		end
+		return function() ctx.onCarryReply = nil end
+	end)
+	if not replied then
+		return false, reason or tostring(accepted)
+	end
+	local grabbed = accepted == true or updateCarryEvidence(ctx)
+	log("CARRY_SINGLE_DONE", "Accepted=%s PriseConfirmee=%s Reason=%s",
+		tostring(accepted), tostring(grabbed), tostring(reason))
+	if grabbed then return true end
+	return false, "prise refusee : " .. tostring(reason)
+end
+
+carryWasLost = function(ctx)
+	if not ctx.hadCarry then return false end
+	local latest = readField(ctx.uid)
+	local carry = readCarry()
+	local newer = latest and (not ctx.pickupVersion or latest.Version > ctx.pickupVersion)
+	local dropped = newer and (latest.State == "Dropped" or latest.State == "GuardCarried"
+		or latest.State == "Slot"
+		or (latest.State == "Carried" and latest.CarrierUserId ~= nil
+			and latest.CarrierUserId ~= player.UserId))
+	if not dropped and not ctx.carryLostAt and carry and carry.IsCarrying and carry.Uid == ctx.uid then
+		ctx.sawCarry = true
+		return false
+	end
+	local owned, source = claimEvidence(ctx)
+	if owned then
+		ctx.claimed, ctx.claimSource, ctx.carryLostAt = true, source, nil
+		return false
+	end
+	if dropped or ctx.carryLostAt then
+		ctx.carryLostAt = ctx.carryLostAt or os.clock()
+		ctx.sawCarry = false
+		if not ctx.lossLogged then
+			ctx.lossLogged = true
+			log("EGG_LOST", "UID=%s Etat=%s CarryUID=%s | retour interrompu pour reprendre le meme oeuf",
+				ctx.uid, latest and tostring(latest.State) or "en attente",
+				carry and tostring(carry.Uid) or "?")
+		end
+		return true
+	end
+	return false
+end
+
+local function waitForRecoverableEgg(ctx)
+	setPhase(ctx, "RECOVERY_WAIT", "Recherche de l'oeuf perdu : " .. getAnimalName(ctx.record))
+	local started, lastLog = os.clock(), -math.huge
+	while validCycle(ctx) do
+		local owned, source = claimEvidence(ctx)
+		if owned then
+			ctx.claimed, ctx.claimSource = true, source
+			return nil, "CLAIMED"
+		end
+		local latest = readField(ctx.uid)
 		local carry = readCarry()
-		if phase == "APPROACH" then
-			if updateCarryEvidence(ctx) then
-				stopMovement()
-				log("CARRY_CONFIRMED", "ReponseServeur=%s TransportUID=%s PossessionUID=%s",
-					tostring(ctx.remoteAccepted), tostring(ctx.sawCarry), tostring(ctx.claimed))
-				return true
-			end
-			if carry and carry.IsCarrying and carry.Uid ~= ctx.uid then
-				return false, "un autre oeuf est deja transporte"
-			end
-			local latest, readOk = readField(ctx.uid)
-			if readOk and (not latest or latest.State ~= SLOT_STATE) then
-				local pending = inFlightRequest and inFlightRequest.uid == ctx.uid and not inFlightRequest.done
-				if not pending then
-					-- Allow replication to deliver CarryChanged before treating the egg as lost.
-					ctx.missingSince = ctx.missingSince or now
-					if now - ctx.missingSince > 1.5 then return false, "oeuf retire sans prise confirmee" end
-				end
-			else
-				ctx.missingSince = nil
-			end
-			if now - (ctx.lastPromptSearch or -math.huge) >= 0.5 then
-				findTargetPrompt(ctx)
-				ctx.lastPromptSearch = now
-			end
-			if distance <= CONFIG.GrabDistance then
-				stopMovement()
-				local pending = inFlightRequest and not inFlightRequest.done
-				if not pending and now - ctx.lastRequest >= CONFIG.RequestInterval then
-					if ctx.attempts >= CONFIG.MaxCarryAttempts then
-						return false, "prise refusee : " .. tostring(ctx.denial)
-					end
-					requestCarry(ctx)
-				end
-				lastMoved = now
-			end
-		elseif distance <= CONFIG.ReturnDistance then
-			stopMovement()
+		local trapped = ctx.character:GetAttribute("IsTrapped") == true
+		if carry and carry.IsCarrying and carry.Uid == ctx.uid
+			and (ctx.sawCarry or (latest and latest.State == "Carried"
+				and latest.CarrierUserId == player.UserId
+				and (not ctx.pickupVersion or latest.Version > ctx.pickupVersion)))
+			and (not latest or (latest.State == "Carried" and latest.CarrierUserId == player.UserId)) then
+			ctx.sawCarry, ctx.carryLostAt = true, nil
+			return nil, "CARRIED"
+		end
+		if latest and (latest.State == "Dropped" or latest.State == SLOT_STATE)
+			and typeof(latest.BottomCFrame) == "CFrame" and not trapped then
+			log("EGG_RECOVERABLE", "UID=%s Etat=%s PositionActuelle=%s Version=%s",
+				ctx.uid, latest.State, formatPosition(latest.BottomCFrame.Position), tostring(latest.Version))
+			return latest, "AVAILABLE"
+		end
+		local now = os.clock()
+		if now - lastLog >= 0.5 then
+			lastLog = now
+			log("RECOVERY_WAIT", "UID=%s Etat=%s IsTrapped=%s Temps=%.1fs",
+				ctx.uid, latest and tostring(latest.State) or "absent / replication",
+				tostring(trapped), now - started)
+		end
+		if now - started >= CONFIG.RecoveryStateTimeout then
+			return nil, "recuperation impossible : oeuf non disponible apres attente"
+		end
+		task.wait(0.1)
+	end
+	return nil, "annule"
+end
+
+local function recoverSameEgg(ctx)
+	stopMovement()
+	ctx.recoveryCount = (ctx.recoveryCount or 0) + 1
+	log("RECOVERY_START", "UID=%s Reprise=%d HomeConservee=%s",
+		ctx.uid, ctx.recoveryCount, formatPosition(ctx.home))
+	while validCycle(ctx) do
+		local latest, state = waitForRecoverableEgg(ctx)
+		if state == "CLAIMED" or state == "CARRIED" then return true end
+		if not latest then return false, state end
+		if inFlightRequest and not inFlightRequest.done then
+			return false, "recuperation suspendue : requete serveur encore en cours"
+		end
+		ctx.record, ctx.eggPosition, ctx.pickupVersion = latest, latest.BottomCFrame.Position, latest.Version
+		ctx.remoteAccepted, ctx.sawCarry, ctx.claimed, ctx.claimFeedback = false, false, false, false
+		ctx.carryLostAt, ctx.lossLogged, ctx.reacquiring = nil, false, true
+		ctx.attempts, ctx.lastRequest = 0, -math.huge
+		local destination = Vector3.new(ctx.eggPosition.X, ctx.home.Y, ctx.eggPosition.Z)
+		local grabbed, reason = flyThenCarry(ctx, destination)
+		if grabbed then
+			ctx.reacquiring, ctx.hadCarry = false, true
+			log("RECOVERY_GRABBED", "UID=%s Reprise=%d | nouveau retour vers la meme zone safe",
+				ctx.uid, ctx.recoveryCount)
 			return true
 		end
-		if phase == "APPROACH" and inFlightRequest and not inFlightRequest.done
-			and now - inFlightRequest.started > CONFIG.RequestTimeout then
-			return false, "requete serveur sans reponse ; attente de reconciliation"
+		if not validCycle(ctx) then return false, "annule" end
+		if inFlightRequest and not inFlightRequest.done then
+			return false, "recuperation suspendue : requete serveur sans reponse"
 		end
-		if now - started > timeout then return false, "delai de deplacement depasse" end
-		if now - lastMoved > CONFIG.NoMovementTimeout then return false, "deplacement bloque" end
-		if distance > (phase == "APPROACH" and CONFIG.GrabDistance or CONFIG.ReturnDistance)
-			and now - lastCommand >= CONFIG.MoveRefresh then
-			humanoid:MoveTo(destination)
-			lastCommand = now
-		end
-		if now - lastLog >= CONFIG.ProgressInterval then
-			lastLog = now
-			local overwriteCount = 0
-			for _, entry in pairs(prompts) do overwriteCount += entry.overwrites end
-			log("MOVE_PROGRESS", "Phase=%s Pos=%s DistanceXZ=%.2f WalkSpeed=%.1f VitesseReelle=%.1f Safe=%s CarryUID=%s Requetes=%d Prompt=%s Reecritures=%d",
-				phase, formatPosition(root.Position), distance, humanoid.WalkSpeed,
-				root.AssemblyLinearVelocity.Magnitude, tostring(isSafe(root.Position)),
-				carry and tostring(carry.Uid) or "?", ctx.attempts, tostring(ctx.prompt ~= nil), overwriteCount)
-		end
-		RunService.Heartbeat:Wait()
+		log("RECOVERY_RETRY", "UID=%s Raison=%s | nouvelle lecture de la position avant nouvel essai",
+			ctx.uid, tostring(reason))
+		task.wait(CONFIG.RecoveryRetryDelay)
 	end
+	return false, "annule"
+end
+
+local function flyReturn(ctx, destination)
+	setPhase(ctx, "RETURN", "SafeFly : retour vers la zone sure")
+	return safeFlyTeleport(ctx, destination, true)
 end
 
 local function waitForClaim(ctx)
@@ -602,6 +650,7 @@ local function waitForClaim(ctx)
 			log("CLAIM_CONFIRMED", "UID=%s Source=%s | cycle termine", ctx.uid, source)
 			return true
 		end
+		if carryWasLost(ctx) then return false, CARRY_LOST end
 		local now = os.clock()
 		local carry = readCarry()
 		if now - lastLog >= 0.5 then
@@ -620,8 +669,9 @@ end
 
 local function cleanupCycle(ctx)
 	if currentCycle ~= ctx then return end
+	if ctx.cancelPendingWait then ctx.cancelPendingWait() end
+	if ctx.cancelFlight then ctx.cancelFlight() end
 	stopMovement()
-	restorePrompts()
 	currentCycle = nil
 end
 
@@ -638,9 +688,9 @@ local function runCycle(record, rate, recovering)
 		home = safeHome, eggPosition = record.BottomCFrame and record.BottomCFrame.Position,
 		attempts = 0, lastRequest = -math.huge, phase = "SELECTED", ownerBefore = ownerSnapshot(),
 		remoteAccepted = recovering == true, sawCarry = recovering == true,
+		pickupVersion = record.Version, hadCarry = recovering == true,
 	}
 	currentCycle = ctx
-	for prompt, entry in pairs(prompts) do enforcePrompt(prompt, entry) end
 	log("TARGET", "Animal=%s Revenu=%s/s Home=%s Recovery=%s",
 		getAnimalName(record), formatNumber(rate or 0), formatPosition(ctx.home), tostring(recovering))
 	local cycleOK, completed, failure = xpcall(function()
@@ -651,20 +701,31 @@ local function runCycle(record, rate, recovering)
 			return false, "position de l'oeuf absente"
 		else
 			local destination = Vector3.new(ctx.eggPosition.X, ctx.home.Y, ctx.eggPosition.Z)
-			grabbed, grabReason = moveLoop(ctx, destination, "APPROACH")
+			grabbed, grabReason = flyThenCarry(ctx, destination)
 		end
 		if not validCycle(ctx) then return false, "annule" end
 		if not grabbed and inFlightRequest and not inFlightRequest.done then
 			return false, grabReason or "requete serveur encore en cours"
 		end
-		local returned, returnReason = moveLoop(ctx, ctx.home, "RETURN")
-		if not returned then return false, returnReason end
-		local _, _, currentRoot = getCharacterParts()
-		if not currentRoot or isSafe(currentRoot.Position) ~= true then
-			return false, "retour termine mais ligne safe non franchie"
+		ctx.hadCarry = grabbed == true
+		while validCycle(ctx) do
+			local returned, returnReason = flyReturn(ctx, ctx.home)
+			if not returned and returnReason ~= CARRY_LOST then return false, returnReason end
+			if returned then
+				local _, _, currentRoot = getCharacterParts()
+				if not currentRoot or isSafe(currentRoot.Position) ~= true then
+					return false, "retour termine mais ligne safe non franchie"
+				end
+				if not grabbed then return false, grabReason end
+				local claimed, claimReason = waitForClaim(ctx)
+				if claimed then return true end
+				if claimReason ~= CARRY_LOST then return false, claimReason end
+			end
+			local recovered, recoveryReason = recoverSameEgg(ctx)
+			if not recovered then return false, recoveryReason end
+			grabbed = true
 		end
-		if not grabbed then return false, grabReason end
-		return waitForClaim(ctx)
+		return false, "annule"
 	end, debug.traceback)
 	cleanupCycle(ctx)
 	if not cycleOK then return false, tostring(completed) end
@@ -754,7 +815,8 @@ local function worker(token)
 				local after = readCarry()
 				local _, _, root = getCharacterParts()
 				if not after or after.IsCarrying or not root or isSafe(root.Position) ~= true
-					or string.find(tostring(reason), "attribution", 1, true) then
+					or string.find(tostring(reason), "attribution", 1, true)
+					or string.find(tostring(reason), "recuperation", 1, true) then
 					stopAutomation(tostring(reason))
 					return
 				end
@@ -841,7 +903,12 @@ local function initialize()
 		local ctx = currentCycle
 		log("CARRY_CHANGED", "Carrying=%s UID=%s Area=%s SpeedMultiplier=%s",
 			tostring(state.IsCarrying), tostring(state.Uid), tostring(state.AreaId), tostring(state.SpeedMultiplier))
-		if ctx and state.IsCarrying and state.Uid == ctx.uid then ctx.sawCarry = true end
+		if ctx and state.IsCarrying and state.Uid == ctx.uid then
+			ctx.sawCarry, ctx.carryLostAt = true, nil
+		elseif ctx and ctx.hadCarry and (ctx.phase == "RETURN" or ctx.phase == "CONFIRM_CLAIM") then
+			ctx.carryLostAt = os.clock()
+			log("CARRY_RELEASED", "Transport termine | UID cible=%s | verification perte ou attribution", ctx.uid)
+		end
 	end)
 	connect(EggState.FieldClaimed, function(payload)
 		local ctx = currentCycle
@@ -858,12 +925,10 @@ local function initialize()
 			log("OWNER_REFRESHED", "UID=%s Possession=%s", currentCycle.uid, tostring(ownsEgg(currentCycle.uid)))
 		end
 	end)
-	startPromptRegistry()
 	snapshot(EggState.ReadFieldEggs())
 	ready = true
 	setStatus("Pret : demarre depuis la zone sure", Color3.fromRGB(96, 230, 145))
-	log("READY", "Build=2 | CarryFieldEgg/ReadOwnedEgg | AffichageCible=%d | DistancePrise=%d",
-		CONFIG.TargetPromptDistance, CONFIG.GrabDistance)
+	log("READY", "Build=SafeFly-1 | safeFlyTeleport -> CarryFieldEgg -> safeFlyTeleport -> inventaire | reprise du meme UID si perte")
 end
 
 local function createInterface()
@@ -907,9 +972,9 @@ local function createInterface()
 	title.Size = UDim2.new(1, -28, 0, 28)
 	title.BackgroundTransparency = 1
 	title.Font = Enum.Font.GothamBold
-	title.Text = "AUTO EGG"
+	title.Text = "AUTO EGG - SAFE FLY"
 	title.TextColor3 = Color3.fromRGB(245, 248, 255)
-	title.TextSize = 20
+	title.TextSize = 18
 	title.TextXAlignment = Enum.TextXAlignment.Left
 	title.Parent = frame
 
@@ -1026,10 +1091,6 @@ local function destroy()
 	destroyed = true
 	for _, connection in ipairs(lifetimeConnections) do connection:Disconnect() end
 	table.clear(lifetimeConnections)
-	for prompt, entry in pairs(prompts) do
-		for _, connection in ipairs(entry.connections) do connection:Disconnect() end
-		prompts[prompt] = nil
-	end
 	if shared.__AutoSAEController and shared.__AutoSAEController.Gui == gui then
 		shared.__AutoSAEController = nil
 	end
@@ -1051,4 +1112,3 @@ task.spawn(function()
 		log("ERROR", "%s", tostring(failure))
 	end
 end)
-
