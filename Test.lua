@@ -15,6 +15,9 @@ local SLOT_STATE = "Slot"
 local PROMPT_SEARCH_RADIUS = 14
 local PROMPT_SEARCH_ATTEMPTS = 40
 local MAX_PATH_SEGMENT_DISTANCE = 450
+local FIRST_MOVE_RETRY_DELAY = 0.5
+local PROMPT_HOLD_DURATION = 0
+local PROMPT_MAX_ACTIVATION_DISTANCE = 16
 local ROUTE_Y = 71
 
 local ROUTE_POSITIONS = {
@@ -58,6 +61,53 @@ local function getCharacterParts()
 
 	return character, character:FindFirstChildOfClass("Humanoid"), character:FindFirstChild("HumanoidRootPart")
 end
+
+local function configurePrompt(instance)
+	if not instance:IsA("ProximityPrompt") then
+		return false
+	end
+
+	instance.HoldDuration = PROMPT_HOLD_DURATION
+	instance.MaxActivationDistance = PROMPT_MAX_ACTIVATION_DISTANCE
+	return true
+end
+
+local function configureAllPrompts()
+	local configuredCount = 0
+
+	for _, descendant in ipairs(Workspace:GetDescendants()) do
+		if configurePrompt(descendant) then
+			configuredCount += 1
+		end
+	end
+
+	return configuredCount
+end
+
+Workspace.DescendantAdded:Connect(function(descendant)
+	configurePrompt(descendant)
+end)
+
+local function teleportToRouteStart()
+	local character = player.Character or player.CharacterAdded:Wait()
+	local rootPart = character:WaitForChild("HumanoidRootPart", 10)
+
+	if not rootPart then
+		warn("[Auto_SAE] Téléportation initiale impossible: HumanoidRootPart introuvable.")
+		return
+	end
+
+	rootPart.CFrame = CFrame.new(ROUTE_POSITIONS[1])
+	rootPart.AssemblyLinearVelocity = Vector3.zero
+	rootPart.AssemblyAngularVelocity = Vector3.zero
+
+	print(string.format(
+		"[Auto_SAE] Téléportation initiale au point 1: %s.",
+		formatPosition(ROUTE_POSITIONS[1])
+	))
+end
+
+task.spawn(teleportToRouteStart)
 
 local clientFolder = ReplicatedStorage:WaitForChild("Client", 10)
 local dataFolder = ReplicatedStorage:WaitForChild("Data", 10)
@@ -293,11 +343,35 @@ local function walkRouteToEgg(eggPosition, token)
 	local reachedRoute = {}
 
 	for index, checkpoint in ipairs(route) do
-		if not walkPath(
-			checkpoint,
-			token,
-			string.format("le point de route %d", index)
-		) then
+		local reached = false
+
+		if index == 2 then
+			-- Le mur temporaire entre les points 1 et 2 bloque environ 5 secondes.
+			-- On recalcule le chemin sans limite jusqu'à son ouverture ou l'annulation.
+			while token == navigationToken and not reached do
+				reached = walkPath(
+					checkpoint,
+					token,
+					"le point de route 2"
+				)
+
+				if not reached and token == navigationToken then
+					print(string.format(
+						"[Auto_SAE] Point 2 encore bloqué, nouvelle tentative dans %.1f seconde.",
+						FIRST_MOVE_RETRY_DELAY
+					))
+					task.wait(FIRST_MOVE_RETRY_DELAY)
+				end
+			end
+		else
+			reached = walkPath(
+				checkpoint,
+				token,
+				string.format("le point de route %d", index)
+			)
+		end
+
+		if not reached then
 			return false, reachedRoute, eggGoal
 		end
 
@@ -324,7 +398,13 @@ local function getPromptPosition(prompt)
 end
 
 local function promptIsUsable(prompt, rootPosition)
-	if not prompt or not prompt.Parent or not prompt.Enabled then
+	if not prompt or not prompt.Parent then
+		return false
+	end
+
+	configurePrompt(prompt)
+
+	if not prompt.Enabled then
 		return false
 	end
 
@@ -345,6 +425,7 @@ local function findNearestCarryPrompt(eggPosition, rootPosition)
 			continue
 		end
 
+		configurePrompt(descendant)
 		local promptPosition = getPromptPosition(descendant)
 
 		if not promptPosition then
@@ -423,6 +504,7 @@ local function activateEggPrompt(record, eggPosition, token)
 		end
 	end
 
+	configurePrompt(prompt)
 	activePrompt = prompt
 
 	print(string.format(
@@ -585,6 +667,14 @@ local function enqueueRecord(record)
 		or successfulVersions[uid] == key then
 		return
 	end
+
+	local configuredPromptCount = configureAllPrompts()
+	print(string.format(
+		"[Auto_SAE] Détection: %d prompt(s) configuré(s) | HoldDuration: %.1f | Distance: %.1f",
+		configuredPromptCount,
+		PROMPT_HOLD_DURATION,
+		PROMPT_MAX_ACTIVATION_DISTANCE
+	))
 
 	queuedUids[uid] = true
 	table.insert(recordQueue, {
