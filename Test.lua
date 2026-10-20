@@ -9,6 +9,9 @@ local SLOT_STATE = "Slot"
 local CARRY_PROMPT_NAME = "CarryAreaEgg"
 local PROMPT_SEARCH_RADIUS = 18
 local PROMPT_SEARCH_ATTEMPTS = 40
+local MOVE_ARRIVAL_DISTANCE = 0.25
+local MOVE_FINAL_CORRECTION_DISTANCE = 1.5
+local MOVE_REFRESH_SECONDS = 0.05
 local MINIMUM_BILLIONS = 0.1
 local MAXIMUM_BILLIONS = 999
 local DEFAULT_BILLIONS = 2
@@ -327,7 +330,6 @@ local function waitForResetWall(token)
 	return true
 end
 
--- Déplacement simplifié avec MoveToFinished
 local function moveDirect(destination, token, destinationLabel)
 	local _, humanoid, rootPart = getCharacterParts()
 
@@ -337,17 +339,51 @@ local function moveDirect(destination, token, destinationLabel)
 	end
 
 	print(string.format(
-		"[Auto_SAE] Déplacement vers %s : %s.",
+		"[Auto_SAE] Déplacement direct vers %s : %s.",
 		destinationLabel,
 		formatPosition(destination)
 	))
 
-	humanoid:MoveTo(destination)
-	
-	-- Attente native de la fin du déplacement de l'Humanoid
-	humanoid.MoveToFinished:Wait()
+	local lastMoveCommand = -math.huge
 
-	return token == navigationToken and autoEnabled
+	while token == navigationToken and autoEnabled do
+		if humanoid.Health <= 0 or not rootPart.Parent then
+			return false
+		end
+
+		local offset = destination - rootPart.Position
+		local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
+		local distance = horizontalOffset.Magnitude
+
+		if distance <= MOVE_ARRIVAL_DISTANCE then
+			humanoid:Move(Vector3.zero)
+			return true
+		end
+
+		if distance <= MOVE_FINAL_CORRECTION_DISTANCE then
+			local rotation = rootPart.CFrame - rootPart.Position
+			local verticalVelocity = rootPart.AssemblyLinearVelocity.Y
+
+			humanoid:Move(Vector3.zero)
+			rootPart.AssemblyLinearVelocity = Vector3.new(0, verticalVelocity, 0)
+			rootPart.CFrame = CFrame.new(
+				destination.X,
+				rootPart.Position.Y,
+				destination.Z
+			) * rotation
+			return true
+		end
+
+		local now = os.clock()
+		if now - lastMoveCommand >= MOVE_REFRESH_SECONDS then
+			humanoid:MoveTo(destination)
+			lastMoveCommand = now
+		end
+
+		RunService.Heartbeat:Wait()
+	end
+
+	return false
 end
 
 local function getPromptPosition(prompt)
@@ -367,6 +403,16 @@ local function getPromptPosition(prompt)
 
 	local model = parent:FindFirstAncestorOfClass("Model")
 	return model and model:GetPivot().Position or nil
+end
+
+local function promptIsUsable(prompt, rootPosition)
+	if not configureEggPrompt(prompt) or not prompt.Enabled then
+		return false
+	end
+
+	local promptPosition = getPromptPosition(prompt)
+	return promptPosition ~= nil
+		and (promptPosition - rootPosition).Magnitude <= prompt.MaxActivationDistance + 1
 end
 
 local function promptSlotKey(eggPosition)
@@ -452,30 +498,42 @@ local function waitForCarryPromptNearEgg(record, eggPosition, token)
 			return prompt
 		end
 
-		task.wait(0.05)
+		task.wait(0.1)
 	end
 
 	return nil
 end
 
--- Déclenchement via l'exécuteur (fireproximityprompt)
-local function triggerPrompt(prompt)
-	if not configureEggPrompt(prompt) or not prompt.Enabled then
-		return false
+
+local function activateEggPrompt(record, prompt, token)
+	for _ = 1, PROMPT_SEARCH_ATTEMPTS do
+		if token ~= navigationToken or not autoEnabled then
+			return false
+		end
+
+		local _, _, rootPart = getCharacterParts()
+		if not rootPart then
+			return false
+		end
+
+		if prompt and prompt.Parent and promptIsUsable(prompt, rootPart.Position) then
+			print(string.format(
+				"[Auto_SAE] Activation du prompt de l'œuf | UID: %s | HoldDuration: %.1f | MaxDistance: %.1f",
+				record.Uid,
+				prompt.HoldDuration,
+				prompt.MaxActivationDistance
+			))
+
+			return fireproximityprompt(prompt)
+				and token == navigationToken
+				and autoEnabled
+		end
+
+		task.wait(0.1)
 	end
 
-	activePrompt = prompt
-
-	if fireproximityprompt then
-		fireproximityprompt(prompt)
-	else
-		prompt:InputHoldBegin()
-		task.wait(math.max(prompt.HoldDuration, 0.05))
-		prompt:InputHoldEnd()
-	end
-
-	activePrompt = nil
-	return true
+	warn(string.format("[Auto_SAE] Prompt %s inutilisable pour %s.", CARRY_PROMPT_NAME, record.Uid))
+	return false
 end
 
 local statusLabel
@@ -488,9 +546,9 @@ local function setStatus(text, color)
 end
 
 local function runEgg(record, rate)
-	local character, humanoid, rootPart = getCharacterParts()
+	local _, humanoid, rootPart = getCharacterParts()
 
-	if not character or not humanoid or not rootPart then
+	if not humanoid or not rootPart then
 		warn("[Auto_SAE] Personnage indisponible pour l'œuf", record.Uid)
 		return false
 	end
@@ -504,60 +562,49 @@ local function runEgg(record, rate)
 	navigationToken += 1
 	local token = navigationToken
 	local savedStartPosition = rootPart.Position
-
 	setStatus(
 		string.format("Cible : %s (%s $/s)", getAnimalName(record), formatNumber(rate)),
 		Color3.fromRGB(255, 209, 82)
 	)
 
 	print(string.format(
-		"[Auto_SAE] Cible sélectionnée | UID: %s | Animal: %s | Revenu: %s $/s",
+		"[Auto_SAE] Cible sélectionnée | UID: %s | Animal: %s | Revenu: %s $/s | Départ: %s",
 		record.Uid,
 		getAnimalName(record),
-		formatNumber(rate)
+		formatNumber(rate),
+		formatPosition(savedStartPosition)
 	))
 
 	local promptActivated = false
 
 	if waitForResetWall(token) then
-		local prompt = waitForCarryPromptNearEgg(record, eggPosition, token)
+		local eggDestination = Vector3.new(
+			eggPosition.X,
+			savedStartPosition.Y,
+			eggPosition.Z
+		)
 
-		if not prompt then
-			warn(string.format("[Auto_SAE] Prompt %s introuvable près de %s pour %s.", CARRY_PROMPT_NAME, formatPosition(eggPosition), record.Uid))
-		else
-			local promptPosition = getPromptPosition(prompt)
+		if moveDirect(eggDestination, token, "la zone de l'œuf") then
+			local prompt = waitForCarryPromptNearEgg(record, eggPosition, token)
 
-			if promptPosition then
-				local promptDestination = Vector3.new(
-					promptPosition.X,
-					savedStartPosition.Y,
-					promptPosition.Z
-				)
-
-				-- 1. Mouvement direct vers l'œuf
-				moveDirect(promptDestination, token, "le prompt de l'œuf")
-
-				-- 2. Téléportation/Alignement exact sur la position de l'œuf pour éviter l'overshoot de vitesse
-				humanoid:Move(Vector3.zero)
-				character:PivotTo(CFrame.new(promptPosition + Vector3.new(0, 2.5, 0)))
-				rootPart.AssemblyLinearVelocity = Vector3.zero
-				rootPart.AssemblyAngularVelocity = Vector3.zero
-
-				task.wait(0.05)
-
-				-- 3. Activation instantanée du prompt via Delta
-				promptActivated = triggerPrompt(prompt)
-				task.wait(0.05)
+			if not prompt then
+				warn(string.format("[Auto_SAE] Prompt %s introuvable près de %s pour %s.", CARRY_PROMPT_NAME, formatPosition(eggPosition), record.Uid))
+			else
+				promptActivated = activateEggPrompt(record, prompt, token)
+				task.wait(0.15)
 			end
 		end
 	end
 
-	-- 4. Retour exact à la position de départ
 	if token == navigationToken and autoEnabled then
-		humanoid:Move(Vector3.zero)
-		character:PivotTo(CFrame.new(savedStartPosition))
-		rootPart.AssemblyLinearVelocity = Vector3.zero
-		rootPart.AssemblyAngularVelocity = Vector3.zero
+		local returned = moveDirect(savedStartPosition, token, "la position de départ mémorisée")
+
+		if returned then
+			print(string.format(
+				"[Auto_SAE] Retour terminé : %s.",
+				formatPosition(savedStartPosition)
+			))
+		end
 	end
 
 	return promptActivated
@@ -676,6 +723,7 @@ local function stopAutomation()
 	activeUid = nil
 
 	if activePrompt then
+		activePrompt:InputHoldEnd()
 		activePrompt = nil
 	end
 
@@ -861,4 +909,4 @@ end
 
 createInterface()
 handleSnapshot(EggState.ReadFieldEggs())
-print("[Auto_SAE] Prêt : MoveTo suivi de PivotTo + fireproximityprompt.")
+print("[Auto_SAE] Prêt : récupère uniquement les œufs au-dessus du minimum configuré.")
