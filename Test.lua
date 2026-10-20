@@ -12,10 +12,26 @@ local TARGET_RARITIES = {
 }
 
 local SLOT_STATE = "Slot"
-local APPROACH_DISTANCE = 5
 local PROMPT_SEARCH_RADIUS = 14
 local PROMPT_SEARCH_ATTEMPTS = 40
 local MAX_PATH_SEGMENT_DISTANCE = 450
+local ROUTE_Y = 71
+
+local ROUTE_POSITIONS = {
+	Vector3.new(543, ROUTE_Y, -431),
+	Vector3.new(648, ROUTE_Y, -431),
+	Vector3.new(796, ROUTE_Y, -431),
+	Vector3.new(1007, ROUTE_Y, -431),
+	Vector3.new(1242, ROUTE_Y, -431),
+	Vector3.new(1566, ROUTE_Y, -431),
+	Vector3.new(1951, ROUTE_Y, -431),
+	Vector3.new(2381, ROUTE_Y, -431),
+	Vector3.new(2885, ROUTE_Y, -431),
+	Vector3.new(3525, ROUTE_Y, -431),
+	Vector3.new(4266, ROUTE_Y, -429),
+	Vector3.new(5131, ROUTE_Y, -429),
+	Vector3.new(6011, ROUTE_Y, -429),
+}
 
 local navigationToken = 0
 local activePrompt = nil
@@ -41,84 +57,6 @@ local function getCharacterParts()
 	end
 
 	return character, character:FindFirstChildOfClass("Humanoid"), character:FindFirstChild("HumanoidRootPart")
-end
-
-local function createPositionOverhead(character)
-	local head = character:WaitForChild("Head", 10)
-	local root = character:WaitForChild("HumanoidRootPart", 10)
-
-	if not head or not root then
-		return
-	end
-
-	local previous = head:FindFirstChild("AutoSAE_PositionOverhead")
-	if previous then
-		previous:Destroy()
-	end
-
-	local billboard = Instance.new("BillboardGui")
-	billboard.Name = "AutoSAE_PositionOverhead"
-	billboard.Adornee = head
-	billboard.AlwaysOnTop = true
-	billboard.LightInfluence = 0
-	billboard.MaxDistance = 250
-	billboard.Size = UDim2.fromOffset(310, 42)
-	billboard.StudsOffsetWorldSpace = Vector3.new(0, 3.25, 0)
-	billboard.Parent = head
-
-	local label = Instance.new("TextLabel")
-	label.Name = "Position"
-	label.BackgroundColor3 = Color3.fromRGB(12, 18, 28)
-	label.BackgroundTransparency = 0.2
-	label.BorderSizePixel = 0
-	label.Size = UDim2.fromScale(1, 1)
-	label.Font = Enum.Font.GothamBold
-	label.TextColor3 = Color3.fromRGB(255, 255, 255)
-	label.TextSize = 18
-	label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-	label.TextStrokeTransparency = 0
-	label.Parent = billboard
-
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 8)
-	corner.Parent = label
-
-	local function updateText()
-		local position = root.Position
-		label.Text = string.format(
-			"X: %.1f   Y: %.1f   Z: %.1f",
-			position.X,
-			position.Y,
-			position.Z
-		)
-	end
-
-	updateText()
-
-	local elapsed = 0
-	local connection
-	connection = RunService.RenderStepped:Connect(function(deltaTime)
-		if player.Character ~= character or not root.Parent or not billboard.Parent then
-			connection:Disconnect()
-			return
-		end
-
-		elapsed += deltaTime
-		if elapsed < 0.1 then
-			return
-		end
-
-		elapsed = 0
-		updateText()
-	end)
-end
-
-player.CharacterAdded:Connect(function(character)
-	task.spawn(createPositionOverhead, character)
-end)
-
-if player.Character then
-	task.spawn(createPositionOverhead, player.Character)
 end
 
 local clientFolder = ReplicatedStorage:WaitForChild("Client", 10)
@@ -188,22 +126,6 @@ local function getEggPosition(record)
 	end
 
 	return nil, nil
-end
-
-local function calculateApproachGoal(rootPosition, eggPosition)
-	local direction = Vector3.new(
-		rootPosition.X - eggPosition.X,
-		0,
-		rootPosition.Z - eggPosition.Z
-	)
-
-	if direction.Magnitude < 0.1 then
-		direction = Vector3.new(0, 0, 1)
-	else
-		direction = direction.Unit
-	end
-
-	return eggPosition + direction * APPROACH_DISTANCE
 end
 
 local function followPathSegment(destination, token, destinationLabel, segmentIndex)
@@ -350,6 +272,42 @@ local function walkPath(destination, token, destinationLabel)
 	return false
 end
 
+local function buildOutboundRoute(eggPosition)
+	local eggGoal = Vector3.new(eggPosition.X, ROUTE_Y, eggPosition.Z)
+	local route = {}
+
+	for _, checkpoint in ipairs(ROUTE_POSITIONS) do
+		-- La route avance sur X et ne prend jamais un point situé après l'œuf.
+		if checkpoint.X >= eggGoal.X then
+			break
+		end
+
+		table.insert(route, checkpoint)
+	end
+
+	return route, eggGoal
+end
+
+local function walkRouteToEgg(eggPosition, token)
+	local route, eggGoal = buildOutboundRoute(eggPosition)
+	local reachedRoute = {}
+
+	for index, checkpoint in ipairs(route) do
+		if not walkPath(
+			checkpoint,
+			token,
+			string.format("le point de route %d", index)
+		) then
+			return false, reachedRoute, eggGoal
+		end
+
+		table.insert(reachedRoute, checkpoint)
+	end
+
+	local arrived = walkPath(eggGoal, token, "la position de l'œuf à Y = 71")
+	return arrived, reachedRoute, eggGoal
+end
+
 local function getPromptPosition(prompt)
 	local parent = prompt.Parent
 
@@ -485,38 +443,42 @@ local function activateEggPrompt(record, eggPosition, token)
 	return token == navigationToken
 end
 
-local function returnToStartPosition(returnPosition, token)
-	if typeof(returnPosition) ~= "Vector3" then
-		warn("[Auto_SAE] Position de retour absente.")
-		return false
-	end
-
+local function returnToStartPosition(outboundRoute, token)
 	print(string.format(
-		"[Auto_SAE] Retour vers la position mémorisée %s.",
-		formatPosition(returnPosition)
+		"[Auto_SAE] Retour par les points vers le départ %s.",
+		formatPosition(ROUTE_POSITIONS[1])
 	))
 
-	local returned = walkPath(returnPosition, token, "la position de départ")
+	for index = #outboundRoute, 2, -1 do
+		if not walkPath(
+			outboundRoute[index],
+			token,
+			string.format("le point de retour %d", index)
+		) then
+			return false
+		end
+	end
+
+	local returned = walkPath(
+		ROUTE_POSITIONS[1],
+		token,
+		"la position 1 de départ"
+	)
 
 	if returned then
-		print("[Auto_SAE] Retour à la position de départ terminé.")
+		print("[Auto_SAE] Retour à la position 1 terminé.")
 	end
 
 	return returned
 end
 
-local function runEgg(record, rarity, detectedPosition)
+local function runEgg(record, rarity)
 	local _, humanoid, rootPart = getCharacterParts()
 
 	if not humanoid or not rootPart then
 		warn("[Auto_SAE] Personnage indisponible pour l'œuf", record.Uid)
 		return false
 	end
-
-	-- Conserve le Vector3 exact détecté, Y compris.
-	local returnPosition = typeof(detectedPosition) == "Vector3"
-		and detectedPosition
-		or rootPart.Position
 
 	local eggPosition = getEggPosition(record)
 
@@ -529,28 +491,34 @@ local function runEgg(record, rarity, detectedPosition)
 	local token = navigationToken
 
 	print(string.format(
-		"[Auto_SAE] Egg détecté | UID: %s | Rareté: %s | Position: %s | Retour: %s",
+		"[Auto_SAE] Egg détecté | UID: %s | Rareté: %s | Position: %s | Départ/retour: %s",
 		record.Uid,
 		rarity,
 		formatPosition(eggPosition),
-		formatPosition(returnPosition)
+		formatPosition(ROUTE_POSITIONS[1])
 	))
 
 	local promptActivated = false
+	local reachedRoute = {}
 	local _, _, currentRoot = getCharacterParts()
 
 	if currentRoot and token == navigationToken then
-		local approachGoal = calculateApproachGoal(currentRoot.Position, eggPosition)
+		local arrived, traversedRoute, eggGoal = walkRouteToEgg(eggPosition, token)
+		reachedRoute = traversedRoute
 
-		if walkPath(approachGoal, token, "l'œuf") then
-			print(string.format("[Auto_SAE] Arrivé près de l'œuf %s.", record.Uid))
+		if arrived then
+			print(string.format(
+				"[Auto_SAE] Arrivé à la position de l'œuf %s: %s.",
+				record.Uid,
+				formatPosition(eggGoal)
+			))
 			promptActivated = activateEggPrompt(record, eggPosition, token)
 			task.wait(0.15)
 		end
 	end
 
 	if token == navigationToken then
-		returnToStartPosition(returnPosition, token)
+		returnToStartPosition(reachedRoute, token)
 	end
 
 	return promptActivated
@@ -590,7 +558,7 @@ local function processQueue()
 			if eligible then
 				activeUid = latestRecord.Uid
 
-				if runEgg(latestRecord, rarity, queueEntry.ReturnPosition) then
+				if runEgg(latestRecord, rarity) then
 					successfulVersions[latestRecord.Uid] = versionKey(latestRecord)
 				end
 
@@ -618,20 +586,16 @@ local function enqueueRecord(record)
 		return
 	end
 
-	local _, _, rootPart = getCharacterParts()
-	local returnPosition = rootPart and rootPart.Position or nil
-
 	queuedUids[uid] = true
 	table.insert(recordQueue, {
 		Record = record,
-		ReturnPosition = returnPosition,
 	})
 
 	print(string.format(
-		"[Auto_SAE] Cible ajoutée | UID: %s | Rareté: %s | Retour: %s",
+		"[Auto_SAE] Cible ajoutée | UID: %s | Rareté: %s | Départ/retour: %s",
 		uid,
 		rarity,
-		returnPosition and formatPosition(returnPosition) or "en attente du personnage"
+		formatPosition(ROUTE_POSITIONS[1])
 	))
 
 	processQueue()
