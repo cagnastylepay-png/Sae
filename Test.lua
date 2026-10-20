@@ -1,321 +1,168 @@
+-- Auto_SAE v2. Official EggState API; one client script.
+-- The live game must provide ReplicatedStorage.Client/Data/Shared.
+-- Display range is cosmetic: server carry validation remains authoritative.
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
-
 local player = Players.LocalPlayer
+assert(player, "Auto_SAE doit etre execute sur le client")
 
-local SLOT_STATE = "Slot"
-local CARRY_PROMPT_NAME = "CarryAreaEgg"
-local PROMPT_SEARCH_RADIUS = 18
-local PROMPT_ACTIVATION_ATTEMPTS = 40
-local POSITION_ARRIVAL_DISTANCE = 4.5
-local EGG_ACTIVATION_DISTANCE = 2
-local PROMPT_DISPLAY_DISTANCE = 30
-local TARGET_PROMPT_DISTANCE = 100
-local EGG_CORRECTION_SPEED = 35
-local EGG_MOVE_REFRESH_SECONDS = 0.1
-local DEBUG_PROGRESS_INTERVAL = 0.5
-local MINIMUM_BILLIONS = 0.1
-local MAXIMUM_BILLIONS = 999
-local DEFAULT_BILLIONS = 2
-
-local PROMPT_ROOT_NAMES = {
-	AreaEggSlotsClient = true,
-	SmartPromptPart = true,
+local CONFIG = {
+	Debug = true,
+	ProgressInterval = 0.5,
+	MoveRefresh = 0.1,
+	ScanInterval = 0.25,
+	GrabDistance = 2,
+	ReturnDistance = 3,
+	TargetPromptDistance = 100,
+	IsolateOtherEggPrompts = true,
+	RequestTimeout = 10,
+	RequestInterval = 1,
+	MaxCarryAttempts = 3,
+	ClaimTimeout = 12,
+	NoMovementTimeout = 10,
+	FailedTargetCooldown = 10,
 }
-
-local navigationToken = 0
-local activePrompt = nil
-local activeUid = nil
-local workerRunning = false
-local autoEnabled = false
+local MINIMUM_BILLIONS, MAXIMUM_BILLIONS, DEFAULT_BILLIONS = 0.1, 999, 2
+local SLOT_STATE = "Slot"
+local EggState, Assets, EggRecords, AssetEarnings, SlotIdentity, GuardGeometry, Save
+local ready, destroyed, autoEnabled = false, false, false
+local generation = 0
 local minimumRatePerSecond = DEFAULT_BILLIONS * 1e9
-local queuedUids = {}
-local successfulVersions = {}
-local loggedVersions = {}
-local recordQueue = {}
-local promptCacheBySlot = {}
-local activeTargetPrompt = nil
-local suspendedEggPromptStates = {}
-local debugSequence = 0
+local records, loggedVersions, cooldowns = {}, {}, {}
+local prompts, lifetimeConnections = {}, {}
+local currentCycle, safeHome
+local inFlightRequest = shared.__AutoSAERemoteLock
+local statusLabel, toggleButton, minimumInput
+local sequence = 0
+local renderControls
+local stopAutomation
 
-local function debugLog(stage, message, ...)
-	debugSequence += 1
-	local ok, rendered = pcall(string.format, message, ...)
-
-	if not ok then
-		rendered = message .. " | ERREUR_FORMAT=" .. tostring(rendered)
+local function log(stage, message, ...)
+	if not CONFIG.Debug and stage ~= "ERROR" and stage ~= "CLAIM_CONFIRMED" then
+		return
 	end
-
-	print(string.format(
-		"[Auto_SAE][DEBUG][%04d][%.3f][%s] %s",
-		debugSequence,
-		os.clock(),
-		stage,
-		rendered
-	))
+	sequence += 1
+	local ok, text = pcall(string.format, message, ...)
+	if not ok then
+		text = message .. " | format=" .. tostring(text)
+	end
+	print(string.format("[Auto_SAE][%04d][%.3f][%s][%s] %s",
+		sequence, os.clock(), stage, currentCycle and currentCycle.uid or "-", text))
 end
 
-local function debugWarn(stage, message, ...)
-	debugSequence += 1
-	local ok, rendered = pcall(string.format, message, ...)
-
-	if not ok then
-		rendered = message .. " | ERREUR_FORMAT=" .. tostring(rendered)
+local function setStatus(text, color)
+	if statusLabel then
+		statusLabel.Text = text
+		statusLabel.TextColor3 = color or Color3.fromRGB(225, 230, 245)
 	end
+end
 
-	warn(string.format(
-		"[Auto_SAE][DEBUG][%04d][%.3f][%s] %s",
-		debugSequence,
-		os.clock(),
-		stage,
-		rendered
-	))
+local function connect(signal, callback)
+	local connection = signal:Connect(callback)
+	table.insert(lifetimeConnections, connection)
+	return connection
 end
 
 local function formatPosition(position)
-	return string.format(
-		"(%.1f, %.1f, %.1f)",
-		position.X,
-		position.Y,
-		position.Z
-	)
+	return string.format("(%.1f, %.1f, %.1f)", position.X, position.Y, position.Z)
 end
 
 local function formatNumber(value)
-	local absolute = math.abs(value)
-
-	if absolute >= 1e15 then
-		return string.format("%.3gQa", value / 1e15)
-	elseif absolute >= 1e12 then
-		return string.format("%.3gT", value / 1e12)
-	elseif absolute >= 1e9 then
-		return string.format("%.3gB", value / 1e9)
-	elseif absolute >= 1e6 then
-		return string.format("%.3gM", value / 1e6)
-	elseif absolute >= 1e3 then
-		return string.format("%.3gK", value / 1e3)
+	for _, unit in ipairs({{1e15, "Qa"}, {1e12, "T"}, {1e9, "B"}, {1e6, "M"}, {1e3, "K"}}) do
+		if math.abs(value) >= unit[1] then
+			return string.format("%.3g%s", value / unit[1], unit[2])
+		end
 	end
-
-	return tostring(math.round(value))
+	return string.format("%.3g", value)
 end
 
 local function getCharacterParts()
 	local character = player.Character
-	if not character then
-		return nil, nil, nil
-	end
-
+	if not character then return nil, nil, nil end
 	return character, character:FindFirstChildOfClass("Humanoid"), character:FindFirstChild("HumanoidRootPart")
 end
 
-local function isInsideEggPromptRoot(instance)
-	local current = instance
+local function distanceXZ(first, second)
+	local delta = first - second
+	return Vector2.new(delta.X, delta.Z).Magnitude
+end
 
-	while current and current ~= Workspace do
-		if PROMPT_ROOT_NAMES[current.Name] then
-			return true
-		end
-
-		current = current.Parent
+local function stopMovement()
+	local _, humanoid, root = getCharacterParts()
+	if humanoid and root then
+		humanoid:Move(Vector3.zero)
+		humanoid:MoveTo(root.Position)
 	end
+end
 
+local function readCarry()
+	local ok, state = pcall(EggState.ReadCarryState)
+	if ok and type(state) == "table" then return state end
+	return nil
+end
+
+local function ownsEgg(uid)
+	local ok, record = pcall(EggState.ReadOwnedEgg, player.UserId, uid)
+	if ok and record ~= nil then return true, "ReadOwnedEgg" end
+	if Save then
+		local saveOK, profile = pcall(Save.Peek)
+		if saveOK and profile and profile.EggInventory and profile.EggInventory[uid] then
+			return true, "Save.EggInventory"
+		end
+	end
+	for _, container in pairs({Backpack = player:FindFirstChildOfClass("Backpack"), Character = player.Character}) do
+		if container then
+			for _, tool in ipairs(container:GetChildren()) do
+				if tool:IsA("Tool") and tool:GetAttribute("ItemType") == "AssetEgg"
+					and tool:GetAttribute("UID") == uid then
+					return true, "Tool.UID"
+				end
+			end
+		end
+	end
 	return false
 end
 
-local function configureEggPrompt(prompt)
-	return prompt ~= nil
-		and prompt:IsA("ProximityPrompt")
-		and prompt.Name == CARRY_PROMPT_NAME
-		and isInsideEggPromptRoot(prompt)
+local function readField(uid)
+	local ok, record = pcall(EggState.ReadFieldEgg, uid)
+	if ok then return record, true end
+	log("FIELD_READ_ERROR", "%s", tostring(record))
+	return nil, false
 end
 
-local function setEggPromptDisplayDistance(prompt)
-	if not configureEggPrompt(prompt) then
-		return false
-	end
+local function getSeparationLine()
+	local world = Workspace:FindFirstChild("World")
+	local areas = world and world:FindFirstChild("Areas")
+	local line = areas and areas:FindFirstChild("SeparationLine")
+	return line and line:IsA("BasePart") and line or nil
+end
 
-	prompt.MaxActivationDistance = PROMPT_DISPLAY_DISTANCE
+local function isSafe(position)
+	local line = getSeparationLine()
+	if not line then return nil end
+	return not GuardGeometry.IsPastLine(line, position)
+end
+
+local function validCycle(ctx)
+	if destroyed or not autoEnabled or generation ~= ctx.generation or currentCycle ~= ctx then
+		return false, "annule"
+	end
+	local character, humanoid, root = getCharacterParts()
+	if character ~= ctx.character or not humanoid or not root or humanoid.Health <= 0 then
+		return false, "personnage change ou mort"
+	end
 	return true
 end
 
-local function suspendOtherEggPrompts(targetPrompt)
-	activeTargetPrompt = targetPrompt
-	table.clear(suspendedEggPromptStates)
-
-	local disabledCount = 0
-
-	local function suspend(prompt)
-		if not configureEggPrompt(prompt) or prompt == targetPrompt then
-			return
-		end
-
-		if suspendedEggPromptStates[prompt] == nil then
-			suspendedEggPromptStates[prompt] = prompt.Enabled
-		end
-
-		if prompt.Enabled then
-			prompt.Enabled = false
-		end
-
-		disabledCount += 1
+local function setPhase(ctx, phase, message)
+	if ctx.phase ~= phase then
+		log("PHASE", "%s -> %s | %s", tostring(ctx.phase), phase, message or "")
+		ctx.phase = phase
 	end
-
-	local renderedFolder = Workspace:FindFirstChild("AreaEggSlotsClient")
-	if renderedFolder then
-		for _, descendant in ipairs(renderedFolder:GetDescendants()) do
-			suspend(descendant)
-		end
-	end
-
-	for _, workspaceChild in ipairs(Workspace:GetChildren()) do
-		if workspaceChild.Name == "SmartPromptPart" then
-			for _, descendant in ipairs(workspaceChild:GetDescendants()) do
-				suspend(descendant)
-			end
-		end
-	end
-
-	debugLog(
-		"PROMPT_ISOLATION",
-		"%d prompt(s) non cible(s) suspendu(s). Cible=%s Parent=%s",
-		disabledCount,
-		targetPrompt and targetPrompt:GetFullName() or "nil",
-		targetPrompt and targetPrompt.Parent and targetPrompt.Parent:GetFullName() or "nil"
-	)
+	setStatus(message or phase)
 end
-
-local function enforceOtherEggPromptsDisabled()
-	local disabledAgain = 0
-
-	for prompt in pairs(suspendedEggPromptStates) do
-		if prompt.Parent and prompt.Enabled then
-			prompt.Enabled = false
-			disabledAgain += 1
-		end
-	end
-
-	if disabledAgain > 0 then
-		debugLog(
-			"PROMPT_ISOLATION",
-			"%d prompt(s) non cible(s) reactive(s) par le jeu puis redésactive(s).",
-			disabledAgain
-		)
-	end
-end
-
-local function restoreOtherEggPrompts(afterTriggered)
-	local restoredCount = 0
-
-	for prompt, wasEnabled in pairs(suspendedEggPromptStates) do
-		if prompt.Parent then
-			prompt.Enabled = afterTriggered and true or wasEnabled
-			restoredCount += 1
-		end
-	end
-
-	table.clear(suspendedEggPromptStates)
-	activeTargetPrompt = nil
-
-	debugLog(
-		"PROMPT_ISOLATION",
-		"%d prompt(s) restaure(s) | Triggered=%s | EtatApres=%s",
-		restoredCount,
-		tostring(afterTriggered),
-		afterTriggered and "Enabled" or "etat initial"
-	)
-end
-
-local function configureAllEggPrompts()
-	local configured = 0
-	local renderedFolder = Workspace:FindFirstChild("AreaEggSlotsClient")
-
-	if renderedFolder then
-		for _, descendant in ipairs(renderedFolder:GetDescendants()) do
-			if setEggPromptDisplayDistance(descendant) then
-				configured += 1
-			end
-		end
-	end
-
-	for _, workspaceChild in ipairs(Workspace:GetChildren()) do
-		if workspaceChild.Name == "SmartPromptPart" then
-			for _, descendant in ipairs(workspaceChild:GetDescendants()) do
-				if setEggPromptDisplayDistance(descendant) then
-					configured += 1
-				end
-			end
-		end
-	end
-
-	return configured
-end
-
-Workspace.DescendantAdded:Connect(function(instance)
-	if instance:IsA("ProximityPrompt") and instance.Name == CARRY_PROMPT_NAME then
-		task.defer(function()
-			if not setEggPromptDisplayDistance(instance) then
-				return
-			end
-
-			debugLog(
-				"PROMPT_ADDED",
-				"Nouveau prompt detecte : %s | Enabled=%s | MaxDistance=%.1f | HoldDuration=%.2f",
-				instance:GetFullName(),
-				tostring(instance.Enabled),
-				instance.MaxActivationDistance,
-				instance.HoldDuration
-			)
-
-			if activeTargetPrompt and instance ~= activeTargetPrompt then
-				if suspendedEggPromptStates[instance] == nil then
-					suspendedEggPromptStates[instance] = instance.Enabled
-				end
-
-				instance.Enabled = false
-				debugLog("PROMPT_ISOLATION", "Nouveau prompt non cible desactive : %s", instance:GetFullName())
-			end
-		end)
-	end
-end)
-
-task.defer(function()
-	local configured = configureAllEggPrompts()
-	print(string.format(
-		"[Auto_SAE] %d prompt(s) d'œuf configuré(s) à %.0f studs.",
-		configured,
-		PROMPT_DISPLAY_DISTANCE
-	))
-end)
-
-local clientFolder = ReplicatedStorage:WaitForChild("Client", 10)
-local dataFolder = ReplicatedStorage:WaitForChild("Data", 10)
-local sharedFolder = ReplicatedStorage:WaitForChild("Shared", 10)
-
-if not clientFolder or not dataFolder or not sharedFolder then
-	warn("[Auto_SAE] Client, Data ou Shared est introuvable dans ReplicatedStorage.")
-	return
-end
-
-local eggStateModule = clientFolder:WaitForChild("EggState", 10)
-local assetsModule = dataFolder:WaitForChild("Assets", 10)
-local utilFolder = sharedFolder:WaitForChild("Util", 10)
-local eggRecordsModule = utilFolder and utilFolder:WaitForChild("EggRecords", 10)
-local assetEarningsModule = utilFolder and utilFolder:WaitForChild("AssetEarnings", 10)
-
-if not eggStateModule
-	or not assetsModule
-	or not eggRecordsModule
-	or not assetEarningsModule then
-	warn("[Auto_SAE] EggState, Assets, EggRecords ou AssetEarnings est introuvable.")
-	return
-end
-
-local EggState = require(eggStateModule)
-local Assets = require(assetsModule)
-local EggRecords = require(eggRecordsModule)
-local AssetEarnings = require(assetEarningsModule)
 
 local function getAssetConfig(record)
 	if type(record) ~= "table" or type(record.AssetCategory) ~= "string" then
@@ -435,919 +282,589 @@ local function logEgg(record)
 	))
 end
 
-local function resolveEggModel(uid)
-	local renderedFolder = Workspace:FindFirstChild("AreaEggSlotsClient")
-	local candidate = renderedFolder and renderedFolder:FindFirstChild(uid, true)
 
-	if candidate and candidate:IsA("Model") then
-		return candidate
-	end
-
-	return nil
-end
-
-local function getEggPosition(record)
-	local model = resolveEggModel(record.Uid)
-
-	if model then
-		return model:GetPivot().Position, model
-	end
-
-	local recordPosition = getRecordPosition(record)
-	if recordPosition then
-		return recordPosition, nil
-	end
-
-	return nil, nil
-end
-
-local function popHighestRateQueueEntry()
-	local highestIndex = 1
-	local highestRate = -math.huge
-
-	for index, queueEntry in ipairs(recordQueue) do
-		local rate = tonumber(queueEntry.Rate) or -math.huge
-
-		if rate > highestRate then
-			highestRate = rate
-			highestIndex = index
-		end
-	end
-
-	return table.remove(recordQueue, highestIndex)
-end
-
-local function resolveResetWall()
-	local world = Workspace:FindFirstChild("World")
-	local areas = world and world:FindFirstChild("Areas")
-	return areas and areas:FindFirstChild("WallStartCollision")
-end
-
-local function wallIsClosed(wall)
-	if not wall or not wall.Parent then
-		return false
-	end
-
-	if wall:IsA("BasePart") and wall.CanCollide then
-		return true
-	end
-
-	for _, descendant in ipairs(wall:GetDescendants()) do
-		if descendant:IsA("BasePart") and descendant.CanCollide then
+local function isEggPrompt(prompt)
+	if not prompt:IsA("ProximityPrompt") or prompt.Name ~= "CarryAreaEgg" then return false end
+	local ancestor = prompt.Parent
+	while ancestor and ancestor ~= Workspace do
+		if ancestor.Name == "SmartPromptPart" or ancestor.Name == "AreaEggSlotsClient" then
 			return true
 		end
+		ancestor = ancestor.Parent
 	end
-
 	return false
 end
 
-local function waitForResetWall(token)
-	local wall = resolveResetWall()
+local function promptPosition(prompt)
+	local parent = prompt.Parent
+	if not parent then return nil end
+	if parent:IsA("Attachment") then return parent.WorldPosition end
+	if parent:IsA("BasePart") then return parent.Position end
+	if parent:IsA("Model") then return parent:GetPivot().Position end
+	return nil
+end
 
-	if not wall or not wallIsClosed(wall) then
-		return token == navigationToken
+local function enforcePrompt(prompt, entry)
+	local ctx = currentCycle
+	if entry.writing or not ctx or not prompt.Parent then return end
+	local target = prompt == ctx.prompt
+	if not target and not CONFIG.IsolateOtherEggPrompts then return end
+	if not entry.saved then
+		entry.saved = {
+			Enabled = prompt.Enabled,
+			MaxActivationDistance = prompt.MaxActivationDistance,
+			HoldDuration = prompt.HoldDuration,
+		}
 	end
+	entry.writing = true
+	if target then
+		if prompt.MaxActivationDistance ~= CONFIG.TargetPromptDistance then
+			prompt.MaxActivationDistance = CONFIG.TargetPromptDistance
+		end
+		if prompt.HoldDuration ~= 0 then prompt.HoldDuration = 0 end
+	else
+		if prompt.Enabled then prompt.Enabled = false end
+	end
+	entry.writing = false
+end
 
-	print("[Auto_SAE] Mur de départ fermé : attente de son ouverture.")
+local function restorePrompts()
+	for prompt, entry in pairs(prompts) do
+		if entry.saved then
+			entry.writing = true
+			if prompt.Parent then
+				prompt.Enabled = entry.saved.Enabled
+				prompt.MaxActivationDistance = entry.saved.MaxActivationDistance
+				prompt.HoldDuration = entry.saved.HoldDuration
+			end
+			entry.writing = false
+			entry.saved = nil
+		end
+	end
+	log("PROMPTS_RESTORED", "Proprietes externes restaurees")
+end
 
-	while token == navigationToken and wallIsClosed(wall) do
+local function registerPrompt(prompt)
+	if destroyed or prompts[prompt] or not isEggPrompt(prompt) then return end
+	local entry = {writing = false, connections = {}, overwrites = 0}
+	prompts[prompt] = entry
+	for _, property in ipairs({"Enabled", "MaxActivationDistance", "HoldDuration"}) do
+		table.insert(entry.connections, prompt:GetPropertyChangedSignal(property):Connect(function()
+			if entry.writing then return end
+			local expected
+			local ctx = currentCycle
+			if ctx and ctx.prompt == prompt then
+				if property == "MaxActivationDistance" then expected = CONFIG.TargetPromptDistance end
+				if property == "HoldDuration" then expected = 0 end
+			elseif ctx and CONFIG.IsolateOtherEggPrompts and property == "Enabled" then
+				expected = false
+			end
+			-- Deferred signals may arrive after our writing flag has been cleared.
+			if entry.saved and (expected == nil or prompt[property] ~= expected) then
+				entry.saved[property] = prompt[property]
+				entry.overwrites += 1
+			end
+			enforcePrompt(prompt, entry)
+		end))
+	end
+	for _, event in ipairs({"PromptShown", "PromptHidden", "Triggered"}) do
+		table.insert(entry.connections, prompt[event]:Connect(function(value)
+			local ctx = currentCycle
+			if not ctx or ctx.prompt ~= prompt then return end
+			if event == "PromptShown" then ctx.promptShown = true end
+			if event == "PromptHidden" then ctx.promptShown = false end
+			log("PROMPT_" .. string.upper(event), "Value=%s Enabled=%s Hold=%.2f Max=%.1f",
+				tostring(value), tostring(prompt.Enabled), prompt.HoldDuration, prompt.MaxActivationDistance)
+			-- These local events are diagnostics. They never confirm ownership.
+		end))
+	end
+	table.insert(entry.connections, prompt.Destroying:Connect(function()
+		for _, connection in ipairs(entry.connections) do connection:Disconnect() end
+		prompts[prompt] = nil
+		if currentCycle and currentCycle.prompt == prompt then
+			currentCycle.prompt = nil
+			log("PROMPT_DESTROYED", "La prise par UID reste disponible")
+		end
+	end))
+	enforcePrompt(prompt, entry)
+	log("PROMPT_REGISTERED", "%s Enabled=%s", prompt:GetFullName(), tostring(prompt.Enabled))
+end
+
+local function startPromptRegistry()
+	-- One initial scan restricted to official egg roots, then event-driven updates.
+	local folder = Workspace:FindFirstChild("AreaEggSlotsClient")
+	if folder then
+		for _, instance in ipairs(folder:GetDescendants()) do registerPrompt(instance) end
+	end
+	for _, child in ipairs(Workspace:GetChildren()) do
+		if child.Name == "SmartPromptPart" then
+			for _, instance in ipairs(child:GetDescendants()) do registerPrompt(instance) end
+		end
+	end
+	connect(Workspace.DescendantAdded, function(instance)
+		if instance:IsA("ProximityPrompt") and instance.Name == "CarryAreaEgg" then
+			task.defer(registerPrompt, instance)
+		end
+	end)
+end
+
+local function findTargetPrompt(ctx)
+	if ctx.prompt and ctx.prompt.Parent then return end
+	local best, bestDistance, secondDistance = nil, 18, math.huge
+	for prompt in pairs(prompts) do
+		local position = promptPosition(prompt)
+		if position then
+			local distance = distanceXZ(position, ctx.eggPosition)
+			if distance < bestDistance then
+				secondDistance, bestDistance, best = best and bestDistance or math.huge, distance, prompt
+			elseif distance < secondDistance then
+				secondDistance = distance
+			end
+		end
+	end
+	if best and secondDistance - bestDistance > 0.5 then
+		ctx.prompt = best
+		local entry = prompts[best]
+		if entry.saved then
+			entry.writing = true
+			best.Enabled = entry.saved.Enabled
+			entry.writing = false
+		end
+		enforcePrompt(best, prompts[best])
+		log("TARGET_PROMPT", "%s OffsetXZ=%.2f | prise serveur ciblee par UID",
+			best:GetFullName(), bestDistance)
+	end
+end
+
+local function ownerSnapshot()
+	local ok, inventory = pcall(EggState.ReadOwnerEggs, player.UserId)
+	local merged = ok and type(inventory) == "table" and inventory or {}
+	if Save then
+		local saveOK, profile = pcall(Save.Peek)
+		if saveOK and profile and type(profile.EggInventory) == "table" then
+			for uid, record in pairs(profile.EggInventory) do merged[uid] = record end
+		end
+	end
+	return merged
+end
+
+local function claimEvidence(ctx)
+	local owned, source = ownsEgg(ctx.uid)
+	if owned then return true, source end
+	local carry = readCarry()
+	if ctx.claimFeedback and (ctx.sawCarry or ctx.remoteAccepted) and carry and not carry.IsCarrying then
+		for uid, record in pairs(ownerSnapshot()) do
+			if not ctx.ownerBefore[uid] and type(record) == "table"
+				and record.AssetCategory == ctx.record.AssetCategory then
+				return true, "FieldClaimed + nouvel UID inventaire " .. tostring(uid)
+			end
+		end
+	end
+	return false
+end
+
+local function updateCarryEvidence(ctx)
+	local owned, source = ownsEgg(ctx.uid)
+	if owned then
+		ctx.claimed = true
+		ctx.claimSource = source
+		return true
+	end
+	local carry = readCarry()
+	if carry and carry.IsCarrying and carry.Uid == ctx.uid then
+		ctx.sawCarry = true
+		return true
+	end
+	return ctx.remoteAccepted == true
+end
+
+local function requestCarry(ctx)
+	if inFlightRequest and not inFlightRequest.done then return end
+	if ctx.attempts >= CONFIG.MaxCarryAttempts then return end
+	local request = {uid = ctx.uid, started = os.clock(), done = false}
+	inFlightRequest = request
+	shared.__AutoSAERemoteLock = request
+	ctx.attempts += 1
+	ctx.lastRequest = request.started
+	setPhase(ctx, "CARRY_PENDING", "Prise serveur : " .. getAnimalName(ctx.record))
+	log("CARRY_REQUEST", "Tentative=%d UID=%s", ctx.attempts, ctx.uid)
+	task.spawn(function()
+		if not validCycle(ctx) then
+			request.done = true
+			return
+		end
+		local slotKey
+		if SlotIdentity.LooksLikeFirstAreaUid(ctx.uid) then
+			slotKey = SlotIdentity.SlotKey(ctx.record.AreaId, ctx.record.NestId)
+		end
+		local ok, accepted, reason = pcall(EggState.CarryFieldEgg, ctx.uid, slotKey)
+		request.done = true
+		request.accepted = ok and accepted == true
+		request.reason = ok and reason or tostring(accepted)
+		-- A timed-out InvokeServer may finish later. It never controls a newer cycle.
+		log("CARRY_REPLY", "UID=%s CallOK=%s Accepted=%s Reason=%s Latence=%.3fs SessionActive=%s",
+			ctx.uid, tostring(ok), tostring(request.accepted), tostring(request.reason),
+			os.clock() - request.started, tostring(validCycle(ctx)))
+		if not validCycle(ctx) then return end
+		ctx.remoteAccepted = request.accepted
+		ctx.denial = request.reason
+	end)
+end
+
+local function moveLoop(ctx, destination, phase)
+	local _, humanoid, root = getCharacterParts()
+	if not humanoid or not root then return false, "personnage absent" end
+	local started, lastCommand, lastLog = os.clock(), -math.huge, -math.huge
+	local lastMoved, lastPosition = started, root.Position
+	local distance = distanceXZ(root.Position, destination)
+	local timeout = math.clamp(distance / math.max(humanoid.WalkSpeed, 1) * 4 + 15, 15, 150)
+	setPhase(ctx, phase, phase == "RETURN" and "Retour vers la zone sure" or "Approche : " .. getAnimalName(ctx.record))
+	while true do
+		local valid, reason = validCycle(ctx)
+		if not valid then return false, reason end
+		local now = os.clock()
+		distance = distanceXZ(root.Position, destination)
+		if distanceXZ(lastPosition, root.Position) >= 0.5 then
+			lastMoved, lastPosition = now, root.Position
+		end
+		local carry = readCarry()
+		if phase == "APPROACH" then
+			if updateCarryEvidence(ctx) then
+				stopMovement()
+				log("CARRY_CONFIRMED", "ReponseServeur=%s TransportUID=%s PossessionUID=%s",
+					tostring(ctx.remoteAccepted), tostring(ctx.sawCarry), tostring(ctx.claimed))
+				return true
+			end
+			if carry and carry.IsCarrying and carry.Uid ~= ctx.uid then
+				return false, "un autre oeuf est deja transporte"
+			end
+			local latest, readOk = readField(ctx.uid)
+			if readOk and (not latest or latest.State ~= SLOT_STATE) then
+				local pending = inFlightRequest and inFlightRequest.uid == ctx.uid and not inFlightRequest.done
+				if not pending then
+					-- Allow replication to deliver CarryChanged before treating the egg as lost.
+					ctx.missingSince = ctx.missingSince or now
+					if now - ctx.missingSince > 1.5 then return false, "oeuf retire sans prise confirmee" end
+				end
+			else
+				ctx.missingSince = nil
+			end
+			if now - (ctx.lastPromptSearch or -math.huge) >= 0.5 then
+				findTargetPrompt(ctx)
+				ctx.lastPromptSearch = now
+			end
+			if distance <= CONFIG.GrabDistance then
+				stopMovement()
+				local pending = inFlightRequest and not inFlightRequest.done
+				if not pending and now - ctx.lastRequest >= CONFIG.RequestInterval then
+					if ctx.attempts >= CONFIG.MaxCarryAttempts then
+						return false, "prise refusee : " .. tostring(ctx.denial)
+					end
+					requestCarry(ctx)
+				end
+				lastMoved = now
+			end
+		elseif distance <= CONFIG.ReturnDistance then
+			stopMovement()
+			return true
+		end
+		if phase == "APPROACH" and inFlightRequest and not inFlightRequest.done
+			and now - inFlightRequest.started > CONFIG.RequestTimeout then
+			return false, "requete serveur sans reponse ; attente de reconciliation"
+		end
+		if now - started > timeout then return false, "delai de deplacement depasse" end
+		if now - lastMoved > CONFIG.NoMovementTimeout then return false, "deplacement bloque" end
+		if distance > (phase == "APPROACH" and CONFIG.GrabDistance or CONFIG.ReturnDistance)
+			and now - lastCommand >= CONFIG.MoveRefresh then
+			humanoid:MoveTo(destination)
+			lastCommand = now
+		end
+		if now - lastLog >= CONFIG.ProgressInterval then
+			lastLog = now
+			local overwriteCount = 0
+			for _, entry in pairs(prompts) do overwriteCount += entry.overwrites end
+			log("MOVE_PROGRESS", "Phase=%s Pos=%s DistanceXZ=%.2f WalkSpeed=%.1f VitesseReelle=%.1f Safe=%s CarryUID=%s Requetes=%d Prompt=%s Reecritures=%d",
+				phase, formatPosition(root.Position), distance, humanoid.WalkSpeed,
+				root.AssemblyLinearVelocity.Magnitude, tostring(isSafe(root.Position)),
+				carry and tostring(carry.Uid) or "?", ctx.attempts, tostring(ctx.prompt ~= nil), overwriteCount)
+		end
 		RunService.Heartbeat:Wait()
 	end
+end
 
-	if token ~= navigationToken then
+local function waitForClaim(ctx)
+	setPhase(ctx, "CONFIRM_CLAIM", "Verification de l'oeuf dans l'inventaire")
+	local started, lastLog = os.clock(), -math.huge
+	while validCycle(ctx) do
+		local owned, source = claimEvidence(ctx)
+		if owned then
+			ctx.claimed, ctx.claimSource = true, source
+			log("CLAIM_CONFIRMED", "UID=%s Source=%s | cycle termine", ctx.uid, source)
+			return true
+		end
+		local now = os.clock()
+		local carry = readCarry()
+		if now - lastLog >= 0.5 then
+			lastLog = now
+			log("CLAIM_WAIT", "Carry=%s CarryUID=%s Feedback=%s Temps=%.1fs",
+				carry and tostring(carry.IsCarrying) or "?",
+				carry and tostring(carry.Uid) or "?", tostring(ctx.claimFeedback), now - started)
+		end
+		if now - started >= CONFIG.ClaimTimeout then
+			return false, "attribution non confirmee pour l'UID ; verifie la zone safe"
+		end
+		task.wait(0.1)
+	end
+	return false, "annule"
+end
+
+local function cleanupCycle(ctx)
+	if currentCycle ~= ctx then return end
+	stopMovement()
+	restorePrompts()
+	currentCycle = nil
+end
+
+local function runCycle(record, rate, recovering)
+	local character, humanoid, root = getCharacterParts()
+	if not character or not humanoid or not root then return false, "personnage absent" end
+	local startIsSafe = isSafe(root.Position)
+	if startIsSafe then safeHome = root.Position end
+	if not safeHome or isSafe(safeHome) ~= true then
+		return false, "position de retour sure non disponible"
+	end
+	local ctx = {
+		uid = record.Uid, record = record, generation = generation, character = character,
+		home = safeHome, eggPosition = record.BottomCFrame and record.BottomCFrame.Position,
+		attempts = 0, lastRequest = -math.huge, phase = "SELECTED", ownerBefore = ownerSnapshot(),
+		remoteAccepted = recovering == true, sawCarry = recovering == true,
+	}
+	currentCycle = ctx
+	for prompt, entry in pairs(prompts) do enforcePrompt(prompt, entry) end
+	log("TARGET", "Animal=%s Revenu=%s/s Home=%s Recovery=%s",
+		getAnimalName(record), formatNumber(rate or 0), formatPosition(ctx.home), tostring(recovering))
+	local cycleOK, completed, failure = xpcall(function()
+		local grabbed, grabReason
+		if recovering then
+			grabbed = true
+		elseif not ctx.eggPosition then
+			return false, "position de l'oeuf absente"
+		else
+			local destination = Vector3.new(ctx.eggPosition.X, ctx.home.Y, ctx.eggPosition.Z)
+			grabbed, grabReason = moveLoop(ctx, destination, "APPROACH")
+		end
+		if not validCycle(ctx) then return false, "annule" end
+		if not grabbed and inFlightRequest and not inFlightRequest.done then
+			return false, grabReason or "requete serveur encore en cours"
+		end
+		local returned, returnReason = moveLoop(ctx, ctx.home, "RETURN")
+		if not returned then return false, returnReason end
+		local _, _, currentRoot = getCharacterParts()
+		if not currentRoot or isSafe(currentRoot.Position) ~= true then
+			return false, "retour termine mais ligne safe non franchie"
+		end
+		if not grabbed then return false, grabReason end
+		return waitForClaim(ctx)
+	end, debug.traceback)
+	cleanupCycle(ctx)
+	if not cycleOK then return false, tostring(completed) end
+	return completed, failure
+end
+
+local function ingest(record)
+	if type(record) ~= "table" or type(record.Uid) ~= "string" then return end
+	records[record.Uid] = record
+	logEgg(record)
+end
+
+local function snapshot(snapshotData)
+	if type(snapshotData) ~= "table" or type(snapshotData.Records) ~= "table" then return end
+	local updated = {}
+	for _, record in ipairs(snapshotData.Records) do
+		if type(record) == "table" and type(record.Uid) == "string" then
+			updated[record.Uid] = record
+			logEgg(record)
+		end
+	end
+	records = updated
+end
+
+local function selectBest()
+	local best, bestRate = nil, -math.huge
+	local _, _, root = getCharacterParts()
+	for uid, cached in pairs(records) do
+		if cached.State == SLOT_STATE and (cooldowns[uid] or 0) <= os.clock() then
+			local latest, ok = readField(uid)
+			if ok and latest and latest.State == SLOT_STATE and not ownsEgg(uid) then
+				records[uid] = latest
+				local rate = getRatePerSecond(latest)
+				if rate and rate >= minimumRatePerSecond then
+					if rate > bestRate or (rate == bestRate and root and best
+						and distanceXZ(latest.BottomCFrame.Position, root.Position)
+						< distanceXZ(best.BottomCFrame.Position, root.Position)) then
+						best, bestRate = latest, rate
+					end
+				end
+			end
+		end
+	end
+	return best, bestRate
+end
+
+stopAutomation = function(reason)
+	autoEnabled = false
+	generation += 1
+	if currentCycle then cleanupCycle(currentCycle) end
+	stopMovement()
+	setStatus(reason or "Arrete", Color3.fromRGB(255, 150, 120))
+	if renderControls then renderControls() end
+	log("STOP", "%s | RemoteEnCours=%s", reason or "utilisateur", tostring(inFlightRequest and not inFlightRequest.done))
+end
+
+local function worker(token)
+	while autoEnabled and generation == token and not destroyed do
+		if inFlightRequest and not inFlightRequest.done then
+			stopAutomation("Requete serveur en cours : attendre sa reponse")
+			return
+		end
+		local carry = readCarry()
+		if not carry then
+			stopAutomation("Etat de transport indisponible")
+			return
+		end
+		local selected, rate, recovering
+		if carry.IsCarrying and carry.Uid then
+			selected = readField(carry.Uid)
+			selected = selected or {Uid = carry.Uid, AssetCategory = carry.AssetCategory}
+			recovering = true
+		else
+			selected, rate = selectBest()
+		end
+		if selected then
+			local success, reason = runCycle(selected, rate, recovering)
+			if not autoEnabled or generation ~= token then return end
+			if not success then
+				log("CYCLE_FAILED", "UID=%s Raison=%s", selected.Uid, tostring(reason))
+				cooldowns[selected.Uid] = os.clock() + CONFIG.FailedTargetCooldown
+				-- Never continue after ambiguous ownership or an unresolved request.
+				if recovering or (inFlightRequest and not inFlightRequest.done) then
+					stopAutomation(tostring(reason))
+					return
+				end
+				local after = readCarry()
+				local _, _, root = getCharacterParts()
+				if not after or after.IsCarrying or not root or isSafe(root.Position) ~= true
+					or string.find(tostring(reason), "attribution", 1, true) then
+					stopAutomation(tostring(reason))
+					return
+				end
+			end
+		else
+			setStatus("En attente : minimum " .. formatNumber(minimumRatePerSecond) .. " $/s",
+				Color3.fromRGB(96, 230, 145))
+		end
+		task.wait(CONFIG.ScanInterval)
+	end
+end
+
+local function startAutomation(billions)
+	if destroyed or not ready then
+		setStatus("Les modules du jeu sont indisponibles", Color3.fromRGB(255, 130, 110))
 		return false
 	end
-
-	print("[Auto_SAE] Mur de départ ouvert.")
+	if inFlightRequest and not inFlightRequest.done then
+		setStatus("Une requete attend encore le serveur", Color3.fromRGB(255, 190, 100))
+		return false
+	end
+	local _, humanoid, root = getCharacterParts()
+	if not humanoid or not root or humanoid.Health <= 0 then
+		setStatus("Personnage indisponible")
+		return false
+	end
+	if isSafe(root.Position) == true then safeHome = root.Position end
+	if not safeHome or isSafe(safeHome) ~= true then
+		setStatus("Place-toi dans la zone sure puis START", Color3.fromRGB(255, 190, 100))
+		return false
+	end
+	minimumRatePerSecond = math.clamp(billions, MINIMUM_BILLIONS, MAXIMUM_BILLIONS) * 1e9
+	generation += 1
+	local token = generation
+	autoEnabled = true
+	cooldowns = {}
+	snapshot(EggState.ReadFieldEggs())
+	if renderControls then renderControls() end
+	log("START", "Minimum=%s/s SafeHome=%s Session=%d",
+		formatNumber(minimumRatePerSecond), formatPosition(safeHome), token)
+	task.spawn(function()
+		local ok, failure = xpcall(function() worker(token) end, debug.traceback)
+		if not ok then
+			log("ERROR", "%s", tostring(failure))
+			if generation == token then stopAutomation("Erreur : voir la console Auto_SAE") end
+		end
+	end)
 	return true
 end
 
-local function moveDirect(destination, token, destinationLabel)
-	local _, humanoid, rootPart = getCharacterParts()
-
-	if not humanoid or not rootPart then
-		warn("[Auto_SAE] Personnage ou HumanoidRootPart introuvable.")
-		return false
-	end
-
-	print(string.format(
-		"[Auto_SAE] MoveTo rapide vers %s : %s.",
-		destinationLabel,
-		formatPosition(destination)
-	))
-
-	humanoid:MoveTo(destination)
-	humanoid.MoveToFinished:Wait()
-
-	if token ~= navigationToken or not autoEnabled then
-		return false
-	end
-
-	local offsetAfterMove = destination - rootPart.Position
-	local distanceAfterMove = Vector3.new(offsetAfterMove.X, 0, offsetAfterMove.Z).Magnitude
-
-	if distanceAfterMove <= POSITION_ARRIVAL_DISTANCE then
-		humanoid:Move(Vector3.zero)
-		return true
-	end
-
-	local speedToRestore = humanoid.WalkSpeed
-	humanoid.WalkSpeed = math.min(speedToRestore, EGG_CORRECTION_SPEED)
-	local lastMoveCommand = -math.huge
-
-	print(string.format(
-		"[Auto_SAE] Ajustement retour à %.0f studs/s, distance restante : %.1f studs.",
-		humanoid.WalkSpeed,
-		distanceAfterMove
-	))
-
-	local function restoreSpeed()
-		if humanoid.Parent then
-			humanoid.WalkSpeed = speedToRestore
+local function loadModule(path)
+	local deadline, node = os.clock() + 12, ReplicatedStorage
+	for name in string.gmatch(path, "[^%.]+") do
+		local child = node:FindFirstChild(name)
+		while not child and os.clock() < deadline and not destroyed do
+			task.wait(0.1)
+			child = node:FindFirstChild(name)
 		end
+		assert(child, "ReplicatedStorage." .. path .. " introuvable")
+		node = child
 	end
-
-	while token == navigationToken and autoEnabled do
-		if humanoid.Health <= 0 or not rootPart.Parent then
-			restoreSpeed()
-			return false
-		end
-
-		local offset = destination - rootPart.Position
-		local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
-
-		if distance <= POSITION_ARRIVAL_DISTANCE then
-			humanoid:Move(Vector3.zero)
-			restoreSpeed()
-			return true
-		end
-
-		local now = os.clock()
-		if now - lastMoveCommand >= EGG_MOVE_REFRESH_SECONDS then
-			humanoid:MoveTo(destination)
-			lastMoveCommand = now
-		end
-
-		RunService.Heartbeat:Wait()
-	end
-
-	humanoid:Move(Vector3.zero)
-	restoreSpeed()
-	return false
+	return require(node)
 end
 
-local fireprompt
-local getPromptPosition
-
-local function moveUntilPromptTriggered(destination, prompt, token, destinationLabel)
-	local _, humanoid, rootPart = getCharacterParts()
-
-	if not humanoid or not rootPart or not configureEggPrompt(prompt) or not prompt.Parent then
-		debugWarn(
-			"MOVE_INIT",
-			"Demarrage refuse | Humanoid=%s | Root=%s | Prompt=%s | Parent=%s",
-			tostring(humanoid ~= nil),
-			tostring(rootPart ~= nil),
-			tostring(prompt ~= nil),
-			tostring(prompt and prompt.Parent ~= nil)
-		)
-		return false
+local function initialize()
+	EggState = loadModule("Client.EggState")
+	Assets = loadModule("Data.Assets")
+	EggRecords = loadModule("Shared.Util.EggRecords")
+	AssetEarnings = loadModule("Shared.Util.AssetEarnings")
+	SlotIdentity = loadModule("Shared.Util.AreaEggSlotIdentity")
+	GuardGeometry = loadModule("Shared.Util.GuardAreaGeometry")
+	Save = loadModule("Shared.Save")
+	if destroyed then return end
+	for _, name in ipairs({"CarryFieldEgg", "ReadFieldEgg", "ReadFieldEggs", "ReadCarryState", "ReadOwnedEgg", "ReadOwnerEggs"}) do
+		assert(type(EggState[name]) == "function", "EggState." .. name .. " indisponible")
 	end
-
-	prompt.MaxActivationDistance = TARGET_PROMPT_DISTANCE
-	prompt.HoldDuration = 0
-	suspendOtherEggPrompts(prompt)
-
-	local promptTriggered = false
-	local promptShown = false
-	local activationInProgress = false
-	local moveCommandCount = 0
-	local shownCount = 0
-	local hiddenCount = 0
-	local lastProgressLog = -math.huge
-	local lastMoveCommand = -math.huge
-
-	debugLog(
-		"MOVE_INIT",
-		"Cible preparee | Destination=%s | Prompt=%s | Enabled=%s | MaxDistance=%.1f | HoldDuration=%.2f | Root=%s",
-		formatPosition(destination),
-		prompt:GetFullName(),
-		tostring(prompt.Enabled),
-		prompt.MaxActivationDistance,
-		prompt.HoldDuration,
-		formatPosition(rootPart.Position)
-	)
-
-	local function requestActivation(reason)
-		if activationInProgress or promptTriggered or not prompt.Parent or not autoEnabled then
-			debugLog(
-				"ACTIVATION_SKIP",
-				"Activation ignoree | Raison=%s | InProgress=%s | Triggered=%s | Parent=%s | Auto=%s",
-				reason,
-				tostring(activationInProgress),
-				tostring(promptTriggered),
-				tostring(prompt.Parent ~= nil),
-				tostring(autoEnabled)
-			)
-			return
+	connect(EggState.FieldRefreshed, snapshot)
+	connect(EggState.FieldShifted, ingest)
+	connect(EggState.FieldGone, function(uid)
+		records[uid], loggedVersions[uid] = nil, nil
+		log("FIELD_GONE", "UID=%s | ne prouve pas la possession", tostring(uid))
+	end)
+	connect(EggState.CarryChanged, function(state)
+		local ctx = currentCycle
+		log("CARRY_CHANGED", "Carrying=%s UID=%s Area=%s SpeedMultiplier=%s",
+			tostring(state.IsCarrying), tostring(state.Uid), tostring(state.AreaId), tostring(state.SpeedMultiplier))
+		if ctx and state.IsCarrying and state.Uid == ctx.uid then ctx.sawCarry = true end
+	end)
+	connect(EggState.FieldClaimed, function(payload)
+		local ctx = currentCycle
+		log("FIELD_CLAIMED", "Animal=%s Rarity=%s Pos=%s | payload sans UID",
+			tostring(payload.AssetCategory), tostring(payload.Rarity), formatPosition(payload.Position))
+		if ctx and payload.AssetCategory == ctx.record.AssetCategory
+			and (ctx.sawCarry or ctx.remoteAccepted) then
+			ctx.claimFeedback = true
 		end
-
-		activationInProgress = true
-		debugLog("ACTIVATION_REQUEST", "fireprompt lance | Raison=%s", reason)
-
-		task.defer(function()
-			local activationResult = fireprompt(prompt)
-			debugLog(
-				"ACTIVATION_RESULT",
-				"fireprompt termine | Resultat=%s | TriggeredObserve=%s | Enabled=%s | Parent=%s",
-				tostring(activationResult),
-				tostring(promptTriggered),
-				tostring(prompt.Enabled),
-				tostring(prompt.Parent ~= nil)
-			)
-			activationInProgress = false
-		end)
-	end
-
-	local triggeredConnection = prompt.Triggered:Connect(function(triggeringPlayer)
-		debugLog(
-			"TRIGGERED_EVENT",
-			"Evenement recu | Joueur=%s | LocalPlayer=%s",
-			triggeringPlayer and triggeringPlayer.Name or "nil",
-			player.Name
-		)
-
-		if triggeringPlayer == nil or triggeringPlayer == player then
-			promptTriggered = true
-			debugLog("TRIGGERED_EVENT", "Confirmation acceptee : la boucle MoveTo peut s'arreter.")
-		else
-			debugWarn("TRIGGERED_EVENT", "Confirmation ignoree car elle vient d'un autre joueur.")
+		-- Final success is still checked against ReadOwnedEgg(localUserId, exactUid).
+	end)
+	connect(EggState.OwnerRefreshed, function(userId)
+		if userId == player.UserId and currentCycle then
+			log("OWNER_REFRESHED", "UID=%s Possession=%s", currentCycle.uid, tostring(ownsEgg(currentCycle.uid)))
 		end
 	end)
-
-	local shownConnection = prompt.PromptShown:Connect(function(inputType)
-		shownCount += 1
-		promptShown = true
-		prompt.MaxActivationDistance = TARGET_PROMPT_DISTANCE
-		prompt.HoldDuration = 0
-
-		debugLog(
-			"PROMPT_SHOWN",
-			"Affichage #%d | Input=%s | Enabled=%s | MaxDistance=%.1f | HoldDuration=%.2f | Boucle continue jusqu'a Triggered",
-			shownCount,
-			tostring(inputType),
-			tostring(prompt.Enabled),
-			prompt.MaxActivationDistance,
-			prompt.HoldDuration
-		)
-
-		requestActivation("PromptShown #" .. tostring(shownCount))
-	end)
-
-	local hiddenConnection = prompt.PromptHidden:Connect(function()
-		hiddenCount += 1
-		promptShown = false
-		debugWarn(
-			"PROMPT_HIDDEN",
-			"Disparition #%d | Enabled=%s | Parent=%s | La boucle MoveTo continue.",
-			hiddenCount,
-			tostring(prompt.Enabled),
-			tostring(prompt.Parent ~= nil)
-		)
-	end)
-
-	local function disconnectEvents()
-		triggeredConnection:Disconnect()
-		shownConnection:Disconnect()
-		hiddenConnection:Disconnect()
-	end
-
-	RunService.Heartbeat:Wait()
-
-	local promptPosition = getPromptPosition(prompt)
-	if prompt.Enabled
-		and promptPosition
-		and (promptPosition - rootPart.Position).Magnitude <= prompt.MaxActivationDistance + 1 then
-		promptShown = true
-		debugLog(
-			"PROMPT_VISIBLE_FALLBACK",
-			"Prompt deja visible a la connexion | Distance3D=%.2f | Activation lancee.",
-			(promptPosition - rootPart.Position).Magnitude
-		)
-		requestActivation("prompt deja visible")
-	end
-
-	while token == navigationToken and autoEnabled and not promptTriggered do
-		if humanoid.Health <= 0 or not rootPart.Parent then
-			debugWarn(
-				"MOVE_ABORT",
-				"Personnage invalide | Health=%.1f | RootParent=%s",
-				humanoid.Health,
-				tostring(rootPart.Parent ~= nil)
-			)
-			break
-		end
-
-		if not prompt.Parent then
-			debugWarn("MOVE_ABORT", "Le prompt cible a perdu son Parent avant Triggered.")
-			break
-		end
-
-		local now = os.clock()
-		local offset = destination - rootPart.Position
-		local horizontalDistanceToEgg = Vector2.new(offset.X, offset.Z).Magnitude
-		local promptPositionNow = getPromptPosition(prompt)
-		local promptDistance = promptPositionNow and (promptPositionNow - rootPart.Position).Magnitude or -1
-
-		if now - lastMoveCommand >= EGG_MOVE_REFRESH_SECONDS then
-			enforceOtherEggPromptsDisabled()
-			humanoid:MoveTo(destination)
-			lastMoveCommand = now
-			moveCommandCount += 1
-		end
-
-		if now - lastProgressLog >= DEBUG_PROGRESS_INTERVAL then
-			lastProgressLog = now
-			debugLog(
-				"MOVE_PROGRESS",
-				"Commande=%d | Position=%s | DistanceEggXZ=%.2f | DistancePrompt3D=%.2f | Shown=%s | Enabled=%s | Activation=%s | Triggered=%s",
-				moveCommandCount,
-				formatPosition(rootPart.Position),
-				horizontalDistanceToEgg,
-				promptDistance,
-				tostring(promptShown),
-				tostring(prompt.Enabled),
-				tostring(activationInProgress),
-				tostring(promptTriggered)
-			)
-		end
-
-		RunService.Heartbeat:Wait()
-	end
-
-	humanoid:Move(Vector3.zero)
-	humanoid:MoveTo(rootPart.Position)
-	disconnectEvents()
-	restoreOtherEggPrompts(promptTriggered)
-
-	if promptTriggered and token == navigationToken and autoEnabled then
-		debugLog(
-			"MOVE_COMPLETE",
-			"Triggered confirme apres %d commande(s) MoveTo | Position finale=%s | Retour autorise.",
-			moveCommandCount,
-			formatPosition(rootPart.Position)
-		)
-		return true
-	end
-
-	debugWarn(
-		"MOVE_FAILED",
-		"Fin sans Triggered | TokenValide=%s | Auto=%s | PromptParent=%s | Commandes=%d",
-		tostring(token == navigationToken),
-		tostring(autoEnabled),
-		tostring(prompt.Parent ~= nil),
-		moveCommandCount
-	)
-	return false
+	startPromptRegistry()
+	snapshot(EggState.ReadFieldEggs())
+	ready = true
+	setStatus("Pret : demarre depuis la zone sure", Color3.fromRGB(96, 230, 145))
+	log("READY", "Build=2 | CarryFieldEgg/ReadOwnedEgg | AffichageCible=%d | DistancePrise=%d",
+		CONFIG.TargetPromptDistance, CONFIG.GrabDistance)
 end
-getPromptPosition = function(prompt)
-	local parent = prompt.Parent
-
-	if not parent then
-		return nil
-	end
-
-	if parent:IsA("Attachment") then
-		return parent.WorldPosition
-	end
-
-	if parent:IsA("BasePart") then
-		return parent.Position
-	end
-
-	local model = parent:FindFirstAncestorOfClass("Model")
-	return model and model:GetPivot().Position or nil
-end
-
-local function promptIsUsable(prompt, rootPosition)
-	if not configureEggPrompt(prompt) or not prompt.Enabled then
-		return false
-	end
-
-	local promptPosition = getPromptPosition(prompt)
-	return promptPosition ~= nil
-		and (promptPosition - rootPosition).Magnitude <= prompt.MaxActivationDistance + 1
-end
-
-local function promptSlotKey(eggPosition)
-	return string.format("%.1f|%.1f", eggPosition.X, eggPosition.Z)
-end
-
-local function horizontalDistance(firstPosition, secondPosition)
-	local offset = firstPosition - secondPosition
-	return Vector2.new(offset.X, offset.Z).Magnitude
-end
-
-local function findCarryPromptNearEgg(record, eggPosition)
-	local cacheKey = promptSlotKey(eggPosition)
-	local cachedPrompt = promptCacheBySlot[cacheKey]
-
-	if setEggPromptDisplayDistance(cachedPrompt)
-		and cachedPrompt.Parent then
-		local cachedPosition = getPromptPosition(cachedPrompt)
-
-		if cachedPosition
-			and horizontalDistance(cachedPosition, eggPosition) <= PROMPT_SEARCH_RADIUS then
-			return cachedPrompt
-		end
-	end
-
-	promptCacheBySlot[cacheKey] = nil
-
-	local bestPrompt
-	local bestDistance = math.huge
-
-	local function considerPrompt(prompt)
-		if not configureEggPrompt(prompt) or not prompt.Parent then
-			return
-		end
-
-		local promptPosition = getPromptPosition(prompt)
-		if not promptPosition then
-			return
-		end
-
-		local distance = horizontalDistance(promptPosition, eggPosition)
-		if distance <= PROMPT_SEARCH_RADIUS and distance < bestDistance then
-			bestDistance = distance
-			bestPrompt = prompt
-		end
-	end
-
-	local eggModel = resolveEggModel(record.Uid)
-	local exactPrompt = eggModel and eggModel:FindFirstChild(CARRY_PROMPT_NAME, true)
-	considerPrompt(exactPrompt)
-
-	local renderedFolder = Workspace:FindFirstChild("AreaEggSlotsClient")
-	if renderedFolder then
-		for _, descendant in ipairs(renderedFolder:GetDescendants()) do
-			considerPrompt(descendant)
-		end
-	end
-
-	for _, workspaceChild in ipairs(Workspace:GetChildren()) do
-		if workspaceChild.Name == "SmartPromptPart" then
-			for _, descendant in ipairs(workspaceChild:GetDescendants()) do
-				considerPrompt(descendant)
-			end
-		end
-	end
-
-	if bestPrompt then
-		promptCacheBySlot[cacheKey] = bestPrompt
-	end
-
-	return bestPrompt
-end
-
-local function waitForCarryPromptNearEgg(record, eggPosition, token)
-	local waitingLogged = false
-	local searchCount = 0
-	local lastDebugLog = -math.huge
-
-	debugLog(
-		"PROMPT_SEARCH",
-		"Debut recherche | UID=%s | EggPosition=%s | Rayon=%.1f",
-		record.Uid,
-		formatPosition(eggPosition),
-		PROMPT_SEARCH_RADIUS
-	)
-
-	while token == navigationToken and autoEnabled do
-		searchCount += 1
-		local prompt = findCarryPromptNearEgg(record, eggPosition)
-
-		if prompt then
-			local promptPosition = getPromptPosition(prompt)
-			debugLog(
-				"PROMPT_FOUND",
-				"Trouve apres %d scan(s) | Path=%s | Position=%s | Enabled=%s | MaxDistance=%.1f | HoldDuration=%.2f",
-				searchCount,
-				prompt:GetFullName(),
-				promptPosition and formatPosition(promptPosition) or "nil",
-				tostring(prompt.Enabled),
-				prompt.MaxActivationDistance,
-				prompt.HoldDuration
-			)
-			return prompt
-		end
-
-		if not waitingLogged then
-			waitingLogged = true
-			print(string.format(
-				"[Auto_SAE] Prompt de %s pas encore rendu : attente de son SmartPromptPart.",
-				record.Uid
-			))
-		end
-
-		if os.clock() - lastDebugLog >= 1 then
-			lastDebugLog = os.clock()
-			debugLog(
-				"PROMPT_SEARCH",
-				"Scan #%d sans resultat | UID=%s | TokenValide=%s | Auto=%s",
-				searchCount,
-				record.Uid,
-				tostring(token == navigationToken),
-				tostring(autoEnabled)
-			)
-		end
-
-		local readOk, currentRecord = pcall(EggState.ReadFieldEgg, record.Uid)
-		if readOk and (currentRecord == nil or currentRecord.State ~= SLOT_STATE) then
-			debugWarn(
-				"PROMPT_SEARCH",
-				"Recherche abandonnee : l'oeuf n'est plus dans l'etat Slot | UID=%s",
-				record.Uid
-			)
-			return nil
-		end
-
-		task.wait(0.1)
-	end
-
-	debugWarn(
-		"PROMPT_SEARCH",
-		"Recherche interrompue | UID=%s | TokenValide=%s | Auto=%s",
-		record.Uid,
-		tostring(token == navigationToken),
-		tostring(autoEnabled)
-	)
-	return nil
-end
-
-fireprompt = function(prompt)
-	if not configureEggPrompt(prompt) or not prompt.Enabled or not prompt.Parent then
-		debugWarn(
-			"FIRE_REJECTED",
-			"Prompt inutilisable | Configure=%s | Enabled=%s | Parent=%s",
-			tostring(configureEggPrompt(prompt)),
-			tostring(prompt and prompt.Enabled),
-			tostring(prompt and prompt.Parent ~= nil)
-		)
-		return false
-	end
-
-	debugLog(
-		"FIRE_START",
-		"Debut | Prompt=%s | Enabled=%s | MaxDistance=%.1f | HoldDuration=%.2f",
-		prompt:GetFullName(),
-		tostring(prompt.Enabled),
-		prompt.MaxActivationDistance,
-		prompt.HoldDuration
-	)
-
-	for attempt = 1, 3 do
-		if not autoEnabled or not prompt.Parent or not prompt.Enabled then
-			debugWarn(
-				"FIRE_ABORT",
-				"Tentative %d annulee | Auto=%s | Parent=%s | Enabled=%s",
-				attempt,
-				tostring(autoEnabled),
-				tostring(prompt.Parent ~= nil),
-				tostring(prompt.Enabled)
-			)
-			return false
-		end
-
-		local triggered = false
-		local connection = prompt.Triggered:Connect(function(triggeringPlayer)
-			debugLog(
-				"FIRE_TRIGGERED",
-				"Tentative %d | Joueur=%s",
-				attempt,
-				triggeringPlayer and triggeringPlayer.Name or "nil"
-			)
-
-			if triggeringPlayer == nil or triggeringPlayer == player then
-				triggered = true
-			end
-		end)
-
-		activePrompt = prompt
-		debugLog("FIRE_ATTEMPT", "Tentative %d/3 : InputHoldBegin.", attempt)
-
-		local beginOk, beginError = pcall(function()
-			prompt:InputHoldBegin()
-		end)
-
-		if not beginOk then
-			connection:Disconnect()
-			activePrompt = nil
-			debugWarn("FIRE_ERROR", "InputHoldBegin impossible | Tentative=%d | Erreur=%s", attempt, tostring(beginError))
-			return false
-		end
-
-		local deadline = os.clock() + math.max(prompt.HoldDuration, 0) + 0.35
-		debugLog(
-			"FIRE_WAIT",
-			"Tentative %d | DeadlineDans=%.3f | HoldDuration=%.2f",
-			attempt,
-			deadline - os.clock(),
-			prompt.HoldDuration
-		)
-
-		while activePrompt == prompt
-			and autoEnabled
-			and prompt.Parent
-			and prompt.Enabled
-			and not triggered
-			and os.clock() < deadline do
-			RunService.Heartbeat:Wait()
-		end
-
-		if activePrompt == prompt then
-			local endOk, endError = pcall(function()
-				prompt:InputHoldEnd()
-			end)
-			activePrompt = nil
-			debugLog(
-				"FIRE_HOLD_END",
-				"Tentative %d | InputHoldEndOk=%s | Erreur=%s",
-				attempt,
-				tostring(endOk),
-				tostring(endError)
-			)
-		end
-
-		RunService.Heartbeat:Wait()
-		connection:Disconnect()
-
-		if triggered then
-			debugLog("FIRE_SUCCESS", "Triggered confirme a la tentative %d.", attempt)
-			return true
-		end
-
-		debugWarn(
-			"FIRE_RETRY",
-			"Echec tentative %d | Enabled=%s | Parent=%s | Auto=%s",
-			attempt,
-			tostring(prompt.Enabled),
-			tostring(prompt.Parent ~= nil),
-			tostring(autoEnabled)
-		)
-		task.wait(0.1)
-	end
-
-	debugWarn("FIRE_FAILED", "Aucun Triggered apres 3 tentatives.")
-	return false
-end
-local function activateEggPrompt(record, prompt, token)
-	for _ = 1, PROMPT_ACTIVATION_ATTEMPTS do
-		if token ~= navigationToken or not autoEnabled then
-			return false
-		end
-
-		local _, _, rootPart = getCharacterParts()
-		if not rootPart then
-			return false
-		end
-
-		if prompt and prompt.Parent and promptIsUsable(prompt, rootPart.Position) then
-			prompt.MaxActivationDistance = TARGET_PROMPT_DISTANCE
-			prompt.HoldDuration = 0
-
-			print(string.format(
-				"[Auto_SAE] Activation du prompt de l'œuf | UID: %s | HoldDuration: %.1f | MaxDistance: %.1f",
-				record.Uid,
-				prompt.HoldDuration,
-				prompt.MaxActivationDistance
-			))
-
-			return fireprompt(prompt)
-				and token == navigationToken
-				and autoEnabled
-		end
-
-		task.wait(0.1)
-	end
-
-	warn(string.format("[Auto_SAE] Prompt %s inutilisable pour %s.", CARRY_PROMPT_NAME, record.Uid))
-	return false
-end
-
-local statusLabel
-
-local function setStatus(text, color)
-	if statusLabel then
-		statusLabel.Text = text
-		statusLabel.TextColor3 = color
-	end
-end
-
-local function runEgg(record, rate)
-	local _, humanoid, rootPart = getCharacterParts()
-
-	if not humanoid or not rootPart then
-		warn("[Auto_SAE] Personnage indisponible pour l'œuf", record.Uid)
-		return false
-	end
-
-	local eggPosition = getEggPosition(record)
-	if not eggPosition then
-		warn("[Auto_SAE] Position introuvable pour l'œuf", record.Uid)
-		return false
-	end
-
-	navigationToken += 1
-	local token = navigationToken
-	local savedStartPosition = rootPart.Position
-	setStatus(
-		string.format("Cible : %s (%s $/s)", getAnimalName(record), formatNumber(rate)),
-		Color3.fromRGB(255, 209, 82)
-	)
-
-	print(string.format(
-		"[Auto_SAE] Cible sélectionnée | UID: %s | Animal: %s | Revenu: %s $/s | Départ: %s",
-		record.Uid,
-		getAnimalName(record),
-		formatNumber(rate),
-		formatPosition(savedStartPosition)
-	))
-
-	local promptActivated = false
-
-	if waitForResetWall(token) then
-		local eggDestination = Vector3.new(
-			eggPosition.X,
-			savedStartPosition.Y,
-			eggPosition.Z
-		)
-
-		local prompt = waitForCarryPromptNearEgg(record, eggPosition, token)
-
-		if not prompt then
-			warn(string.format("[Auto_SAE] Prompt %s introuvable près de %s pour %s.", CARRY_PROMPT_NAME, formatPosition(eggPosition), record.Uid))
-		else
-			debugLog(
-				"TARGET_PROMPT",
-				"Prompt cible retenu | UID=%s | Path=%s | Enabled=%s | MaxDistanceAvant=%.1f | HoldDurationAvant=%.2f",
-				record.Uid,
-				prompt:GetFullName(),
-				tostring(prompt.Enabled),
-				prompt.MaxActivationDistance,
-				prompt.HoldDuration
-			)
-
-			promptActivated = moveUntilPromptTriggered(
-				eggDestination,
-				prompt,
-				token,
-				"la zone de l'œuf"
-			)
-			task.wait(0.15)
-		end
-	end
-
-	if promptActivated and token == navigationToken and autoEnabled then
-		local returned = moveDirect(savedStartPosition, token, "la position de départ mémorisée")
-
-		if returned then
-			print(string.format(
-				"[Auto_SAE] Retour terminé : %s.",
-				formatPosition(savedStartPosition)
-			))
-		end
-	end
-
-	return promptActivated
-end
-
-local function eligibleRecord(record)
-	if not autoEnabled
-		or type(record) ~= "table"
-		or type(record.Uid) ~= "string"
-		or record.State ~= SLOT_STATE then
-		return false, nil
-	end
-
-	local rate = getRatePerSecond(record) or 0
-	return rate >= minimumRatePerSecond, rate
-end
-
-local function processQueue()
-	if workerRunning then
-		return
-	end
-
-	workerRunning = true
-
-	task.spawn(function()
-		while autoEnabled and #recordQueue > 0 do
-			local queueEntry = popHighestRateQueueEntry()
-			local record = queueEntry.Record
-			queuedUids[record.Uid] = nil
-
-			local latestRecord = EggState.ReadFieldEgg(record.Uid)
-			local eligible, rate = eligibleRecord(latestRecord)
-
-			if eligible then
-				activeUid = latestRecord.Uid
-
-				if runEgg(latestRecord, rate) then
-					successfulVersions[latestRecord.Uid] = versionKey(latestRecord)
-				end
-
-				activeUid = nil
-			end
-		end
-
-		workerRunning = false
-
-		if autoEnabled then
-			setStatus(
-				string.format("Actif : minimum %s $/s", formatNumber(minimumRatePerSecond)),
-				Color3.fromRGB(96, 230, 145)
-			)
-		end
-	end)
-end
-
-local function enqueueRecord(record)
-	local eligible, rate = eligibleRecord(record)
-
-	if not eligible then
-		return
-	end
-
-	local uid = record.Uid
-	local key = versionKey(record)
-
-	if queuedUids[uid]
-		or activeUid == uid
-		or successfulVersions[uid] == key then
-		return
-	end
-
-	queuedUids[uid] = true
-	table.insert(recordQueue, {
-		Record = record,
-		Rate = rate,
-	})
-
-	print(string.format(
-		"[Auto_SAE] Cible ajoutée | UID: %s | Animal: %s | Revenu: %s $/s",
-		uid,
-		getAnimalName(record),
-		formatNumber(rate)
-	))
-
-	processQueue()
-end
-
-local function handleRecord(record)
-	logEgg(record)
-	enqueueRecord(record)
-end
-
-local function handleSnapshot(snapshot)
-	if type(snapshot) ~= "table" then
-		return
-	end
-
-	for _, record in ipairs(snapshot.Records or {}) do
-		handleRecord(record)
-	end
-end
-
-EggState.FieldRefreshed:Connect(handleSnapshot)
-EggState.FieldShifted:Connect(handleRecord)
-EggState.FieldGone:Connect(function(uid)
-	queuedUids[uid] = nil
-	successfulVersions[uid] = nil
-	loggedVersions[uid] = nil
-end)
-
-local function stopAutomation()
-	autoEnabled = false
-	navigationToken += 1
-	recordQueue = {}
-	queuedUids = {}
-	activeUid = nil
-
-	if activePrompt then
-		activePrompt:InputHoldEnd()
-		activePrompt = nil
-	end
-
-	local _, humanoid = getCharacterParts()
-	if humanoid then
-		humanoid:Move(Vector3.zero)
-	end
-end
-
-player.CharacterRemoving:Connect(function()
-	stopAutomation()
-end)
 
 local function createInterface()
 	local playerGui = player:WaitForChild("PlayerGui")
@@ -1421,6 +938,7 @@ local function createInterface()
 	input.TextColor3 = Color3.fromRGB(255, 255, 255)
 	input.TextSize = 18
 	input.Parent = frame
+	minimumInput = input
 
 	local inputCorner = Instance.new("UICorner")
 	inputCorner.CornerRadius = UDim.new(0, 8)
@@ -1438,7 +956,7 @@ local function createInterface()
 	suffix.TextXAlignment = Enum.TextXAlignment.Left
 	suffix.Parent = frame
 
-	local toggleButton = Instance.new("TextButton")
+	toggleButton = Instance.new("TextButton")
 	toggleButton.Name = "Toggle"
 	toggleButton.Position = UDim2.new(1, -104, 0, 67)
 	toggleButton.Size = UDim2.fromOffset(90, 38)
@@ -1471,54 +989,66 @@ local function createInterface()
 	statusCorner.CornerRadius = UDim.new(0, 8)
 	statusCorner.Parent = statusLabel
 
+
+	renderControls = function()
+		toggleButton.Text = autoEnabled and "STOP" or "START"
+		toggleButton.BackgroundColor3 = autoEnabled and Color3.fromRGB(214, 73, 73) or Color3.fromRGB(48, 181, 102)
+		input.TextEditable = not autoEnabled
+	end
 	toggleButton.Activated:Connect(function()
 		if autoEnabled then
-			stopAutomation()
-			toggleButton.Text = "START"
-			toggleButton.BackgroundColor3 = Color3.fromRGB(48, 181, 102)
-			input.TextEditable = true
-			setStatus("Arrêté", Color3.fromRGB(255, 114, 114))
-			print("[Auto_SAE] STOP.")
+			stopAutomation("Arrete par l'utilisateur")
 			return
 		end
-
-		local normalizedInput = string.gsub(input.Text, ",", ".")
-		local billions = tonumber(normalizedInput)
-		if not billions then
+		local normalized = string.gsub(input.Text, ",", ".")
+		local billions = tonumber(normalized)
+		if not billions or billions ~= billions or math.abs(billions) == math.huge then
 			setStatus("Valeur invalide : entre 0.1 et 999", Color3.fromRGB(255, 114, 114))
 			return
 		end
-
 		billions = math.clamp(billions, MINIMUM_BILLIONS, MAXIMUM_BILLIONS)
 		input.Text = tostring(billions)
-		minimumRatePerSecond = billions * 1e9
-
-		navigationToken += 1
-		recordQueue = {}
-		queuedUids = {}
-		successfulVersions = {}
-		activeUid = nil
-		autoEnabled = true
-
-		toggleButton.Text = "STOP"
-		toggleButton.BackgroundColor3 = Color3.fromRGB(214, 73, 73)
-		input.TextEditable = false
-		setStatus(
-			string.format("Actif : minimum %s $/s", formatNumber(minimumRatePerSecond)),
-			Color3.fromRGB(96, 230, 145)
-		)
-
-		print(string.format(
-			"[Auto_SAE] START | Minimum configuré : %s $/s.",
-			formatNumber(minimumRatePerSecond)
-		))
-
-		handleSnapshot(EggState.ReadFieldEggs())
+		startAutomation(billions)
 	end)
 
 	return gui
 end
 
-createInterface()
-handleSnapshot(EggState.ReadFieldEggs())
-print("[Auto_SAE] Prêt : récupère uniquement les œufs au-dessus du minimum configuré.")
+
+local gui = createInterface()
+setStatus("Chargement des modules du jeu...")
+connect(player.CharacterRemoving, function()
+	stopAutomation("Personnage retire : redemarre depuis la zone sure")
+end)
+local function destroy()
+	if destroyed then return end
+	stopAutomation("Script ferme")
+	destroyed = true
+	for _, connection in ipairs(lifetimeConnections) do connection:Disconnect() end
+	table.clear(lifetimeConnections)
+	for prompt, entry in pairs(prompts) do
+		for _, connection in ipairs(entry.connections) do connection:Disconnect() end
+		prompts[prompt] = nil
+	end
+	if shared.__AutoSAEController and shared.__AutoSAEController.Gui == gui then
+		shared.__AutoSAEController = nil
+	end
+	if gui.Parent then gui:Destroy() end
+end
+
+local previous = shared.__AutoSAEController
+if previous and type(previous.Destroy) == "function" then
+	pcall(previous.Destroy)
+end
+shared.__AutoSAEController = {Destroy = destroy, Gui = gui}
+connect(gui.Destroying, destroy)
+connect(script.Destroying, destroy)
+task.spawn(function()
+	local ok, failure = xpcall(initialize, debug.traceback)
+	if not ok and not destroyed then
+		ready = false
+		setStatus("Modules indisponibles : voir la console", Color3.fromRGB(255, 130, 110))
+		log("ERROR", "%s", tostring(failure))
+	end
+end)
+
