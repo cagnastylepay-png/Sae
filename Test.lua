@@ -618,52 +618,26 @@ local function runEgg(record, rate, missingFromIndex)
 	navigationToken += 1
 	local token = navigationToken
 	local savedStartPosition = rootPart.Position
-	local eggDestination = Vector3.new(
-		eggPosition.X,
-		savedStartPosition.Y,
-		eggPosition.Z
-	)
 
-	local targetReason
-	if missingFromIndex and rate >= minimumRatePerSecond then
-		targetReason = "revenu + absent de l'index"
-	elseif missingFromIndex then
-		targetReason = "absent de l'index"
-	else
-		targetReason = "revenu minimum"
-	end
+	-- Target positionnée 2 studs au-dessus pour éviter d'être coincé dans le sol
+	local targetCFrame = CFrame.new(eggPosition + Vector3.new(0, 2, 0))
 
-	setStatus(
-		string.format("Cible : %s (%s)", getAnimalName(record), targetReason),
-		Color3.fromRGB(255, 209, 82)
-	)
+	-- 1. Réinitialisation de la vitesse et téléportation directe à l'œuf
+	rootPart.AssemblyLinearVelocity = Vector3.zero
+	rootPart.AssemblyAngularVelocity = Vector3.zero
+	rootPart.CFrame = targetCFrame
 
-	print(string.format(
-		"[Auto_SAE] Cible sélectionnée | UID: %s | Animal: %s | Revenu: %s $/s | Motif: %s | Départ: %s",
-		record.Uid,
-		getAnimalName(record),
-		formatNumber(rate),
-		targetReason,
-		formatPosition(savedStartPosition)
-	))
+	task.wait(0.05) -- Courte pause pour stabiliser le serveur
 
-	local promptActivated = false
+	-- 2. Activation du prompt
+	local promptActivated = activateEggPrompt(record, eggPosition, token)
+	task.wait(0.05)
 
-	if waitForResetWall(token)
-		and moveDirect(eggDestination, token, "l'œuf") then
-		promptActivated = activateEggPrompt(record, eggPosition, token)
-		task.wait(0.15)
-	end
-
+	-- 3. Retour immédiat à la position de départ
 	if token == navigationToken and autoEnabled then
-		local returned = moveDirect(savedStartPosition, token, "la position de départ mémorisée")
-
-		if returned then
-			print(string.format(
-				"[Auto_SAE] Retour terminé : %s.",
-				formatPosition(savedStartPosition)
-			))
-		end
+		rootPart.AssemblyLinearVelocity = Vector3.zero
+		rootPart.AssemblyAngularVelocity = Vector3.zero
+		rootPart.CFrame = CFrame.new(savedStartPosition)
 	end
 
 	return promptActivated
