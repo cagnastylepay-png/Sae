@@ -1,4 +1,4 @@
--- Auto_SAE v2.4. Verified client contracts; no character/anticheat replacement.
+-- Auto_SAE v2.5. SellPrompt selection UI. Verified client contracts; no character/anticheat replacement.
 -- The live game must provide ReplicatedStorage.Client/Data/Shared.
 -- Refresh outbound MoveTo before its native timeout; verify distance before carry.
 local RunService = game:GetService("RunService")
@@ -45,6 +45,8 @@ local inFlightRequest = shared.__AutoSAERemoteLock
 local statusLabel, toggleButton, minimumInput
 local sequence = 0
 local renderControls
+local refreshEggInterface
+local selectedEggs = {}
 local stopAutomation
 local rigPause = {Character = nil, Until = 0, Reason = nil}
 
@@ -373,7 +375,7 @@ local function logEgg(record)
 		rate and formatNumber(rate) or "Inconnu",
 		mutationLabel(record),
 		position and formatPosition(position) or "Inconnue"
-	))
+		))
 end
 
 
@@ -986,12 +988,12 @@ local function selectBest()
 	local best, bestRate = nil, -math.huge
 	local _, _, root = getCharacterParts()
 	for uid, cached in pairs(records) do
-		if cached.State == SLOT_STATE and (cooldowns[uid] or 0) <= os.clock() then
+		if selectedEggs[uid] and (cached.State == SLOT_STATE or cached.State == "Dropped") and (cooldowns[uid] or 0) <= os.clock() then
 			local latest, ok = readField(uid)
-			if ok and latest and latest.State == SLOT_STATE and not ownsEgg(uid) then
+			if ok and latest and (latest.State == SLOT_STATE or latest.State == "Dropped") and latest.CarrierUserId == nil and not ownsEgg(uid) then
 				records[uid] = latest
 				local rate = getRatePerSecond(latest)
-				if rate and rate >= minimumRatePerSecond then
+				if rate then
 					if rate > bestRate or (rate == bestRate and root and best
 						and distanceXZ(latest.BottomCFrame.Position, root.Position)
 						< distanceXZ(best.BottomCFrame.Position, root.Position)) then
@@ -1027,6 +1029,10 @@ local function worker(token)
 		end
 		local selected, rate, recovering
 		if carry.IsCarrying and carry.Uid then
+			if not selectedEggs[carry.Uid] then
+				stopAutomation("Un oeuf non selectionne est deja porte")
+				return
+			end
 			selected = readField(carry.Uid)
 			selected = selected or {Uid = carry.Uid, AssetCategory = carry.AssetCategory}
 			recovering = true
@@ -1036,6 +1042,10 @@ local function worker(token)
 		if selected then
 			local success, reason = runCycle(selected, rate, recovering)
 			if not autoEnabled or generation ~= token then return end
+			if success then
+				selectedEggs[selected.Uid] = nil
+				if renderControls then renderControls() end
+			end
 			if not success then
 				log("CYCLE_FAILED", "UID=%s Raison=%s", selected.Uid, tostring(reason))
 				cooldowns[selected.Uid] = os.clock() + CONFIG.FailedTargetCooldown
@@ -1054,8 +1064,8 @@ local function worker(token)
 				end
 			end
 		else
-			setStatus("En attente : minimum " .. formatNumber(minimumRatePerSecond) .. " $/s",
-				Color3.fromRGB(96, 230, 145))
+			stopAutomation("Selection terminee ou oeufs indisponibles")
+			return
 		end
 		task.wait(CONFIG.ScanInterval)
 	end
@@ -1077,7 +1087,7 @@ local function startAutomation(billions)
 	end
 	if isSafe(root.Position) == true then safeHome = root.Position end
 	if not safeHome or isSafe(safeHome) ~= true then
-		setStatus("Place-toi dans la zone sure puis START", Color3.fromRGB(255, 190, 100))
+		setStatus("Place-toi dans la zone sure puis GO", Color3.fromRGB(255, 190, 100))
 		return false
 	end
 	minimumRatePerSecond = math.clamp(billions, MINIMUM_BILLIONS, MAXIMUM_BILLIONS) * 1e9
@@ -1177,158 +1187,259 @@ local function initialize()
 	end)
 	snapshot(EggState.ReadFieldEggs())
 	ready = true
-	setStatus("Pret : demarre depuis la zone sure", Color3.fromRGB(96, 230, 145))
+	setStatus("Pret : ouvre Auto Eggs et coche tes oeufs.", Color3.fromRGB(96, 230, 145))
+	if refreshEggInterface then refreshEggInterface() end
 	log("READY", "Build=2.4 | MoveTo renouvele / freinage horizontal / distance 3D <= 8 / %d essais en serie / retour / inventaire / reprise meme UID", CONFIG.MaxCarryAttempts)
 end
 
 local function createInterface()
 	local playerGui = player:WaitForChild("PlayerGui")
-	local oldGui = playerGui:FindFirstChild("AutoSAEGui")
-
-	if oldGui then
-		oldGui:Destroy()
-	end
-
-	local gui = Instance.new("ScreenGui")
+	local previous = shared.__AutoSAEController
+	if previous and type(previous.Destroy) == "function" then pcall(previous.Destroy) end
+	local old = playerGui:FindFirstChild("AutoSAEGui")
+	if old then old:Destroy() end
+	local source = game:GetService("StarterGui"):FindFirstChild("SellPrompt") or playerGui:FindFirstChild("SellPrompt")
+	assert(source and source:IsA("ScreenGui"), "SellPrompt est introuvable")
+	local gui = source:Clone()
 	gui.Name = "AutoSAEGui"
 	gui.ResetOnSpawn = false
-	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.Enabled = true
+	gui.DisplayOrder = math.max(source.DisplayOrder + 10, 100)
+	for _, descendant in ipairs(gui:GetDescendants()) do
+		if descendant:IsA("BaseScript") then descendant:Destroy() end
+	end
+	local frame = gui:WaitForChild("Frame")
+	frame.Visible = false
+	local tabs = frame:FindFirstChild("TabButtonHolder")
+	if tabs then tabs:Destroy() end
+	local sort = frame:WaitForChild("SortByHolder")
+	for _, name in ipairs({"Weight", "Value", "PaddingTop", "PaddingSelect"}) do
+		local object = sort:FindFirstChild(name)
+		if object then object:Destroy() end
+	end
+	sort.Title.Text = "Selection"
+	local header = frame:WaitForChild("Header")
+	for _, name in ipairs({"Title", "Title2Stroke"}) do
+		local title = header:FindFirstChild(name)
+		if title then title.Text = "Auto Eggs" end
+	end
+	local info = frame:WaitForChild("SellInfoHolder")
+	info.Title.Text = "Selection :"
+	info.Value.Text = "0 oeuf"
+	info.Icon.Visible = false
+	toggleButton = info:WaitForChild("Sell")
+	toggleButton.Name = "Go"
+	toggleButton.Title.Text = "GO"
+	local scroll = frame:WaitForChild("ScrollingFrame")
+	local template = gui.Assets:WaitForChild("TemplateHolder"):Clone()
+	template.Visible = true
+	for _, object in ipairs(scroll:GetChildren()) do
+		if object:IsA("GuiObject") then object:Destroy() end
+	end
+	local grid = scroll:FindFirstChildOfClass("UIGridLayout") or Instance.new("UIGridLayout", scroll)
+	grid.SortOrder = Enum.SortOrder.LayoutOrder
+	grid.CellPadding = UDim2.fromOffset(10, 16)
+	scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	scroll.CanvasSize = UDim2.new()
+	local function resizeGrid()
+		local width = math.max(scroll.AbsoluteSize.X - scroll.ScrollBarThickness - 12, 120)
+		local columns = math.max(1, math.floor((width + 10) / 130))
+		local side = math.floor((width - (columns - 1) * 10) / columns)
+		grid.CellSize = UDim2.fromOffset(side, side + 25)
+	end
+	connect(scroll:GetPropertyChangedSignal("AbsoluteSize"), resizeGrid)
+	resizeGrid()
+	statusLabel = Instance.new("TextLabel")
+	statusLabel.Name = "AutoStealStatus"
+	statusLabel.BackgroundTransparency = 1
+	statusLabel.TextColor3 = Color3.fromRGB(225, 230, 245)
+	statusLabel.Font = Enum.Font.GothamMedium
+	statusLabel.TextSize = 12
+	statusLabel.TextWrapped = true
+	statusLabel.AnchorPoint = Vector2.new(0, 1)
+	statusLabel.Position = UDim2.fromScale(0.02, 0.99)
+	statusLabel.Size = UDim2.fromScale(0.70, 0.28)
+	statusLabel.ZIndex = toggleButton.ZIndex + 5
+	statusLabel.Parent = info
+	info.Title.Position = UDim2.fromScale(0.03, 0.08)
+	info.Title.AnchorPoint = Vector2.zero
+	info.Title.Size = UDim2.fromScale(0.23, 0.35)
+	info.Value.Position = UDim2.fromScale(0.28, 0.08)
+	info.Value.AnchorPoint = Vector2.zero
+	info.Value.Size = UDim2.fromScale(0.42, 0.35)
+	for _, object in ipairs(info:GetChildren()) do
+		if object.Name == "ShadowDecor" then object.Visible = false end
+	end
+	local backdrop = gui:FindFirstChild("Backdrop")
+	local hudToggle = gui:FindFirstChild("HudToggle")
+	if hudToggle then hudToggle:Destroy() end
+	local function show(open)
+		frame.Visible = open
+		if backdrop then backdrop.Visible = open end
+		if open and refreshEggInterface then refreshEggInterface() end
+	end
+	connect(frame.Close.Activated, function() show(false) end)
+	if backdrop and backdrop:IsA("GuiButton") then
+		connect(backdrop.Activated, function() show(false) end)
+	end
 	gui.Parent = playerGui
 
-	local frame = Instance.new("Frame")
-	frame.Name = "Panel"
-	frame.AnchorPoint = Vector2.new(1, 0)
-	frame.Position = UDim2.new(1, -24, 0, 120)
-	frame.Size = UDim2.fromOffset(280, 178)
-	frame.BackgroundColor3 = Color3.fromRGB(20, 24, 34)
-	frame.BorderSizePixel = 0
-	frame.Active = true
-	frame.Draggable = true
-	frame.Parent = gui
-
-	local frameCorner = Instance.new("UICorner")
-	frameCorner.CornerRadius = UDim.new(0, 12)
-	frameCorner.Parent = frame
-
-	local frameStroke = Instance.new("UIStroke")
-	frameStroke.Color = Color3.fromRGB(71, 119, 255)
-	frameStroke.Thickness = 2
-	frameStroke.Transparency = 0.2
-	frameStroke.Parent = frame
-
-	local title = Instance.new("TextLabel")
-	title.Name = "Title"
-	title.Position = UDim2.fromOffset(14, 10)
-	title.Size = UDim2.new(1, -28, 0, 28)
-	title.BackgroundTransparency = 1
-	title.Font = Enum.Font.GothamBold
-	title.Text = "AUTO EGG"
-	title.TextColor3 = Color3.fromRGB(245, 248, 255)
-	title.TextSize = 20
-	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Parent = frame
-
-	local inputLabel = Instance.new("TextLabel")
-	inputLabel.Name = "InputLabel"
-	inputLabel.Position = UDim2.fromOffset(14, 43)
-	inputLabel.Size = UDim2.new(1, -28, 0, 20)
-	inputLabel.BackgroundTransparency = 1
-	inputLabel.Font = Enum.Font.Gotham
-	inputLabel.Text = "Minimum $/s en milliards (0.1 à 999)"
-	inputLabel.TextColor3 = Color3.fromRGB(174, 183, 204)
-	inputLabel.TextSize = 13
-	inputLabel.TextXAlignment = Enum.TextXAlignment.Left
-	inputLabel.Parent = frame
-
-	local input = Instance.new("TextBox")
-	input.Name = "MinimumBillions"
-	input.Position = UDim2.fromOffset(14, 67)
-	input.Size = UDim2.fromOffset(112, 38)
-	input.BackgroundColor3 = Color3.fromRGB(35, 41, 57)
-	input.BorderSizePixel = 0
-	input.ClearTextOnFocus = false
-	input.Font = Enum.Font.GothamBold
-	input.PlaceholderText = "0.1 - 999"
-	input.Text = tostring(DEFAULT_BILLIONS)
-	input.TextColor3 = Color3.fromRGB(255, 255, 255)
-	input.TextSize = 18
-	input.Parent = frame
-	minimumInput = input
-
-	local inputCorner = Instance.new("UICorner")
-	inputCorner.CornerRadius = UDim.new(0, 8)
-	inputCorner.Parent = input
-
-	local suffix = Instance.new("TextLabel")
-	suffix.Name = "Suffix"
-	suffix.Position = UDim2.fromOffset(132, 67)
-	suffix.Size = UDim2.fromOffset(44, 38)
-	suffix.BackgroundTransparency = 1
-	suffix.Font = Enum.Font.GothamBold
-	suffix.Text = "B/s"
-	suffix.TextColor3 = Color3.fromRGB(174, 183, 204)
-	suffix.TextSize = 17
-	suffix.TextXAlignment = Enum.TextXAlignment.Left
-	suffix.Parent = frame
-
-	toggleButton = Instance.new("TextButton")
-	toggleButton.Name = "Toggle"
-	toggleButton.Position = UDim2.new(1, -104, 0, 67)
-	toggleButton.Size = UDim2.fromOffset(90, 38)
-	toggleButton.BackgroundColor3 = Color3.fromRGB(48, 181, 102)
-	toggleButton.BorderSizePixel = 0
-	toggleButton.Font = Enum.Font.GothamBold
-	toggleButton.Text = "START"
-	toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-	toggleButton.TextSize = 15
-	toggleButton.Parent = frame
-
-	local buttonCorner = Instance.new("UICorner")
-	buttonCorner.CornerRadius = UDim.new(0, 8)
-	buttonCorner.Parent = toggleButton
-
-	statusLabel = Instance.new("TextLabel")
-	statusLabel.Name = "Status"
-	statusLabel.Position = UDim2.fromOffset(14, 118)
-	statusLabel.Size = UDim2.new(1, -28, 0, 43)
-	statusLabel.BackgroundColor3 = Color3.fromRGB(28, 33, 46)
-	statusLabel.BorderSizePixel = 0
-	statusLabel.Font = Enum.Font.GothamMedium
-	statusLabel.Text = "Arrêté"
-	statusLabel.TextColor3 = Color3.fromRGB(255, 114, 114)
-	statusLabel.TextSize = 13
-	statusLabel.TextWrapped = true
-	statusLabel.Parent = frame
-
-	local statusCorner = Instance.new("UICorner")
-	statusCorner.CornerRadius = UDim.new(0, 8)
-	statusCorner.Parent = statusLabel
-
-
-	renderControls = function()
-		toggleButton.Text = autoEnabled and "STOP" or "START"
-		toggleButton.BackgroundColor3 = autoEnabled and Color3.fromRGB(214, 73, 73) or Color3.fromRGB(48, 181, 102)
-		input.TextEditable = not autoEnabled
+	local cards = {}
+	local function countSelected()
+		local n = 0
+		for _ in pairs(selectedEggs) do n += 1 end
+		return n
 	end
-	toggleButton.Activated:Connect(function()
-		if autoEnabled then
-			stopAutomation("Arrete par l'utilisateur")
-			return
+	local function updateSelection()
+		local count = countSelected()
+		info.Value.Text = tostring(count) .. (count == 1 and " oeuf" or " oeufs")
+		toggleButton.Title.Text = autoEnabled and "STOP" or "GO"
+		for uid, card in pairs(cards) do
+			local checked = selectedEggs[uid] == true
+			card.holder.SelectedOverlay.Visible = checked
+			card.holder.SelectedIcon.Visible = checked
+			card.button.Active = not autoEnabled
 		end
-		local normalized = string.gsub(input.Text, ",", ".")
-		local billions = tonumber(normalized)
-		if not billions or billions ~= billions or math.abs(billions) == math.huge then
-			setStatus("Valeur invalide : entre 0.1 et 999", Color3.fromRGB(255, 114, 114))
-			return
+	end
+	refreshEggInterface = function()
+		if destroyed or not ready then updateSelection(); return end
+		local available = {}
+		for uid, record in pairs(records) do
+			if (record.State == SLOT_STATE or record.State == "Dropped")
+				and record.CarrierUserId == nil and not ownsEgg(uid) then
+				table.insert(available, record)
+			end
 		end
-		billions = math.clamp(billions, MINIMUM_BILLIONS, MAXIMUM_BILLIONS)
-		input.Text = tostring(billions)
-		startAutomation(billions)
+		table.sort(available, function(a, b)
+			local ar, br = getRatePerSecond(a) or 0, getRatePerSecond(b) or 0
+			if ar ~= br then return ar > br end
+			return tostring(a.Uid) < tostring(b.Uid)
+		end)
+		local seen = {}
+		for index, record in ipairs(available) do
+			local uid = record.Uid
+			seen[uid] = true
+			local card = cards[uid]
+			if not card then
+				local holder = template:Clone()
+				holder.Name = uid
+				holder.Visible = true
+				holder:SetAttribute("EggUid", uid)
+				local visual = holder:WaitForChild("Template")
+				local click = Instance.new("TextButton")
+				click.Name = "SelectEgg"
+				click.BackgroundTransparency = 1
+				click.Text = ""
+				click.Size = UDim2.fromScale(1, 1)
+				click.ZIndex = 200
+				click.Parent = holder
+				card = {holder = holder, visual = visual, button = click}
+				cards[uid] = card
+				card.connection = click.Activated:Connect(function()
+					if autoEnabled then return end
+					selectedEggs[uid] = not selectedEggs[uid] or nil
+					updateSelection()
+				end)
+				holder.Parent = scroll
+			end
+			card.holder.LayoutOrder = index
+			local config = getAssetConfig(record)
+			local icon = config and config.Egg and config.Egg.Icon
+			card.visual.Icon.Image = icon or "rbxassetid://103094823152347"
+			local rate = getRatePerSecond(record)
+			card.visual.Amount.Text = rate and (formatNumber(rate) .. "/s") or "?"
+			local weight = getWeightKg(record)
+			card.visual.Weight.Text = weight and string.format("%.1f kg", weight) or ""
+			local valueHolder = card.visual:FindFirstChild("ValueHolder")
+			if valueHolder then
+				valueHolder.Value.Text = getAnimalName(record)
+				valueHolder.Value.Size = UDim2.fromScale(0.95, 0.9)
+				valueHolder.Value.Position = UDim2.fromScale(0.5, 0.5)
+				valueHolder.Value.AnchorPoint = Vector2.new(0.5, 0.5)
+				valueHolder.Value.TextScaled = true
+				if valueHolder:FindFirstChild("Icon") then valueHolder.Icon.Visible = false end
+			end
+		end
+		for uid, card in pairs(cards) do
+			if not seen[uid] then
+				card.connection:Disconnect()
+				card.holder:Destroy()
+				cards[uid] = nil
+				if not currentCycle or currentCycle.uid ~= uid then selectedEggs[uid] = nil end
+			end
+		end
+		for uid in pairs(selectedEggs) do
+			if not seen[uid] and (not currentCycle or currentCycle.uid ~= uid) then selectedEggs[uid] = nil end
+		end
+		updateSelection()
+	end
+	renderControls = updateSelection
+	connect(sort.Clear.Activated, function()
+		if autoEnabled then return end
+		table.clear(selectedEggs)
+		updateSelection()
 	end)
-
+	connect(sort.SelectAll.Activated, function()
+		if autoEnabled then return end
+		for uid in pairs(cards) do selectedEggs[uid] = true end
+		updateSelection()
+	end)
+	connect(toggleButton.Activated, function()
+		if autoEnabled then stopAutomation("Collecte arretee"); return end
+		refreshEggInterface()
+		if countSelected() == 0 then setStatus("Coche au moins un oeuf."); return end
+		startAutomation(0)
+	end)
+	connect(gui.Destroying, function()
+		for _, card in pairs(cards) do card.connection:Disconnect() end
+		template:Destroy()
+	end)
+	task.spawn(function()
+		local hud = playerGui:WaitForChild("HUD", 30)
+		local gameHud = hud and hud:WaitForChild("GameHUD", 30)
+		local buttons = gameHud and gameHud:WaitForChild("RightButtons", 30)
+		if not buttons or destroyed then return end
+		local existing = buttons:FindFirstChild("AutoStealButton")
+		if existing then existing:Destroy() end
+		local button = buttons:WaitForChild("EggsButton", 10)
+		if not button or destroyed then return end
+		button = button:Clone()
+		button.Name = "AutoStealButton"
+		button.LayoutOrder = 15
+		button.Visible = true
+		for _, name in ipairs({"Notification", "ReadyNotification", "NightImage", "NightText", "GamepadGlyph"}) do
+			local object = button:FindFirstChild(name)
+			if object then object:Destroy() end
+		end
+		local icon = button:FindFirstChild("ImageLabel")
+		if icon then icon.Image = "rbxassetid://103094823152347" end
+		local caption = Instance.new("TextLabel")
+		caption.Name = "AutoEggsTitle"
+		caption.BackgroundTransparency = 1
+		caption.Position = UDim2.fromScale(0, 0.72)
+		caption.Size = UDim2.fromScale(1, 0.28)
+		caption.Text = "AUTO EGGS"
+		caption.TextColor3 = Color3.new(1,1,1)
+		caption.TextScaled = true
+		caption.Font = Enum.Font.GothamBold
+		caption.ZIndex = 200
+		caption.Parent = button
+		local stroke = Instance.new("UIStroke", caption)
+		stroke.Thickness = 2
+		button.Parent = buttons
+		connect(button.Activated, function() show(not frame.Visible) end)
+		connect(gui.Destroying, function() button:Destroy() end)
+	end)
+	local elapsed = 0
+	connect(RunService.Heartbeat, function(dt)
+		elapsed += dt
+		if elapsed >= 0.75 then
+			elapsed = 0
+			if frame.Visible and ready and not destroyed then refreshEggInterface() end
+		end
+	end)
 	return gui
 end
-
 
 local gui = createInterface()
 setStatus("Chargement des modules du jeu...")
