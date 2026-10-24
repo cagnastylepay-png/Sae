@@ -60,6 +60,11 @@ local syncQueue, wakeQueue, refreshQueueInterface, startAutomation
 local stopAutomation
 local rigPause = {Character = nil, Until = 0, Reason = nil}
 local PlotState, TreadmillRemotes, AssetRoster
+local PlacedEggRenderer, EggGrowthPolicy
+local hatchInProgress = false
+local wallMaintenancePending = false
+local HaulRemotes
+local lastEquipBestAt = -math.huge
 local lastDepartureArrival
 local treadmillAssigned, treadmillPending = false, false
 local autoActivity = "IDLE"
@@ -1054,8 +1059,14 @@ end
 local function enqueueEgg(record, source)
 	if type(record) ~= "table" or type(record.Uid) ~= "string" then return false end
 	if plotAnimalCategories()[record.AssetCategory] then return false end
-	if source == "AUTO" and removedFromAuto[record.Uid] then return false end
+	if (source == "AUTO" or source == "INDEX") and removedFromAuto[record.Uid] then return false end
 	if source == "MANUEL" then removedFromAuto[record.Uid] = nil end
+	if source == "INDEX" then
+		if currentCycle and currentCycle.record and currentCycle.record.AssetCategory == record.AssetCategory then return false end
+		for _, entry in pairs(queuedEggs) do
+			if entry.Record.AssetCategory == record.AssetCategory then return false end
+		end
+	end
 	if queuedEggs[record.Uid] then return false end
 	if record.State ~= SLOT_STATE and record.State ~= "Dropped" then return false end
 	if record.CarrierUserId ~= nil or ownsEgg(record.Uid) then return false end
@@ -1083,16 +1094,35 @@ syncQueue = function()
 		local ok, profile = pcall(Save.Peek)
 		local index = ok and type(profile) == "table" and profile.Index
 		local backpackCategories = backpackEggCategories(ok and profile or nil)
+		local candidates = {}
 		for uid, record in pairs(records) do
-			local rate = getRatePerSecond(record)
-			local missing = autoIncludeMissingIndex and type(index) == "table"
-				and type(record.AssetCategory) == "string" and Assets.Directory[record.AssetCategory] ~= nil
-				and index[record.AssetCategory] ~= true
-				and not backpackCategories[record.AssetCategory]
-			if ((rate and rate >= minimumRatePerSecond) or missing) and (cooldowns[uid] or 0) <= os.clock() then
-				enqueueEgg(record, "AUTO")
+			if (cooldowns[uid] or 0) <= os.clock() then
+				local rate = getRatePerSecond(record) or 0
+				local missing = autoIncludeMissingIndex and type(index) == "table"
+					and type(record.AssetCategory) == "string" and Assets.Directory[record.AssetCategory] ~= nil
+					and index[record.AssetCategory] ~= true
+					and not backpackCategories[record.AssetCategory]
+				if rate >= minimumRatePerSecond then
+					local existing = queuedEggs[uid]
+					if existing and existing.Source == "INDEX" then existing.Source = "AUTO" end
+					enqueueEgg(record, "AUTO")
+				elseif missing then
+					table.insert(candidates, record)
+				end
 			end
 		end
+		-- Rebuild pending Index entries to keep the most profitable available egg.
+		for uid, entry in pairs(queuedEggs) do
+			if entry.Source == "INDEX" and (not currentCycle or currentCycle.uid ~= uid) then
+				queuedEggs[uid] = nil
+			end
+		end
+		table.sort(candidates, function(a,b)
+			local ar,br = getRatePerSecond(a) or 0,getRatePerSecond(b) or 0
+			if ar ~= br then return ar > br end
+			return a.Uid < b.Uid
+		end)
+		for _, record in ipairs(candidates) do enqueueEgg(record, "INDEX") end
 	end
 	if refreshQueueInterface then refreshQueueInterface() end
 end
@@ -1225,6 +1255,50 @@ local function leaveTreadmill(token)
 	return ok, reason, ok
 end
 
+local function hatchReadyEggsOnWallClose(token)
+	if hatchInProgress or not PlacedEggRenderer or not EggGrowthPolicy then return end
+	local ok, eggs = pcall(EggState.ReadOwnerEggs, player.UserId)
+	if not ok or type(eggs) ~= "table" then log("HATCH_SCAN", "Lecture des oeufs indisponible"); return end
+	local readyUids = {}
+	for uid, record in pairs(eggs) do
+		if type(uid) == "string" and type(record) == "table" and record.Placement ~= nil then
+			local valid, grown = pcall(EggGrowthPolicy.IsReady, record, 0)
+			if valid and grown then table.insert(readyUids, uid) end
+		end
+	end
+	table.sort(readyUids)
+	for _, uid in ipairs(readyUids) do
+		if destroyed or not autoEnabled or generation ~= token or not automaticMode or queuePaused then break end
+		local readOK, latest = pcall(EggState.ReadOwnedEgg, player.UserId, uid)
+		local readyOK, grown = false, false
+		if readOK and type(latest) == "table" and latest.Placement ~= nil then
+			readyOK, grown = pcall(EggGrowthPolicy.IsReady, latest, 0)
+		end
+		if readyOK and grown then
+			hatchInProgress = true
+			setStatus("Mur ferme : ouverture des oeufs prets...")
+			local activated, accepted, reason = pcall(PlacedEggRenderer.ActivateLocalEgg, uid)
+			hatchInProgress = false
+			log("WALL_HATCH", "UID=%s Accepte=%s Raison=%s", uid, tostring(activated and accepted == true), tostring(activated and reason or accepted))
+		end
+	end
+end
+
+local function serviceWallMaintenance(token)
+	if not wallMaintenancePending or destroyed or not autoEnabled or generation ~= token or currentCycle then return end
+	local _, _, root = getCharacterParts()
+	if not root or isSafe(root.Position) ~= true then return end
+	wallMaintenancePending = false
+	hatchReadyEggsOnWallClose(token)
+	if destroyed or not autoEnabled or generation ~= token or queuePaused then return end
+	if HaulRemotes and os.clock() - lastEquipBestAt >= 5 then
+		lastEquipBestAt = os.clock()
+		setStatus("Mur ferme : Equip Best...")
+		local ok, accepted, reason = pcall(function() return HaulRemotes.WearBest:InvokeServer() end)
+		log("WALL_EQUIP_BEST", "Accepte=%s Raison=%s", tostring(ok and accepted == true), tostring(ok and reason or accepted))
+	end
+end
+
 local function idleOnTreadmill(token)
 	if not PlotState or not TreadmillRemotes then return false, "modules tapis indisponibles" end
 	local slot = PlotState.ResolveLocalSlot()
@@ -1254,9 +1328,11 @@ local function idleOnTreadmill(token)
 		end
 	end
 	autoActivity = "TREADMILL"
+	if destroyed or not autoEnabled or generation ~= token then return true end
 	setStatus("TREADMILL : entrainement, attente d'un oeuf...")
 	while autoEnabled and generation == token and automaticMode and not queuePaused
 		and next(queuedEggs) == nil and not destroyed do
+		serviceWallMaintenance(token)
 		syncQueue()
 		task.wait(CONFIG.ScanInterval)
 	end
@@ -1282,6 +1358,7 @@ end
 
 local function worker(token)
 	while autoEnabled and generation == token and not destroyed do
+		serviceWallMaintenance(token)
 		if inFlightRequest and not inFlightRequest.done then
 			stopAutomation("Requete serveur en cours : attendre sa reponse")
 			return
@@ -1438,7 +1515,18 @@ local function initialize()
 	Save = loadModule("Shared.Save")
 	PlotState = loadModule("Client.PlotState")
 	AssetRoster = loadModule("Client.AssetRoster")
-	TreadmillRemotes = loadModule("Shared.Remotes").Treadmill
+	PlacedEggRenderer = loadModule("Shared.Eggs.PlacedEggRenderer")
+	EggGrowthPolicy = loadModule("Shared.Eggs.PlacedEggGrowthPresentationPolicy")
+	local remotes = loadModule("Shared.Remotes")
+	TreadmillRemotes = remotes.Treadmill
+	HaulRemotes = remotes.Haul
+	local resetWall = loadModule("Client.AreaEggResetWall")
+	connect(resetWall.Changed, function(sealed)
+		if sealed == true and not destroyed and automaticMode then
+			wallMaintenancePending = true
+			log("WALL_CLOSED", "Ouverture des oeufs prets puis Equip Best; differe si un vol est en cours.")
+		end
+	end)
 	connect(TreadmillRemotes.AssignedBeltShifted.OnClientEvent, function(id)
 		treadmillAssigned = id ~= nil
 	end)
@@ -1958,6 +2046,7 @@ local function createInterface()
 		local backpackCategories = backpackEggCategories(profile)
 		local plotCategories = plotAnimalCategories()
 		local count = 0
+		local bestByCategory = {}
 		for uid in pairs(cards) do
 			local record = records[uid]
 			if record and type(record.AssetCategory) == "string"
@@ -1965,10 +2054,14 @@ local function createInterface()
 				and profile.Index[record.AssetCategory] ~= true
 				and not backpackCategories[record.AssetCategory]
 				and not plotCategories[record.AssetCategory] then
-				mapSelection[uid] = true
-				count += 1
+				local previous = bestByCategory[record.AssetCategory]
+				local rate = getRatePerSecond(record) or 0
+				if not previous or rate > previous.Rate or (rate == previous.Rate and uid < previous.Uid) then
+					bestByCategory[record.AssetCategory] = {Uid=uid,Rate=rate}
+				end
 			end
 		end
+		for _, best in pairs(bestByCategory) do mapSelection[best.Uid] = true; count += 1 end
 		updateSelection()
 		setStatus(tostring(count) .. " oeuf(s) d'animaux manquants selectionne(s). Clique Add.")
 	end)
