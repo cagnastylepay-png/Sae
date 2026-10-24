@@ -6,11 +6,13 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
+local PathfindingService = game:GetService("PathfindingService")
 local player = Players.LocalPlayer
 assert(player, "Auto_SAE doit etre execute sur le client")
 
 local CONFIG = {
 	Debug = true,
+	FarmDeparture = Vector3.new(519, 71, -387),
 	ProgressInterval = 0.5,
 	MoveRefresh = 0.1,
 	ApproachRefresh = 4,
@@ -48,13 +50,17 @@ local sequence = 0
 local renderControls
 local refreshEggInterface
 local selectedEggs = {}
-local automaticMode = false
+local automaticMode = true
+local autoIncludeMissingIndex = true
 local queuedEggs = {}
 local removedFromAuto = {}
 local queuePaused = false
 local syncQueue, wakeQueue, refreshQueueInterface, startAutomation
 local stopAutomation
 local rigPause = {Character = nil, Until = 0, Reason = nil}
+local PlotState, TreadmillRemotes
+local treadmillAssigned, treadmillPending = false, false
+local autoActivity = "IDLE"
 
 local function log(stage, message, ...)
 	if not CONFIG.Debug and stage ~= "ERROR" and stage ~= "CLAIM_CONFIRMED" then
@@ -917,7 +923,7 @@ local function runCycle(record, rate, recovering)
 	if not character or not humanoid or not root then return false, "personnage absent" end
 	local startIsSafe = isSafe(root.Position)
 	if startIsSafe then
-		safeHome = root.Position
+		safeHome = CONFIG.FarmDeparture
 		local carry = readCarry()
 		if not (carry and carry.IsCarrying) and humanoid.WalkSpeed > 0 then
 			safeSpeedHumanoid, safeWalkSpeed = humanoid, humanoid.WalkSpeed
@@ -1010,6 +1016,17 @@ local function queueOrder()
 	return result
 end
 
+-- Mirror the backpack: placed eggs are excluded from its virtual egg list.
+local function backpackEggCategories(profile)
+	local categories = {}
+	for _, egg in pairs(type(profile) == "table" and profile.EggInventory or {}) do
+		if type(egg) == "table" and egg.Placement == nil and type(egg.AssetCategory) == "string" then
+			categories[egg.AssetCategory] = true
+		end
+	end
+	return categories
+end
+
 local function enqueueEgg(record, source)
 	if type(record) ~= "table" or type(record.Uid) ~= "string" then return false end
 	if source == "AUTO" and removedFromAuto[record.Uid] then return false end
@@ -1037,9 +1054,16 @@ syncQueue = function()
 		end
 	end
 	if automaticMode then
+		local ok, profile = pcall(Save.Peek)
+		local index = ok and type(profile) == "table" and profile.Index
+		local backpackCategories = backpackEggCategories(ok and profile or nil)
 		for uid, record in pairs(records) do
 			local rate = getRatePerSecond(record)
-			if rate and rate >= minimumRatePerSecond and (cooldowns[uid] or 0) <= os.clock() then
+			local missing = autoIncludeMissingIndex and type(index) == "table"
+				and type(record.AssetCategory) == "string" and Assets.Directory[record.AssetCategory] ~= nil
+				and index[record.AssetCategory] ~= true
+				and not backpackCategories[record.AssetCategory]
+			if ((rate and rate >= minimumRatePerSecond) or missing) and (cooldowns[uid] or 0) <= os.clock() then
 				enqueueEgg(record, "AUTO")
 			end
 		end
@@ -1081,6 +1105,130 @@ stopAutomation = function(reason, pause)
 	log("STOP", "%s | RemoteEnCours=%s", reason or "utilisateur", tostring(inFlightRequest and not inFlightRequest.done))
 end
 
+local function activityValid(token, character)
+	return not destroyed and autoEnabled and generation == token and not queuePaused
+		and player.Character == character
+end
+
+local function pathTo(destination, token, interruptForEgg)
+	local character, humanoid, root = getCharacterParts()
+	if not root or not humanoid then return false, "personnage absent" end
+	for attempt = 1, 3 do
+		if not activityValid(token, character) then return false, "annule" end
+		local path = PathfindingService:CreatePath({AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 4})
+		local ok = pcall(function() path:ComputeAsync(root.Position, destination) end)
+		if ok and path.Status == Enum.PathStatus.Success then
+			local blocked = false
+			local currentIndex = 1
+			local connection = path.Blocked:Connect(function(index)
+				if index >= currentIndex then blocked = true end
+			end)
+			local failed = false
+			for index, waypoint in ipairs(path:GetWaypoints()) do
+				currentIndex = index
+				if not activityValid(token, character) then failed = true; break end
+				if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil) then
+					connection:Disconnect()
+					stopMovement()
+					return false, "nouvel oeuf"
+				end
+				if waypoint.Action == Enum.PathWaypointAction.Jump then humanoid.Jump = true end
+				humanoid:MoveTo(waypoint.Position)
+				local deadline = os.clock() + math.clamp((root.Position-waypoint.Position).Magnitude / math.max(humanoid.WalkSpeed, 1) * 3 + 2, 3, 12)
+				while distanceXZ(root.Position, waypoint.Position) > 2 do
+					if blocked or not activityValid(token, character) or humanoid.Health <= 0
+						or os.clock() > deadline then failed = true; break end
+					if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil) then
+						connection:Disconnect()
+						stopMovement()
+						return false, "nouvel oeuf"
+					end
+					task.wait(0.05)
+				end
+				if failed then break end
+			end
+			connection:Disconnect()
+			if not failed and distanceXZ(root.Position, destination) <= 3 then return true end
+		end
+		task.wait(0.2)
+	end
+	stopMovement()
+	return false, "chemin inaccessible"
+end
+
+-- Serialize treadmill requests, including late replies after a timeout.
+local function treadmillRequest(remote, token)
+	if treadmillPending then return false, "requete tapis en cours" end
+	treadmillPending = true
+	local done, accepted, reason = false, false, nil
+	task.spawn(function()
+		local ok, result, detail = pcall(function() return remote:InvokeServer() end)
+		accepted, reason = ok and result == true, ok and detail or result
+		done, treadmillPending = true, false
+	end)
+	local deadline = os.clock() + CONFIG.RequestTimeout
+	while not done and not destroyed and generation == token and os.clock() < deadline do task.wait(0.05) end
+	if not done then return false, "reponse tapis en attente" end
+	return accepted, reason
+end
+
+local function leaveTreadmill(token)
+	if not treadmillAssigned and autoActivity ~= "TREADMILL" and autoActivity ~= "TO_TREADMILL" then return true end
+	autoActivity = "LEAVING_TREADMILL"
+	setStatus("Sortie du tapis puis trajet vers le depart...")
+	local _, humanoid = getCharacterParts()
+	if treadmillAssigned then
+		local ok, reason = treadmillRequest(TreadmillRemotes.AskDoff, token)
+		if not ok then return false, tostring(reason) end
+		local deadline = os.clock() + 5
+		while treadmillAssigned and autoEnabled and generation == token and os.clock() < deadline do task.wait(0.05) end
+		if treadmillAssigned then return false, "sortie du tapis non confirmee" end
+	end
+	if humanoid then humanoid.Jump = true end
+	task.wait(0.3)
+	local ok, reason = pathTo(CONFIG.FarmDeparture, token, false)
+	if ok then autoActivity = "FARM"; safeHome = CONFIG.FarmDeparture end
+	return ok, reason
+end
+
+local function idleOnTreadmill(token)
+	if not PlotState or not TreadmillRemotes then return false, "modules tapis indisponibles" end
+	local slot = PlotState.ResolveLocalSlot()
+	local plots = Workspace:FindFirstChild("Plots")
+	local plot = plots and slot and plots:FindFirstChild(tostring(slot))
+	local bottom = plot and plot:FindFirstChild("TreadmillBottom")
+	if not bottom or not bottom:IsA("BasePart") then return false, "tapis de ta parcelle introuvable" end
+	autoActivity = "TO_TREADMILL"
+	setStatus("File vide : trajet vers le tapis...")
+	if not treadmillAssigned then
+		local _, humanoid = getCharacterParts()
+		local destination = bottom.Position + Vector3.new(0, humanoid.HipHeight + 2, 0)
+		local ok, reason = pathTo(destination, token, true)
+		if not ok then
+			if reason == "nouvel oeuf" then return true end
+			return false, reason
+		end
+		-- The normal controller detects entry with its downward raycast.
+		local deadline = os.clock() + 3
+		while not treadmillAssigned and autoEnabled and generation == token and os.clock() < deadline do task.wait(0.1) end
+		if not treadmillAssigned and automaticMode and next(queuedEggs) == nil then
+			local accepted, detail = treadmillRequest(TreadmillRemotes.AskWearStill, token)
+			if not accepted and not treadmillAssigned then return false, tostring(detail or "entree tapis refusee") end
+			deadline = os.clock() + 5
+			while not treadmillAssigned and autoEnabled and generation == token and os.clock() < deadline do task.wait(0.1) end
+			if not treadmillAssigned then return false, "entree tapis non confirmee" end
+		end
+	end
+	autoActivity = "TREADMILL"
+	setStatus("TREADMILL : entrainement, attente d'un oeuf...")
+	while autoEnabled and generation == token and automaticMode and not queuePaused
+		and next(queuedEggs) == nil and not destroyed do
+		syncQueue()
+		task.wait(CONFIG.ScanInterval)
+	end
+	return true
+end
+
 local function worker(token)
 	while autoEnabled and generation == token and not destroyed do
 		if inFlightRequest and not inFlightRequest.done then
@@ -1106,6 +1254,20 @@ local function worker(token)
 			selected, rate = selectBest()
 		end
 		if selected then
+			local exited, exitReason = leaveTreadmill(token)
+			if not exited then stopAutomation("Sortie tapis : " .. tostring(exitReason)); return end
+			if not autoEnabled or generation ~= token then return end
+			if not recovering then
+				local _, _, root = getCharacterParts()
+				if not root then stopAutomation("Personnage absent"); return end
+				if distanceXZ(root.Position, CONFIG.FarmDeparture) > 3 then
+					autoActivity = "TO_FARM"
+					setStatus("Trajet vers le point de depart...")
+					local reached, detail = pathTo(CONFIG.FarmDeparture, token, false)
+					if not reached then stopAutomation("Depart : " .. tostring(detail)); return end
+				end
+			end
+			autoActivity = "FARM"
 			local success, reason = runCycle(selected, rate, recovering)
 			if not autoEnabled or generation ~= token then return end
 			if success then
@@ -1133,8 +1295,13 @@ local function worker(token)
 				end
 			end
 		else
-			stopAutomation(automaticMode and "AUTO : attente du prochain oeuf au seuil" or "File terminee", false)
-			return
+			if automaticMode then
+				local ok, reason = idleOnTreadmill(token)
+				if not ok then stopAutomation("Tapis : " .. tostring(reason)); return end
+			else
+				stopAutomation("File terminee", false)
+				return
+			end
 		end
 		task.wait(CONFIG.ScanInterval)
 	end
@@ -1154,7 +1321,7 @@ startAutomation = function(billions)
 		setStatus("Personnage indisponible")
 		return false
 	end
-	if isSafe(root.Position) == true then safeHome = root.Position end
+	if isSafe(CONFIG.FarmDeparture) == true then safeHome = CONFIG.FarmDeparture end
 	if not safeHome or isSafe(safeHome) ~= true then
 		setStatus("File en attente : rejoins la zone sure", Color3.fromRGB(255, 190, 100))
 		return false
@@ -1182,7 +1349,7 @@ startAutomation = function(billions)
 end
 
 wakeQueue = function()
-	if destroyed or not ready or autoEnabled or queuePaused or next(queuedEggs) == nil then return end
+	if destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
 	if inFlightRequest and not inFlightRequest.done then return end
 	startAutomation(minimumRatePerSecond / 1e9)
 end
@@ -1209,6 +1376,11 @@ local function initialize()
 	SlotIdentity = loadModule("Shared.Util.AreaEggSlotIdentity")
 	GuardGeometry = loadModule("Shared.Util.GuardAreaGeometry")
 	Save = loadModule("Shared.Save")
+	PlotState = loadModule("Client.PlotState")
+	TreadmillRemotes = loadModule("Shared.Remotes").Treadmill
+	connect(TreadmillRemotes.AssignedBeltShifted.OnClientEvent, function(id)
+		treadmillAssigned = id ~= nil
+	end)
 	if destroyed then return end
 	if CONFIG.ObserveRigSync then
 		local sharedFolder = ReplicatedStorage:FindFirstChild("Shared")
@@ -1265,7 +1437,9 @@ local function initialize()
 	end)
 	snapshot(EggState.ReadFieldEggs())
 	ready = true
-	setStatus("Pret : coche tes oeufs puis Add, ou active AUTO.", Color3.fromRGB(96, 230, 145))
+	setStatus("AUTO ON : recherche des oeufs, sinon entrainement au tapis.", Color3.fromRGB(96, 230, 145))
+	syncQueue()
+	wakeQueue()
 	if refreshEggInterface then refreshEggInterface() end
 	log("READY", "Build=2.4 | MoveTo renouvele / freinage horizontal / distance 3D <= 8 / %d essais en serie / retour / inventaire / reprise meme UID", CONFIG.MaxCarryAttempts)
 end
@@ -1500,6 +1674,17 @@ local function createInterface()
 	paramsLayout.Padding = UDim.new(0, 16)
 	paramsLayout.SortOrder = Enum.SortOrder.LayoutOrder
 	autoButton.Parent = paramsPanel
+	local includeMissingButton = autoButton:Clone()
+	includeMissingButton.Name = "AutoIncludeMissingIndex"
+	includeMissingButton.LayoutOrder = 40
+	includeMissingButton.Parent = paramsPanel
+	caption(includeMissingButton, "Manquants : ON")
+	connect(includeMissingButton.Activated, function()
+		autoIncludeMissingIndex = not autoIncludeMissingIndex
+		caption(includeMissingButton, autoIncludeMissingIndex and "Manquants : ON" or "Manquants : OFF")
+		setStatus(autoIncludeMissingIndex and "AUTO : seuil OU animaux manquants." or "AUTO : seuil de revenu uniquement. File existante conservee.")
+		if ready then syncQueue(); wakeQueue() end
+	end)
 	thresholdTitle.Parent = paramsPanel
 	minimumInput.Parent = paramsPanel
 	autoButton.Size = UDim2.fromScale(0.65, 0.16)
@@ -1563,6 +1748,7 @@ local function createInterface()
 		local count = countSelected()
 		info.Value.Text = activeTab == "Params" and ("AUTO >= " .. formatNumber(minimumRatePerSecond) .. "/s") or (tostring(count) .. (count == 1 and " oeuf" or " oeufs"))
 		setAutoCaption(automaticMode and "AUTO : ON" or "AUTO : OFF")
+		caption(includeMissingButton, autoIncludeMissingIndex and "Manquants : ON" or "Manquants : OFF")
 		minimumInput.TextEditable = true
 		thresholdTitle.Visible = true
 		minimumInput.Visible = true
@@ -1678,12 +1864,14 @@ local function createInterface()
 		end
 		refreshEggInterface()
 		table.clear(mapSelection)
+		local backpackCategories = backpackEggCategories(profile)
 		local count = 0
 		for uid in pairs(cards) do
 			local record = records[uid]
 			if record and type(record.AssetCategory) == "string"
 				and Assets.Directory[record.AssetCategory]
-				and profile.Index[record.AssetCategory] ~= true then
+				and profile.Index[record.AssetCategory] ~= true
+				and not backpackCategories[record.AssetCategory] then
 				mapSelection[uid] = true
 				count += 1
 			end
