@@ -1689,6 +1689,24 @@ local function createInterface()
 		connect(backdrop.Activated, function() show(false) end)
 	end
 	gui.Parent = playerGui
+	-- Remain accessible even when the live HUD differs from the saved template.
+	local fallbackOpen = Instance.new("TextButton")
+	fallbackOpen.Name = "OpenAutoEggsFallback"
+	fallbackOpen.AnchorPoint = Vector2.new(1, 0.5)
+	fallbackOpen.Position = UDim2.new(1, -12, 0.55, 0)
+	fallbackOpen.Size = UDim2.fromOffset(78, 54)
+	fallbackOpen.BackgroundColor3 = Color3.fromRGB(73, 190, 35)
+	fallbackOpen.TextColor3 = Color3.new(1, 1, 1)
+	fallbackOpen.Font = Enum.Font.GothamBold
+	fallbackOpen.Text = "AUTO\nEGGS"
+	fallbackOpen.TextSize = 16
+	fallbackOpen.AutoLocalize = false
+	fallbackOpen.ZIndex = 1000
+	fallbackOpen.Parent = gui
+	Instance.new("UICorner", fallbackOpen).CornerRadius = UDim.new(0, 8)
+	local fallbackStroke = Instance.new("UIStroke", fallbackOpen)
+	fallbackStroke.Thickness = 2
+	connect(fallbackOpen.Activated, function() show(not frame.Visible) end)
 
 
 	local paramsPanel = Instance.new("Frame")
@@ -1988,6 +2006,7 @@ local function createInterface()
 		local stroke = Instance.new("UIStroke", caption)
 		stroke.Thickness = 2
 		button.Parent = buttons
+		fallbackOpen.Visible = false
 		connect(button.Activated, function() show(not frame.Visible) end)
 		connect(gui.Destroying, function() button:Destroy() end)
 	end)
@@ -2003,6 +2022,8 @@ local function createInterface()
 			end
 		end
 	end)
+	show(true)
+	log("UI_READY", "Interface PlayerGui.AutoSAEGui creee; bouton de secours disponible en attendant le HUD.")
 	return gui
 end
 
