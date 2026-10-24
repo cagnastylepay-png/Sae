@@ -13,6 +13,8 @@ assert(player, "Auto_SAE doit etre execute sur le client")
 local CONFIG = {
 	Debug = true,
 	FarmDeparture = Vector3.new(519, 71, -387),
+	CollectButterflies = true,
+	ButterflyTargetTimeout = 20,
 	ProgressInterval = 0.5,
 	MoveRefresh = 0.1,
 	ApproachRefresh = 4,
@@ -65,6 +67,8 @@ local hatchInProgress = false
 local wallMaintenancePending = false
 local HaulRemotes
 local lastEquipBestAt = -math.huge
+local ButterflySwarm, ButterflyFlags
+local butterflyCooldowns, butterflyRemoved = {}, {}
 local lastDepartureArrival
 local treadmillAssigned, treadmillPending = false, false
 local autoActivity = "IDLE"
@@ -1166,6 +1170,42 @@ local function activityValid(token, character)
 		and player.Character == character
 end
 
+local BUTTERFLY_RANK = {Green = 1, Blue = 2, Purple = 3, Golden = 4}
+
+local function findButterflyNet()
+	for _, container in pairs({Character = player.Character, Backpack = player:FindFirstChildOfClass("Backpack")}) do
+		if container then
+			for _, tool in ipairs(container:GetChildren()) do
+				if tool:IsA("Tool") and tool:GetAttribute("ButterflyNet") == true then return tool end
+			end
+		end
+	end
+	return nil
+end
+
+local function selectButterfly()
+	if not CONFIG.CollectButterflies or not automaticMode or not ButterflySwarm or not ButterflyFlags then return nil end
+	if not ButterflyFlags.Enabled:Get() or not findButterflyNet() then return nil end
+	local ok, profile = pcall(Save.Peek)
+	if not ok or not profile or not profile.Butterflies or profile.Butterflies.NetClaimed ~= true then return nil end
+	local _, _, root = getCharacterParts()
+	if not root then return nil end
+	local best, bestRank, bestDistance, bestId = nil, -1, math.huge, nil
+	for id, state in pairs(ButterflySwarm.Each()) do
+		local flight = state.Flight
+		local rank = flight and BUTTERFLY_RANK[flight.Tier]
+		if rank and typeof(state.Position) == "Vector3" and (state.Alpha or 0) >= 0.5
+			and not butterflyRemoved[id] and (butterflyCooldowns[id] or 0) <= os.clock() then
+			local distance = (state.Position - root.Position).Magnitude
+			if rank > bestRank or (rank == bestRank and (distance < bestDistance
+				or (distance == bestDistance and tostring(id) < tostring(bestId)))) then
+				best, bestRank, bestDistance, bestId = state, rank, distance, id
+			end
+		end
+	end
+	return best
+end
+
 local function pathTo(destination, token, interruptForEgg)
 	local character, humanoid, root = getCharacterParts()
 	if not root or not humanoid then return false, "personnage absent" end
@@ -1184,7 +1224,7 @@ local function pathTo(destination, token, interruptForEgg)
 			for index, waypoint in ipairs(path:GetWaypoints()) do
 				currentIndex = index
 				if not activityValid(token, character) then failed = true; break end
-				if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil) then
+				if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil or selectButterfly() ~= nil) then
 					connection:Disconnect()
 					stopMovement()
 					return false, "nouvel oeuf"
@@ -1196,7 +1236,7 @@ local function pathTo(destination, token, interruptForEgg)
 				while distanceXZ(root.Position, waypoint.Position) > arrivalRadius do
 					if blocked or not activityValid(token, character) or humanoid.Health <= 0
 						or os.clock() > deadline then failed = true; break end
-					if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil) then
+					if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil or selectButterfly() ~= nil) then
 						connection:Disconnect()
 						stopMovement()
 						return false, "nouvel oeuf"
@@ -1253,6 +1293,79 @@ local function leaveTreadmill(token)
 		log("DEPARTURE_READY", "Point de depart atteint : transition directe vers le vol")
 	end
 	return ok, reason, ok
+end
+
+local function farmButterflies(token)
+	local exited, reason = leaveTreadmill(token)
+	if not exited then return false, reason end
+	local character, humanoid, root = getCharacterParts()
+	if not root or not humanoid then return false, "personnage absent" end
+	local net = findButterflyNet()
+	if not net then return false, "filet indisponible" end
+	local previousTools = {}
+	for _, tool in ipairs(character:GetChildren()) do
+		if tool:IsA("Tool") and tool ~= net then table.insert(previousTools, tool) end
+	end
+	autoActivity = "BUTTERFLY"
+	local lastCommand, lastSwing, activeId, targetStarted = -math.huge, -math.huge, nil, 0
+	local ok, failure = xpcall(function()
+		humanoid:EquipTool(net)
+		while activityValid(token, character) and automaticMode do
+			syncQueue()
+			if next(queuedEggs) ~= nil or wallMaintenancePending then break end
+			local target = selectButterfly()
+			if not target then break end
+			local id = target.Flight.Id
+			local now = os.clock()
+			if id ~= activeId then
+				activeId, targetStarted, lastCommand = id, now, -math.huge
+				log("BUTTERFLY_TARGET", "Id=%s Rarete=%s", tostring(id), tostring(target.Flight.Tier))
+			end
+			if now - targetStarted >= CONFIG.ButterflyTargetTimeout then
+				butterflyCooldowns[id] = now + 5
+				activeId = nil
+			elseif not motionBlockReason({character = character}) then
+				if net.Parent ~= character then humanoid:EquipTool(net) end
+				local reach = ButterflyFlags.NetReach:Get()
+				local distance = (root.Position - target.Position).Magnitude
+				setStatus("PAPILLON : " .. tostring(target.Flight.Tier))
+				if distance > reach * 0.65 then
+					if now - lastCommand >= CONFIG.MoveRefresh then
+						lastCommand = now
+						humanoid:MoveTo(Vector3.new(target.Position.X, root.Position.Y, target.Position.Z))
+					end
+				else
+					humanoid:MoveTo(root.Position)
+					-- Use the real tool; its client controller handles range, animation and server verdict.
+					if not ButterflyFlags.AutoSwing:Get() and now - lastSwing >= ButterflyFlags.SwingCooldownSeconds:Get() then
+						lastSwing = now
+						net:Activate()
+					end
+				end
+			else
+				stopMovement()
+			end
+			task.wait(0.05)
+		end
+	end, debug.traceback)
+	if player.Character == character and humanoid.Health > 0 then
+		if net.Parent == character then humanoid:UnequipTools() end
+		for _, tool in ipairs(previousTools) do
+			if tool.Parent == player:FindFirstChildOfClass("Backpack") then humanoid:EquipTool(tool); break end
+		end
+	end
+	if not activityValid(token, character) then return false, "annule" end
+	if not ok then log("BUTTERFLY_ERROR", "%s", tostring(failure)) end
+	if next(queuedEggs) ~= nil then
+		autoActivity = "FARM"
+		stopMovement()
+		return true, nil, true
+	end
+	autoActivity = "TO_FARM"
+	setStatus("Retour au point de depart...")
+	local returned, detail = pathTo(CONFIG.FarmDeparture, token, false)
+	if returned then autoActivity = "IDLE"; safeHome = CONFIG.FarmDeparture end
+	return returned, detail
 end
 
 local function hatchReadyEggsOnWallClose(token)
@@ -1318,8 +1431,9 @@ local function idleOnTreadmill(token)
 		end
 		-- The normal controller detects entry with its downward raycast.
 		local deadline = os.clock() + 3
-		while not treadmillAssigned and autoEnabled and generation == token and os.clock() < deadline do task.wait(0.1) end
-		if not treadmillAssigned and automaticMode and next(queuedEggs) == nil then
+		while not treadmillAssigned and autoEnabled and generation == token and os.clock() < deadline
+			and next(queuedEggs) == nil and selectButterfly() == nil do task.wait(0.1) end
+		if not treadmillAssigned and automaticMode and next(queuedEggs) == nil and selectButterfly() == nil then
 			local accepted, detail = treadmillRequest(TreadmillRemotes.AskWearStill, token)
 			if not accepted and not treadmillAssigned then return false, tostring(detail or "entree tapis refusee") end
 			deadline = os.clock() + 5
@@ -1331,7 +1445,7 @@ local function idleOnTreadmill(token)
 	if destroyed or not autoEnabled or generation ~= token then return true end
 	setStatus("TREADMILL : entrainement, attente d'un oeuf...")
 	while autoEnabled and generation == token and automaticMode and not queuePaused
-		and next(queuedEggs) == nil and not destroyed do
+		and next(queuedEggs) == nil and selectButterfly() == nil and not destroyed do
 		serviceWallMaintenance(token)
 		syncQueue()
 		task.wait(CONFIG.ScanInterval)
@@ -1357,6 +1471,7 @@ local function requestUserStop(reason)
 end
 
 local function worker(token)
+	local directEggApproach = false
 	while autoEnabled and generation == token and not destroyed do
 		serviceWallMaintenance(token)
 		if inFlightRequest and not inFlightRequest.done then
@@ -1394,7 +1509,7 @@ local function worker(token)
 			if not recovering then
 				local _, _, root = getCharacterParts()
 				if not root then stopAutomation("Personnage absent"); return end
-				if not reachedDeparture and distanceXZ(root.Position, CONFIG.FarmDeparture) > 3 then
+				if not recovering and not directEggApproach and not reachedDeparture and distanceXZ(root.Position, CONFIG.FarmDeparture) > 3 then
 					autoActivity = "TO_FARM"
 					setStatus("Trajet vers le point de depart...")
 					local reached, detail = pathTo(CONFIG.FarmDeparture, token, false)
@@ -1403,6 +1518,7 @@ local function worker(token)
 				end
 			end
 			autoActivity = "FARM"
+			directEggApproach = false
 			log("FARM_START", "Delai depuis arrivee depart=%.3fs", lastDepartureArrival and (os.clock()-lastDepartureArrival) or 0)
 			local success, reason = runCycle(selected, rate, recovering)
 			if not autoEnabled or generation ~= token then return end
@@ -1430,6 +1546,11 @@ local function worker(token)
 					return
 				end
 			end
+		elseif selectButterfly() ~= nil then
+			local ok, reason, directToEgg = farmButterflies(token)
+			directEggApproach = directToEgg == true
+			if not autoEnabled or generation ~= token then return end
+			if not ok then stopAutomation("Papillons : " .. tostring(reason)); return end
 		else
 			if automaticMode then
 				local ok, reason = idleOnTreadmill(token)
@@ -1520,6 +1641,25 @@ local function initialize()
 	local remotes = loadModule("Shared.Remotes")
 	TreadmillRemotes = remotes.Treadmill
 	HaulRemotes = remotes.Haul
+	-- Optional event support must not prevent the egg interface from starting.
+	local butterflyOK, butterflyError = pcall(function()
+		ButterflySwarm = loadModule("Controllers.Game.AdminAbuseClientController.Events.ButterflyBloom.Swarm")
+		ButterflyFlags = loadModule("Shared.Flags.ButterflyFlags")
+		connect(remotes.Butterflies.Spawned.OnClientEvent, function(flight)
+			if type(flight) == "table" then butterflyRemoved[flight.Id] = nil end
+		end)
+		connect(remotes.Butterflies.Removed.OnClientEvent, function(id, reason, userId)
+			butterflyRemoved[id] = true
+			butterflyCooldowns[id] = nil
+			if reason == "Caught" and userId == player.UserId then
+				log("BUTTERFLY_CAUGHT", "Capture confirmee Id=%s", tostring(id))
+			end
+		end)
+	end)
+	if not butterflyOK then
+		ButterflySwarm, ButterflyFlags = nil, nil
+		log("BUTTERFLY_UNAVAILABLE", "%s", tostring(butterflyError))
+	end
 	local resetWall = loadModule("Client.AreaEggResetWall")
 	connect(resetWall.Changed, function(sealed)
 		if sealed == true and not destroyed and automaticMode then
