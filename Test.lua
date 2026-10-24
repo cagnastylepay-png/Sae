@@ -1,4 +1,4 @@
--- Auto_SAE v2.5. SellPrompt selection UI. Verified client contracts; no character/anticheat replacement.
+-- Auto_SAE v2.8. SellPrompt selection UI. Verified client contracts; no character/anticheat replacement.
 -- The live game must provide ReplicatedStorage.Client/Data/Shared.
 -- Refresh outbound MoveTo before its native timeout; verify distance before carry.
 local RunService = game:GetService("RunService")
@@ -41,12 +41,17 @@ local minimumRatePerSecond = DEFAULT_BILLIONS * 1e9
 local records, loggedVersions, cooldowns = {}, {}, {}
 local lifetimeConnections = {}
 local currentCycle, safeHome
+local safeSpeedHumanoid, safeWalkSpeed
 local inFlightRequest = shared.__AutoSAERemoteLock
 local statusLabel, toggleButton, minimumInput
 local sequence = 0
 local renderControls
 local refreshEggInterface
 local selectedEggs = {}
+local automaticMode = false
+local queuedEggs = {}
+local queuePaused = false
+local syncQueue, wakeQueue, refreshQueueInterface, startAutomation
 local stopAutomation
 local rigPause = {Character = nil, Until = 0, Reason = nil}
 
@@ -910,7 +915,13 @@ local function runCycle(record, rate, recovering)
 	local character, humanoid, root = getCharacterParts()
 	if not character or not humanoid or not root then return false, "personnage absent" end
 	local startIsSafe = isSafe(root.Position)
-	if startIsSafe then safeHome = root.Position end
+	if startIsSafe then
+		safeHome = root.Position
+		local carry = readCarry()
+		if not (carry and carry.IsCarrying) and humanoid.WalkSpeed > 0 then
+			safeSpeedHumanoid, safeWalkSpeed = humanoid, humanoid.WalkSpeed
+		end
+	end
 	if not safeHome or isSafe(safeHome) ~= true then
 		return false, "position de retour sure non disponible"
 	end
@@ -984,11 +995,61 @@ local function snapshot(snapshotData)
 	records = updated
 end
 
+local function queueOrder()
+	local result = {}
+	for uid, entry in pairs(queuedEggs) do
+		entry.Uid = uid
+		entry.Rate = getRatePerSecond(records[uid] or entry.Record) or entry.Rate or 0
+		table.insert(result, entry)
+	end
+	table.sort(result, function(a, b)
+		if a.Rate ~= b.Rate then return a.Rate > b.Rate end
+		return a.Uid < b.Uid
+	end)
+	return result
+end
+
+local function enqueueEgg(record, source)
+	if type(record) ~= "table" or type(record.Uid) ~= "string" then return false end
+	if queuedEggs[record.Uid] then return false end
+	if record.State ~= SLOT_STATE and record.State ~= "Dropped" then return false end
+	if record.CarrierUserId ~= nil or ownsEgg(record.Uid) then return false end
+	queuedEggs[record.Uid] = {Record = record, Rate = getRatePerSecond(record) or 0, Source = source}
+	return true
+end
+
+syncQueue = function()
+	if not ready or destroyed then return end
+	for uid, entry in pairs(queuedEggs) do
+		if not currentCycle or currentCycle.uid ~= uid then
+			local record = records[uid]
+			local carriedByMe = record and record.State == "Carried" and record.CarrierUserId == player.UserId
+			if not record or ownsEgg(uid)
+				or (not carriedByMe and record.State ~= SLOT_STATE and record.State ~= "Dropped")
+				or (record.CarrierUserId ~= nil and not carriedByMe) then
+				queuedEggs[uid] = nil
+			else
+				entry.Record = record
+			end
+		end
+	end
+	if automaticMode then
+		for uid, record in pairs(records) do
+			local rate = getRatePerSecond(record)
+			if rate and rate >= minimumRatePerSecond and (cooldowns[uid] or 0) <= os.clock() then
+				enqueueEgg(record, "AUTO")
+			end
+		end
+	end
+	if refreshQueueInterface then refreshQueueInterface() end
+end
+
 local function selectBest()
 	local best, bestRate = nil, -math.huge
 	local _, _, root = getCharacterParts()
-	for uid, cached in pairs(records) do
-		if selectedEggs[uid] and (cached.State == SLOT_STATE or cached.State == "Dropped") and (cooldowns[uid] or 0) <= os.clock() then
+	for uid, entry in pairs(queuedEggs) do
+		local cached = records[uid] or entry.Record
+		if queuedEggs[uid] and (cached.State == SLOT_STATE or cached.State == "Dropped") and (cooldowns[uid] or 0) <= os.clock() then
 			local latest, ok = readField(uid)
 			if ok and latest and (latest.State == SLOT_STATE or latest.State == "Dropped") and latest.CarrierUserId == nil and not ownsEgg(uid) then
 				records[uid] = latest
@@ -1006,7 +1067,8 @@ local function selectBest()
 	return best, bestRate
 end
 
-stopAutomation = function(reason)
+stopAutomation = function(reason, pause)
+	queuePaused = pause ~= false
 	autoEnabled = false
 	generation += 1
 	if currentCycle then cleanupCycle(currentCycle) end
@@ -1027,10 +1089,11 @@ local function worker(token)
 			stopAutomation("Etat de transport indisponible")
 			return
 		end
+		syncQueue()
 		local selected, rate, recovering
 		if carry.IsCarrying and carry.Uid then
-			if not selectedEggs[carry.Uid] then
-				stopAutomation("Un oeuf non selectionne est deja porte")
+			if not queuedEggs[carry.Uid] then
+				stopAutomation("Un oeuf hors de la file est deja porte")
 				return
 			end
 			selected = readField(carry.Uid)
@@ -1044,11 +1107,14 @@ local function worker(token)
 			if not autoEnabled or generation ~= token then return end
 			if success then
 				selectedEggs[selected.Uid] = nil
+				queuedEggs[selected.Uid] = nil
+				if refreshQueueInterface then refreshQueueInterface() end
 				if renderControls then renderControls() end
 			end
 			if not success then
 				log("CYCLE_FAILED", "UID=%s Raison=%s", selected.Uid, tostring(reason))
 				cooldowns[selected.Uid] = os.clock() + CONFIG.FailedTargetCooldown
+				queuedEggs[selected.Uid] = nil
 				-- Never continue after ambiguous ownership or an unresolved request.
 				if recovering or (inFlightRequest and not inFlightRequest.done) then
 					stopAutomation(tostring(reason))
@@ -1064,14 +1130,14 @@ local function worker(token)
 				end
 			end
 		else
-			stopAutomation("Selection terminee ou oeufs indisponibles")
+			stopAutomation(automaticMode and "AUTO : attente du prochain oeuf au seuil" or "File terminee", false)
 			return
 		end
 		task.wait(CONFIG.ScanInterval)
 	end
 end
 
-local function startAutomation(billions)
+startAutomation = function(billions)
 	if destroyed or not ready then
 		setStatus("Les modules du jeu sont indisponibles", Color3.fromRGB(255, 130, 110))
 		return false
@@ -1087,14 +1153,17 @@ local function startAutomation(billions)
 	end
 	if isSafe(root.Position) == true then safeHome = root.Position end
 	if not safeHome or isSafe(safeHome) ~= true then
-		setStatus("Place-toi dans la zone sure puis GO", Color3.fromRGB(255, 190, 100))
+		setStatus("File en attente : rejoins la zone sure", Color3.fromRGB(255, 190, 100))
+		return false
+	end
+	if type(billions) ~= "number" or billions ~= billions or math.abs(billions) == math.huge then
+		setStatus("Seuil invalide : entre 0.1 et 999 B/s")
 		return false
 	end
 	minimumRatePerSecond = math.clamp(billions, MINIMUM_BILLIONS, MAXIMUM_BILLIONS) * 1e9
 	generation += 1
 	local token = generation
 	autoEnabled = true
-	cooldowns = {}
 	snapshot(EggState.ReadFieldEggs())
 	if renderControls then renderControls() end
 	log("START", "Minimum=%s/s SafeHome=%s Session=%d",
@@ -1107,6 +1176,12 @@ local function startAutomation(billions)
 		end
 	end)
 	return true
+end
+
+wakeQueue = function()
+	if destroyed or not ready or autoEnabled or queuePaused or next(queuedEggs) == nil then return end
+	if inFlightRequest and not inFlightRequest.done then return end
+	startAutomation(minimumRatePerSecond / 1e9)
 end
 
 local function loadModule(path)
@@ -1187,7 +1262,7 @@ local function initialize()
 	end)
 	snapshot(EggState.ReadFieldEggs())
 	ready = true
-	setStatus("Pret : ouvre Auto Eggs et coche tes oeufs.", Color3.fromRGB(96, 230, 145))
+	setStatus("Pret : coche tes oeufs puis Add, ou active AUTO.", Color3.fromRGB(96, 230, 145))
 	if refreshEggInterface then refreshEggInterface() end
 	log("READY", "Build=2.4 | MoveTo renouvele / freinage horizontal / distance 3D <= 8 / %d essais en serie / retour / inventaire / reprise meme UID", CONFIG.MaxCarryAttempts)
 end
@@ -1210,14 +1285,83 @@ local function createInterface()
 	end
 	local frame = gui:WaitForChild("Frame")
 	frame.Visible = false
-	local tabs = frame:FindFirstChild("TabButtonHolder")
-	if tabs then tabs:Destroy() end
+	local tabs = frame:WaitForChild("TabButtonHolder")
+	local mapTab = tabs:WaitForChild("EggsTab")
+	local queueTab = tabs:WaitForChild("PetsTab")
+	mapTab.Name = "MapTab"
+	queueTab.Name = "QueueTab"
+	mapTab.Title.Text = "Map"
+	queueTab.Title.Text = "Queue"
+	local activeTab = "Map"
 	local sort = frame:WaitForChild("SortByHolder")
 	for _, name in ipairs({"Weight", "Value", "PaddingTop", "PaddingSelect"}) do
 		local object = sort:FindFirstChild(name)
 		if object then object:Destroy() end
 	end
-	sort.Title.Text = "Selection"
+	sort.Title.Text = "Collecte"
+
+	sort.Clear.LayoutOrder = 60
+	sort.SelectAll.LayoutOrder = 50
+	local autoButton = sort.SelectAll:Clone()
+	autoButton.Name = "AutomaticMode"
+	autoButton.LayoutOrder = 10
+	autoButton.Parent = sort
+	local autoIcon = autoButton:FindFirstChild("Icon")
+	if autoIcon then autoIcon.Visible = false end
+	local function setAutoCaption(text)
+		for _, object in ipairs(autoButton:GetDescendants()) do
+			if object:IsA("TextLabel") then
+				object.Text = text
+				object.Size = UDim2.fromScale(0.92, 0.85)
+				object.Position = UDim2.fromScale(0.5, 0.5)
+				object.AnchorPoint = Vector2.new(0.5, 0.5)
+				object.TextScaled = true
+			end
+		end
+	end
+	local thresholdTitle = sort.Title:Clone()
+	thresholdTitle.Name = "ThresholdTitle"
+	thresholdTitle.LayoutOrder = 20
+	thresholdTitle.Text = "Minimum (B/s)"
+	thresholdTitle.Size = UDim2.fromScale(0.95, 0.08)
+	thresholdTitle.TextScaled = true
+	thresholdTitle.Parent = sort
+	minimumInput = Instance.new("TextBox")
+	minimumInput.Name = "MinimumBillions"
+	minimumInput.LayoutOrder = 30
+	minimumInput.Size = UDim2.fromScale(0.91, 0.12)
+	minimumInput.BackgroundColor3 = Color3.fromRGB(35, 41, 57)
+	minimumInput.TextColor3 = Color3.new(1, 1, 1)
+	minimumInput.Font = Enum.Font.GothamBold
+	minimumInput.TextSize = 16
+	minimumInput.ClearTextOnFocus = false
+	minimumInput.PlaceholderText = "0.1 - 999"
+	minimumInput.Text = tostring(DEFAULT_BILLIONS)
+	minimumInput.Parent = sort
+	local thresholdCorner = Instance.new("UICorner", minimumInput)
+	thresholdCorner.CornerRadius = UDim.new(0, 8)
+	local function readThreshold()
+		local value = tonumber((minimumInput.Text:gsub(",", ".")))
+		if not value or value ~= value or math.abs(value) == math.huge then
+			setStatus("Seuil invalide : entre 0.1 et 999 B/s", Color3.fromRGB(255, 130, 110))
+			return nil
+		end
+		value = math.clamp(value, MINIMUM_BILLIONS, MAXIMUM_BILLIONS)
+		minimumInput.Text = tostring(value)
+		return value
+	end
+	connect(minimumInput.FocusLost, function()
+		do
+			local value = readThreshold()
+			if value then
+				minimumRatePerSecond = value * 1e9
+				if syncQueue then syncQueue() end
+				if wakeQueue then wakeQueue() end
+				if renderControls then renderControls() end
+			end
+		end
+	end)
+
 	local header = frame:WaitForChild("Header")
 	for _, name in ipairs({"Title", "Title2Stroke"}) do
 		local title = header:FindFirstChild(name)
@@ -1228,9 +1372,12 @@ local function createInterface()
 	info.Value.Text = "0 oeuf"
 	info.Icon.Visible = false
 	toggleButton = info:WaitForChild("Sell")
-	toggleButton.Name = "Go"
-	toggleButton.Title.Text = "GO"
+	toggleButton.Name = "Add"
+	toggleButton.Title.Text = "Add"
 	local scroll = frame:WaitForChild("ScrollingFrame")
+	scroll.AnchorPoint = Vector2.zero
+	scroll.Position = UDim2.fromScale(0.22, 0.16)
+	scroll.Size = UDim2.fromScale(0.766, 0.67)
 	local template = gui.Assets:WaitForChild("TemplateHolder"):Clone()
 	template.Visible = true
 	for _, object in ipairs(scroll:GetChildren()) do
@@ -1277,6 +1424,7 @@ local function createInterface()
 		frame.Visible = open
 		if backdrop then backdrop.Visible = open end
 		if open and refreshEggInterface then refreshEggInterface() end
+		if open and refreshQueueInterface then refreshQueueInterface() end
 	end
 	connect(frame.Close.Activated, function() show(false) end)
 	if backdrop and backdrop:IsA("GuiButton") then
@@ -1284,6 +1432,114 @@ local function createInterface()
 	end
 	gui.Parent = playerGui
 
+
+	local queuePanel = Instance.new("Frame")
+	queuePanel.Name = "Queue"
+	queuePanel.BackgroundColor3 = Color3.fromRGB(25, 31, 43)
+	queuePanel.BackgroundTransparency = 0.1
+	queuePanel.BorderSizePixel = 0
+	queuePanel.Position = scroll.Position
+	queuePanel.Size = scroll.Size
+	queuePanel.Visible = false
+	queuePanel.ZIndex = scroll.ZIndex + 1
+	queuePanel.Parent = frame
+	Instance.new("UICorner", queuePanel).CornerRadius = UDim.new(0, 8)
+	local queueTitle = Instance.new("TextLabel")
+	queueTitle.Name = "Title"
+	queueTitle.BackgroundTransparency = 1
+	queueTitle.Size = UDim2.new(1, -8, 0, 26)
+	queueTitle.Position = UDim2.fromOffset(4, 0)
+	queueTitle.Text = "QUEUE (0)"
+	queueTitle.TextColor3 = Color3.new(1,1,1)
+	queueTitle.TextScaled = true
+	queueTitle.Font = Enum.Font.GothamBold
+	queueTitle.ZIndex = queuePanel.ZIndex + 1
+	queueTitle.Parent = queuePanel
+	local queueList = Instance.new("ScrollingFrame")
+	queueList.Name = "List"
+	queueList.BackgroundTransparency = 1
+	queueList.BorderSizePixel = 0
+	queueList.Position = UDim2.fromOffset(4, 30)
+	queueList.Size = UDim2.new(1, -8, 1, -34)
+	queueList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	queueList.CanvasSize = UDim2.new()
+	queueList.ScrollBarThickness = 4
+	queueList.ZIndex = queuePanel.ZIndex + 1
+	queueList.Parent = queuePanel
+	local queueLayout = Instance.new("UIListLayout", queueList)
+	queueLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	queueLayout.Padding = UDim.new(0, 5)
+	local queueRows = {}
+	refreshQueueInterface = function()
+		if destroyed then return end
+		local entries = queueOrder()
+		queueTitle.Text = "QUEUE (" .. #entries .. ") - revenu decroissant"
+		queueTab.Title.Text = "Queue (" .. #entries .. ")"
+		local seen = {}
+		for rank, entry in ipairs(entries) do
+			local uid = entry.Uid
+			seen[uid] = true
+			local row = queueRows[uid]
+			if not row then
+				row = Instance.new("TextLabel")
+				row.Name = uid
+				row.Size = UDim2.new(1, -6, 0, 65)
+				row.BackgroundColor3 = Color3.fromRGB(43, 50, 65)
+				row.TextColor3 = Color3.new(1,1,1)
+				row.TextWrapped = true
+				row.TextSize = 12
+				row.Font = Enum.Font.GothamMedium
+				row.ZIndex = queueList.ZIndex + 1
+				row.Parent = queueList
+				Instance.new("UICorner", row).CornerRadius = UDim.new(0, 5)
+				queueRows[uid] = row
+			end
+			row.LayoutOrder = rank
+			local active = currentCycle and currentCycle.uid == uid
+			row.BackgroundColor3 = active and Color3.fromRGB(37, 104, 69) or Color3.fromRGB(43, 50, 65)
+			row.Text = tostring(rank) .. ". " .. getAnimalName(entry.Record)
+				.. "\n" .. formatNumber(entry.Rate) .. "/s"
+				.. "\n" .. (active and "EN COURS" or (queuePaused and "EN PAUSE" or entry.Source))
+		end
+		for uid, row in pairs(queueRows) do
+			if not seen[uid] then row:Destroy(); queueRows[uid] = nil end
+		end
+	end
+	local pauseButton = Instance.new("TextButton")
+	pauseButton.Name = "QueuePause"
+	pauseButton.LayoutOrder = 40
+	pauseButton.Size = UDim2.fromScale(0.91, 0.11)
+	pauseButton.BackgroundColor3 = Color3.fromRGB(61, 75, 103)
+	pauseButton.TextColor3 = Color3.new(1,1,1)
+	pauseButton.TextScaled = true
+	pauseButton.Font = Enum.Font.GothamBold
+	pauseButton.Text = "PAUSE"
+	pauseButton.Parent = sort
+	Instance.new("UICorner", pauseButton).CornerRadius = UDim.new(0, 8)
+	connect(pauseButton.Activated, function()
+		if queuePaused then
+			queuePaused = false
+			wakeQueue()
+		else
+			stopAutomation("File en pause")
+		end
+		if renderControls then renderControls() end
+		refreshQueueInterface()
+	end)
+
+	local function switchTab(name)
+		activeTab = name
+		scroll.Visible = name == "Map"
+		queuePanel.Visible = name == "Queue"
+		mapTab.Title.TextColor3 = name == "Map" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
+		queueTab.Title.TextColor3 = name == "Queue" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
+		if name == "Queue" and refreshQueueInterface then refreshQueueInterface() end
+		if name == "Map" and refreshEggInterface then refreshEggInterface() end
+		if renderControls then renderControls() end
+	end
+	connect(mapTab.Activated, function() switchTab("Map") end)
+	connect(queueTab.Activated, function() switchTab("Queue") end)
+	switchTab("Map")
 	local cards = {}
 	local function countSelected()
 		local n = 0
@@ -1292,13 +1548,23 @@ local function createInterface()
 	end
 	local function updateSelection()
 		local count = countSelected()
-		info.Value.Text = tostring(count) .. (count == 1 and " oeuf" or " oeufs")
-		toggleButton.Title.Text = autoEnabled and "STOP" or "GO"
+		info.Value.Text = automaticMode and ("AUTO >= " .. formatNumber(minimumRatePerSecond) .. "/s") or (tostring(count) .. (count == 1 and " oeuf" or " oeufs"))
+		setAutoCaption(automaticMode and "AUTO : ON" or "AUTO : OFF")
+		minimumInput.TextEditable = true
+		thresholdTitle.Visible = automaticMode
+		minimumInput.Visible = automaticMode
+		sort.Clear.Active = true
+		sort.SelectAll.Active = true
+		toggleButton.Title.Text = "Add"
+		toggleButton.Visible = activeTab == "Map"
+		sort.SelectAll.Visible = activeTab == "Map"
+		sort.Clear.Visible = activeTab == "Map"
+		pauseButton.Text = queuePaused and "REPRENDRE" or "PAUSE"
 		for uid, card in pairs(cards) do
 			local checked = selectedEggs[uid] == true
 			card.holder.SelectedOverlay.Visible = checked
 			card.holder.SelectedIcon.Visible = checked
-			card.button.Active = not autoEnabled
+			card.button.Active = true
 		end
 	end
 	refreshEggInterface = function()
@@ -1336,7 +1602,6 @@ local function createInterface()
 				card = {holder = holder, visual = visual, button = click}
 				cards[uid] = card
 				card.connection = click.Activated:Connect(function()
-					if autoEnabled then return end
 					selectedEggs[uid] = not selectedEggs[uid] or nil
 					updateSelection()
 				end)
@@ -1374,21 +1639,38 @@ local function createInterface()
 		updateSelection()
 	end
 	renderControls = updateSelection
+	connect(autoButton.Activated, function()
+		local value = readThreshold()
+		if not value then return end
+		minimumRatePerSecond = value * 1e9
+		automaticMode = not automaticMode
+		if automaticMode then queuePaused = false end
+		setStatus(automaticMode and "AUTO : ajout des oeufs au seuil dans la file." or "AUTO OFF : la file existante est conservee.")
+		syncQueue()
+		wakeQueue()
+		updateSelection()
+	end)
 	connect(sort.Clear.Activated, function()
-		if autoEnabled then return end
 		table.clear(selectedEggs)
 		updateSelection()
 	end)
 	connect(sort.SelectAll.Activated, function()
-		if autoEnabled then return end
 		for uid in pairs(cards) do selectedEggs[uid] = true end
 		updateSelection()
 	end)
 	connect(toggleButton.Activated, function()
-		if autoEnabled then stopAutomation("Collecte arretee"); return end
 		refreshEggInterface()
-		if countSelected() == 0 then setStatus("Coche au moins un oeuf."); return end
-		startAutomation(0)
+		if countSelected() == 0 then setStatus("Coche au moins un oeuf puis Add."); return end
+		local added = 0
+		for uid in pairs(selectedEggs) do
+			if enqueueEgg(records[uid], "MANUEL") then added += 1 end
+		end
+		table.clear(selectedEggs)
+		queuePaused = false
+		setStatus(tostring(added) .. " oeuf(s) ajoute(s) a la file.")
+		syncQueue()
+		wakeQueue()
+		updateSelection()
 	end)
 	connect(gui.Destroying, function()
 		for _, card in pairs(cards) do card.connection:Disconnect() end
@@ -1435,11 +1717,47 @@ local function createInterface()
 		elapsed += dt
 		if elapsed >= 0.75 then
 			elapsed = 0
-			if frame.Visible and ready and not destroyed then refreshEggInterface() end
+			if ready and not destroyed then
+				syncQueue()
+				wakeQueue()
+				if frame.Visible then refreshEggInterface() end
+			end
 		end
 	end)
 	return gui
 end
+
+-- Cache the current character's unladen safe-zone speed; freeze it during each trip.
+connect(RunService.Heartbeat, function()
+	if destroyed or not ready then return end
+	local character, humanoid, root = getCharacterParts()
+	if not humanoid or not root or humanoid.Health <= 0 then return end
+	if safeSpeedHumanoid ~= humanoid then
+		safeSpeedHumanoid, safeWalkSpeed = nil, nil
+	end
+	local ctx = currentCycle
+	if not ctx then
+		local carry = readCarry()
+		if isSafe(root.Position) == true and not (carry and carry.IsCarrying)
+			and not motionBlockReason({character = character})
+			and humanoid.WalkSpeed > 0 and humanoid.WalkSpeed < math.huge then
+			safeSpeedHumanoid, safeWalkSpeed = humanoid, humanoid.WalkSpeed
+		end
+		return
+	end
+	if not validCycle(ctx) then return end
+	if safeSpeedHumanoid == humanoid and safeWalkSpeed then
+		if math.abs(humanoid.WalkSpeed - safeWalkSpeed) > 0.001 then
+			humanoid.WalkSpeed = safeWalkSpeed
+		end
+	end
+	-- Request another jump after landing; leave ragdoll/traps and airborne states alone.
+	if ctx.phase == "RETURN" and not motionBlockReason(ctx)
+		and humanoid.FloorMaterial ~= Enum.Material.Air
+		and humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping) then
+		humanoid.Jump = true
+	end
+end)
 
 local gui = createInterface()
 setStatus("Chargement des modules du jeu...")
