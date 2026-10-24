@@ -59,7 +59,8 @@ local queuePaused = false
 local syncQueue, wakeQueue, refreshQueueInterface, startAutomation
 local stopAutomation
 local rigPause = {Character = nil, Until = 0, Reason = nil}
-local PlotState, TreadmillRemotes
+local PlotState, TreadmillRemotes, AssetRoster
+local lastDepartureArrival
 local treadmillAssigned, treadmillPending = false, false
 local autoActivity = "IDLE"
 
@@ -1028,8 +1029,31 @@ local function backpackEggCategories(profile)
 	return categories
 end
 
+local function plotAnimalCategories()
+	local categories = {}
+	if AssetRoster then
+		local ok, pen = pcall(AssetRoster.ReadOwnerPen, player.UserId)
+		if ok and type(pen) == "table" then
+			for _, record in pairs(pen) do
+				local item = type(record) == "table" and record.ItemData
+				if type(item) == "table" and type(item.Category) == "string" then categories[item.Category] = true end
+			end
+		end
+	end
+	local ok, profile = pcall(Save.Peek)
+	if ok and type(profile) == "table" then
+		for _, egg in pairs(profile.EggInventory or {}) do
+			if type(egg) == "table" and egg.Placement ~= nil and type(egg.AssetCategory) == "string" then
+				categories[egg.AssetCategory] = true
+			end
+		end
+	end
+	return categories
+end
+
 local function enqueueEgg(record, source)
 	if type(record) ~= "table" or type(record.Uid) ~= "string" then return false end
+	if plotAnimalCategories()[record.AssetCategory] then return false end
 	if source == "AUTO" and removedFromAuto[record.Uid] then return false end
 	if source == "MANUEL" then removedFromAuto[record.Uid] = nil end
 	if queuedEggs[record.Uid] then return false end
@@ -1041,11 +1065,12 @@ end
 
 syncQueue = function()
 	if not ready or destroyed then return end
+	local plotCategories = plotAnimalCategories()
 	for uid, entry in pairs(queuedEggs) do
 		if not currentCycle or currentCycle.uid ~= uid then
 			local record = records[uid]
 			local carriedByMe = record and record.State == "Carried" and record.CarrierUserId == player.UserId
-			if not record or ownsEgg(uid)
+			if not record or ownsEgg(uid) or plotCategories[record.AssetCategory]
 				or (not carriedByMe and record.State ~= SLOT_STATE and record.State ~= "Dropped")
 				or (record.CarrierUserId ~= nil and not carriedByMe) then
 				queuedEggs[uid] = nil
@@ -1114,6 +1139,7 @@ end
 local function pathTo(destination, token, interruptForEgg)
 	local character, humanoid, root = getCharacterParts()
 	if not root or not humanoid then return false, "personnage absent" end
+	if distanceXZ(root.Position, destination) <= 3 then return true end
 	for attempt = 1, 3 do
 		if not activityValid(token, character) then return false, "annule" end
 		local path = PathfindingService:CreatePath({AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 4})
@@ -1136,7 +1162,8 @@ local function pathTo(destination, token, interruptForEgg)
 				if waypoint.Action == Enum.PathWaypointAction.Jump then humanoid.Jump = true end
 				humanoid:MoveTo(waypoint.Position)
 				local deadline = os.clock() + math.clamp((root.Position-waypoint.Position).Magnitude / math.max(humanoid.WalkSpeed, 1) * 3 + 2, 3, 12)
-				while distanceXZ(root.Position, waypoint.Position) > 2 do
+				local arrivalRadius = index == #path:GetWaypoints() and 3 or 2
+				while distanceXZ(root.Position, waypoint.Position) > arrivalRadius do
 					if blocked or not activityValid(token, character) or humanoid.Health <= 0
 						or os.clock() > deadline then failed = true; break end
 					if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil) then
@@ -1189,10 +1216,13 @@ local function leaveTreadmill(token)
 		if treadmillAssigned then return false, "sortie du tapis non confirmee" end
 	end
 	if humanoid then humanoid.Jump = true end
-	task.wait(0.3)
 	local ok, reason = pathTo(CONFIG.FarmDeparture, token, false)
-	if ok then autoActivity = "FARM"; safeHome = CONFIG.FarmDeparture end
-	return ok, reason
+	if ok then
+		autoActivity = "FARM"; safeHome = CONFIG.FarmDeparture
+		lastDepartureArrival = os.clock()
+		log("DEPARTURE_READY", "Point de depart atteint : transition directe vers le vol")
+	end
+	return ok, reason, ok
 end
 
 local function idleOnTreadmill(token)
@@ -1281,20 +1311,22 @@ local function worker(token)
 			selected, rate = selectBest()
 		end
 		if selected then
-			local exited, exitReason = leaveTreadmill(token)
+			local exited, exitReason, reachedDeparture = leaveTreadmill(token)
 			if not exited then stopAutomation("Sortie tapis : " .. tostring(exitReason)); return end
 			if not autoEnabled or generation ~= token then return end
 			if not recovering then
 				local _, _, root = getCharacterParts()
 				if not root then stopAutomation("Personnage absent"); return end
-				if distanceXZ(root.Position, CONFIG.FarmDeparture) > 3 then
+				if not reachedDeparture and distanceXZ(root.Position, CONFIG.FarmDeparture) > 3 then
 					autoActivity = "TO_FARM"
 					setStatus("Trajet vers le point de depart...")
 					local reached, detail = pathTo(CONFIG.FarmDeparture, token, false)
 					if not reached then stopAutomation("Depart : " .. tostring(detail)); return end
+					lastDepartureArrival = os.clock()
 				end
 			end
 			autoActivity = "FARM"
+			log("FARM_START", "Delai depuis arrivee depart=%.3fs", lastDepartureArrival and (os.clock()-lastDepartureArrival) or 0)
 			local success, reason = runCycle(selected, rate, recovering)
 			if not autoEnabled or generation ~= token then return end
 			if success then
@@ -1405,6 +1437,7 @@ local function initialize()
 	GuardGeometry = loadModule("Shared.Util.GuardAreaGeometry")
 	Save = loadModule("Shared.Save")
 	PlotState = loadModule("Client.PlotState")
+	AssetRoster = loadModule("Client.AssetRoster")
 	TreadmillRemotes = loadModule("Shared.Remotes").Treadmill
 	connect(TreadmillRemotes.AssignedBeltShifted.OnClientEvent, function(id)
 		treadmillAssigned = id ~= nil
@@ -1480,11 +1513,17 @@ local function createInterface()
 	if old then old:Destroy() end
 	local source = game:GetService("StarterGui"):FindFirstChild("SellPrompt") or playerGui:FindFirstChild("SellPrompt")
 	assert(source and source:IsA("ScreenGui"), "SellPrompt est introuvable")
-	local gui = source:Clone()
+	local gui = Instance.new("ScreenGui")
 	gui.Name = "AutoSAEGui"
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.IgnoreGuiInset = false
+	for _, name in ipairs({"Frame", "Assets", "Backdrop"}) do
+		local child = source:FindFirstChild(name)
+		if child then child:Clone().Parent = gui end
+	end
 	gui.ResetOnSpawn = false
 	gui.Enabled = true
-	gui.DisplayOrder = math.max(source.DisplayOrder + 10, 100)
+	gui.DisplayOrder = 10000
 	for _, descendant in ipairs(gui:GetDescendants()) do
 		if descendant:IsA("BaseScript") then descendant:Destroy() end
 	end
@@ -1691,7 +1730,7 @@ local function createInterface()
 	gui.Parent = playerGui
 	-- Remain accessible even when the live HUD differs from the saved template.
 	local fallbackOpen = Instance.new("TextButton")
-	fallbackOpen.Name = "OpenAutoEggsFallback"
+	fallbackOpen.Name = "OpenAutoEggs"
 	fallbackOpen.AnchorPoint = Vector2.new(1, 0.5)
 	fallbackOpen.Position = UDim2.new(1, -12, 0.55, 0)
 	fallbackOpen.Size = UDim2.fromOffset(78, 54)
@@ -1917,13 +1956,15 @@ local function createInterface()
 		refreshEggInterface()
 		table.clear(mapSelection)
 		local backpackCategories = backpackEggCategories(profile)
+		local plotCategories = plotAnimalCategories()
 		local count = 0
 		for uid in pairs(cards) do
 			local record = records[uid]
 			if record and type(record.AssetCategory) == "string"
 				and Assets.Directory[record.AssetCategory]
 				and profile.Index[record.AssetCategory] ~= true
-				and not backpackCategories[record.AssetCategory] then
+				and not backpackCategories[record.AssetCategory]
+				and not plotCategories[record.AssetCategory] then
 				mapSelection[uid] = true
 				count += 1
 			end
@@ -1973,43 +2014,6 @@ local function createInterface()
 		for _, card in pairs(cards) do card.connection:Disconnect() end
 		template:Destroy()
 	end)
-	task.spawn(function()
-		local hud = playerGui:WaitForChild("HUD", 30)
-		local gameHud = hud and hud:WaitForChild("GameHUD", 30)
-		local buttons = gameHud and gameHud:WaitForChild("RightButtons", 30)
-		if not buttons or destroyed then return end
-		local existing = buttons:FindFirstChild("AutoStealButton")
-		if existing then existing:Destroy() end
-		local button = buttons:WaitForChild("EggsButton", 10)
-		if not button or destroyed then return end
-		button = button:Clone()
-		button.Name = "AutoStealButton"
-		button.LayoutOrder = 15
-		button.Visible = true
-		for _, name in ipairs({"Notification", "ReadyNotification", "NightImage", "NightText", "GamepadGlyph"}) do
-			local object = button:FindFirstChild(name)
-			if object then object:Destroy() end
-		end
-		local icon = button:FindFirstChild("ImageLabel")
-		if icon then icon.Image = "rbxassetid://103094823152347" end
-		local caption = Instance.new("TextLabel")
-		caption.Name = "AutoEggsTitle"
-		caption.BackgroundTransparency = 1
-		caption.Position = UDim2.fromScale(0, 0.72)
-		caption.Size = UDim2.fromScale(1, 0.28)
-		caption.Text = "AUTO EGGS"
-		caption.TextColor3 = Color3.new(1,1,1)
-		caption.TextScaled = true
-		caption.Font = Enum.Font.GothamBold
-		caption.ZIndex = 200
-		caption.Parent = button
-		local stroke = Instance.new("UIStroke", caption)
-		stroke.Thickness = 2
-		button.Parent = buttons
-		fallbackOpen.Visible = false
-		connect(button.Activated, function() show(not frame.Visible) end)
-		connect(gui.Destroying, function() button:Destroy() end)
-	end)
 	local elapsed = 0
 	connect(RunService.Heartbeat, function(dt)
 		elapsed += dt
@@ -2023,7 +2027,7 @@ local function createInterface()
 		end
 	end)
 	show(true)
-	log("UI_READY", "Interface PlayerGui.AutoSAEGui creee; bouton de secours disponible en attendant le HUD.")
+	log("UI_READY", "Interface autonome PlayerGui.AutoSAEGui creee avec bouton OpenAutoEggs permanent.")
 	return gui
 end
 
