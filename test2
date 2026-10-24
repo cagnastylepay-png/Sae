@@ -1,0 +1,7 @@
+local AreaEggService = require(
+    game:GetService("ServerScriptService").Controllers.AreaEggService
+)
+
+if type(AreaEggService.SpawnIntoNest) == "function" then
+    print("La fonction SpawnIntoNest existe")
+end
