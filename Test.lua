@@ -69,6 +69,8 @@ local HaulRemotes
 local lastEquipBestAt = -math.huge
 local ButterflySwarm, ButterflyFlags
 local butterflyCooldowns, butterflyRemoved = {}, {}
+local butterflySessionActive = nil -- nil: attach during an already running session
+local activityRecheckPending = false
 local lastDepartureArrival
 local treadmillAssigned, treadmillPending = false, false
 local autoActivity = "IDLE"
@@ -1184,7 +1186,7 @@ local function findButterflyNet()
 end
 
 local function selectButterfly()
-	if not CONFIG.CollectButterflies or not automaticMode or not ButterflySwarm or not ButterflyFlags then return nil end
+	if butterflySessionActive == false or not CONFIG.CollectButterflies or not automaticMode or not ButterflySwarm or not ButterflyFlags then return nil end
 	if not ButterflyFlags.Enabled:Get() or not findButterflyNet() then return nil end
 	local ok, profile = pcall(Save.Peek)
 	if not ok or not profile or not profile.Butterflies or profile.Butterflies.NetClaimed ~= true then return nil end
@@ -1312,7 +1314,7 @@ local function farmButterflies(token)
 		humanoid:EquipTool(net)
 		while activityValid(token, character) and automaticMode do
 			syncQueue()
-			if next(queuedEggs) ~= nil or wallMaintenancePending then break end
+			if next(queuedEggs) ~= nil or wallMaintenancePending or activityRecheckPending then break end
 			local target = selectButterfly()
 			if not target then break end
 			local id = target.Flight.Id
@@ -1360,6 +1362,11 @@ local function farmButterflies(token)
 		autoActivity = "FARM"
 		stopMovement()
 		return true, nil, true
+	end
+	if activityRecheckPending then
+		autoActivity = "IDLE"
+		stopMovement()
+		return true
 	end
 	autoActivity = "TO_FARM"
 	setStatus("Retour au point de depart...")
@@ -1445,7 +1452,7 @@ local function idleOnTreadmill(token)
 	if destroyed or not autoEnabled or generation ~= token then return true end
 	setStatus("TREADMILL : entrainement, attente d'un oeuf...")
 	while autoEnabled and generation == token and automaticMode and not queuePaused
-		and next(queuedEggs) == nil and selectButterfly() == nil and not destroyed do
+		and next(queuedEggs) == nil and selectButterfly() == nil and not activityRecheckPending and not destroyed do
 		serviceWallMaintenance(token)
 		syncQueue()
 		task.wait(CONFIG.ScanInterval)
@@ -1474,6 +1481,12 @@ local function worker(token)
 	local directEggApproach = false
 	while autoEnabled and generation == token and not destroyed do
 		serviceWallMaintenance(token)
+		if activityRecheckPending then
+			activityRecheckPending = false
+			syncQueue()
+			local nextMode = next(queuedEggs) ~= nil and "FARM" or (selectButterfly() and "BUTTERFLY" or "TREADMILL")
+			log("RESET_MODE_CHECK", "Reinitialisation/session : mode choisi=%s", nextMode)
+		end
 		if inFlightRequest and not inFlightRequest.done then
 			stopAutomation("Requete serveur en cours : attendre sa reponse")
 			return
@@ -1645,8 +1658,22 @@ local function initialize()
 	local butterflyOK, butterflyError = pcall(function()
 		ButterflySwarm = loadModule("Controllers.Game.AdminAbuseClientController.Events.ButterflyBloom.Swarm")
 		ButterflyFlags = loadModule("Shared.Flags.ButterflyFlags")
+		connect(remotes.Butterflies.Announce.OnClientEvent, function(kind)
+			if kind == "Start" then
+				butterflySessionActive = true
+				table.clear(butterflyCooldowns)
+				table.clear(butterflyRemoved)
+				activityRecheckPending = true
+			elseif kind == "End" then
+				butterflySessionActive = false
+				activityRecheckPending = true
+			end
+		end)
 		connect(remotes.Butterflies.Spawned.OnClientEvent, function(flight)
-			if type(flight) == "table" then butterflyRemoved[flight.Id] = nil end
+			if type(flight) == "table" then
+				butterflyRemoved[flight.Id] = nil
+				butterflySessionActive = true
+			end
 		end)
 		connect(remotes.Butterflies.Removed.OnClientEvent, function(id, reason, userId)
 			butterflyRemoved[id] = true
@@ -1664,6 +1691,8 @@ local function initialize()
 	connect(resetWall.Changed, function(sealed)
 		if sealed == true and not destroyed and automaticMode then
 			wallMaintenancePending = true
+			activityRecheckPending = true
+			log("EGG_RESET", "Reevaluation de la file, des papillons et du tapis apres le vol actif.")
 			log("WALL_CLOSED", "Ouverture des oeufs prets puis Equip Best; differe si un vol est en cours.")
 		end
 	end)
