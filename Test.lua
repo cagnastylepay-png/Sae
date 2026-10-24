@@ -50,6 +50,7 @@ local refreshEggInterface
 local selectedEggs = {}
 local automaticMode = false
 local queuedEggs = {}
+local removedFromAuto = {}
 local queuePaused = false
 local syncQueue, wakeQueue, refreshQueueInterface, startAutomation
 local stopAutomation
@@ -1011,6 +1012,8 @@ end
 
 local function enqueueEgg(record, source)
 	if type(record) ~= "table" or type(record.Uid) ~= "string" then return false end
+	if source == "AUTO" and removedFromAuto[record.Uid] then return false end
+	if source == "MANUEL" then removedFromAuto[record.Uid] = nil end
 	if queuedEggs[record.Uid] then return false end
 	if record.State ~= SLOT_STATE and record.State ~= "Dropped" then return false end
 	if record.CarrierUserId ~= nil or ownsEgg(record.Uid) then return false end
@@ -1292,7 +1295,17 @@ local function createInterface()
 	queueTab.Name = "QueueTab"
 	mapTab.Title.Text = "Map"
 	queueTab.Title.Text = "Queue"
+	local paramsTab = queueTab:Clone()
+	paramsTab.Name = "ParamsTab"
+	paramsTab.Title.Text = "Params"
+	paramsTab.Parent = tabs
+	mapTab.LayoutOrder, queueTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3
+	mapTab.Size = UDim2.fromScale(0.30, 1)
+	queueTab.Size = mapTab.Size
+	paramsTab.Size = mapTab.Size
 	local activeTab = "Map"
+	local mapSelection = selectedEggs
+	local queueSelection = {}
 	local sort = frame:WaitForChild("SortByHolder")
 	for _, name in ipairs({"Weight", "Value", "PaddingTop", "PaddingSelect"}) do
 		local object = sort:FindFirstChild(name)
@@ -1302,6 +1315,21 @@ local function createInterface()
 
 	sort.Clear.LayoutOrder = 60
 	sort.SelectAll.LayoutOrder = 50
+	local missingButton = sort.SelectAll:Clone()
+	missingButton.Name = "SelectMissingIndex"
+	missingButton.LayoutOrder = 45
+	missingButton.Parent = sort
+	for _, object in ipairs(missingButton:GetDescendants()) do
+		if object:IsA("TextLabel") then
+			object.Text = "Index manquants"
+			object.Size = UDim2.fromScale(0.92, 0.85)
+			object.Position = UDim2.fromScale(0.5, 0.5)
+			object.AnchorPoint = Vector2.new(0.5, 0.5)
+			object.TextScaled = true
+		end
+	end
+	local missingIcon = missingButton:FindFirstChild("Icon")
+	if missingIcon then missingIcon.Visible = false end
 	local autoButton = sort.SelectAll:Clone()
 	autoButton.Name = "AutomaticMode"
 	autoButton.LayoutOrder = 10
@@ -1433,77 +1461,29 @@ local function createInterface()
 	gui.Parent = playerGui
 
 
-	local queuePanel = Instance.new("Frame")
-	queuePanel.Name = "Queue"
-	queuePanel.BackgroundColor3 = Color3.fromRGB(25, 31, 43)
-	queuePanel.BackgroundTransparency = 0.1
-	queuePanel.BorderSizePixel = 0
-	queuePanel.Position = scroll.Position
-	queuePanel.Size = scroll.Size
-	queuePanel.Visible = false
-	queuePanel.ZIndex = scroll.ZIndex + 1
-	queuePanel.Parent = frame
-	Instance.new("UICorner", queuePanel).CornerRadius = UDim.new(0, 8)
-	local queueTitle = Instance.new("TextLabel")
-	queueTitle.Name = "Title"
-	queueTitle.BackgroundTransparency = 1
-	queueTitle.Size = UDim2.new(1, -8, 0, 26)
-	queueTitle.Position = UDim2.fromOffset(4, 0)
-	queueTitle.Text = "QUEUE (0)"
-	queueTitle.TextColor3 = Color3.new(1,1,1)
-	queueTitle.TextScaled = true
-	queueTitle.Font = Enum.Font.GothamBold
-	queueTitle.ZIndex = queuePanel.ZIndex + 1
-	queueTitle.Parent = queuePanel
-	local queueList = Instance.new("ScrollingFrame")
-	queueList.Name = "List"
-	queueList.BackgroundTransparency = 1
-	queueList.BorderSizePixel = 0
-	queueList.Position = UDim2.fromOffset(4, 30)
-	queueList.Size = UDim2.new(1, -8, 1, -34)
-	queueList.AutomaticCanvasSize = Enum.AutomaticSize.Y
-	queueList.CanvasSize = UDim2.new()
-	queueList.ScrollBarThickness = 4
-	queueList.ZIndex = queuePanel.ZIndex + 1
-	queueList.Parent = queuePanel
-	local queueLayout = Instance.new("UIListLayout", queueList)
-	queueLayout.SortOrder = Enum.SortOrder.LayoutOrder
-	queueLayout.Padding = UDim.new(0, 5)
-	local queueRows = {}
+	local paramsPanel = Instance.new("Frame")
+	paramsPanel.Name = "Params"
+	paramsPanel.BackgroundTransparency = 1
+	paramsPanel.Position = scroll.Position
+	paramsPanel.Size = scroll.Size
+	paramsPanel.Visible = false
+	paramsPanel.Parent = frame
+	local paramsLayout = Instance.new("UIListLayout", paramsPanel)
+	paramsLayout.Padding = UDim.new(0, 16)
+	paramsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	autoButton.Parent = paramsPanel
+	thresholdTitle.Parent = paramsPanel
+	minimumInput.Parent = paramsPanel
+	autoButton.Size = UDim2.fromScale(0.65, 0.16)
+	thresholdTitle.Size = UDim2.fromScale(0.65, 0.10)
+	minimumInput.Size = UDim2.fromScale(0.65, 0.14)
 	refreshQueueInterface = function()
-		if destroyed then return end
 		local entries = queueOrder()
-		queueTitle.Text = "QUEUE (" .. #entries .. ") - revenu decroissant"
 		queueTab.Title.Text = "Queue (" .. #entries .. ")"
-		local seen = {}
-		for rank, entry in ipairs(entries) do
-			local uid = entry.Uid
-			seen[uid] = true
-			local row = queueRows[uid]
-			if not row then
-				row = Instance.new("TextLabel")
-				row.Name = uid
-				row.Size = UDim2.new(1, -6, 0, 65)
-				row.BackgroundColor3 = Color3.fromRGB(43, 50, 65)
-				row.TextColor3 = Color3.new(1,1,1)
-				row.TextWrapped = true
-				row.TextSize = 12
-				row.Font = Enum.Font.GothamMedium
-				row.ZIndex = queueList.ZIndex + 1
-				row.Parent = queueList
-				Instance.new("UICorner", row).CornerRadius = UDim.new(0, 5)
-				queueRows[uid] = row
-			end
-			row.LayoutOrder = rank
-			local active = currentCycle and currentCycle.uid == uid
-			row.BackgroundColor3 = active and Color3.fromRGB(37, 104, 69) or Color3.fromRGB(43, 50, 65)
-			row.Text = tostring(rank) .. ". " .. getAnimalName(entry.Record)
-				.. "\n" .. formatNumber(entry.Rate) .. "/s"
-				.. "\n" .. (active and "EN COURS" or (queuePaused and "EN PAUSE" or entry.Source))
+		for uid in pairs(queueSelection) do
+			if not queuedEggs[uid] then queueSelection[uid] = nil end
 		end
-		for uid, row in pairs(queueRows) do
-			if not seen[uid] then row:Destroy(); queueRows[uid] = nil end
-		end
+		if activeTab == "Queue" and refreshEggInterface then refreshEggInterface() end
 	end
 	local pauseButton = Instance.new("TextButton")
 	pauseButton.Name = "QueuePause"
@@ -1529,8 +1509,11 @@ local function createInterface()
 
 	local function switchTab(name)
 		activeTab = name
-		scroll.Visible = name == "Map"
-		queuePanel.Visible = name == "Queue"
+		selectedEggs = name == "Queue" and queueSelection or mapSelection
+		scroll.Visible = name ~= "Params"
+		paramsPanel.Visible = name == "Params"
+		sort.Visible = name ~= "Params"
+		paramsTab.Title.TextColor3 = name == "Params" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		mapTab.Title.TextColor3 = name == "Map" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
 		queueTab.Title.TextColor3 = name == "Queue" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
 		if name == "Queue" and refreshQueueInterface then refreshQueueInterface() end
@@ -1539,6 +1522,7 @@ local function createInterface()
 	end
 	connect(mapTab.Activated, function() switchTab("Map") end)
 	connect(queueTab.Activated, function() switchTab("Queue") end)
+	connect(paramsTab.Activated, function() switchTab("Params") end)
 	switchTab("Map")
 	local cards = {}
 	local function countSelected()
@@ -1548,17 +1532,18 @@ local function createInterface()
 	end
 	local function updateSelection()
 		local count = countSelected()
-		info.Value.Text = automaticMode and ("AUTO >= " .. formatNumber(minimumRatePerSecond) .. "/s") or (tostring(count) .. (count == 1 and " oeuf" or " oeufs"))
+		info.Value.Text = activeTab == "Params" and ("AUTO >= " .. formatNumber(minimumRatePerSecond) .. "/s") or (tostring(count) .. (count == 1 and " oeuf" or " oeufs"))
 		setAutoCaption(automaticMode and "AUTO : ON" or "AUTO : OFF")
 		minimumInput.TextEditable = true
-		thresholdTitle.Visible = automaticMode
-		minimumInput.Visible = automaticMode
+		thresholdTitle.Visible = true
+		minimumInput.Visible = true
 		sort.Clear.Active = true
 		sort.SelectAll.Active = true
-		toggleButton.Title.Text = "Add"
-		toggleButton.Visible = activeTab == "Map"
-		sort.SelectAll.Visible = activeTab == "Map"
-		sort.Clear.Visible = activeTab == "Map"
+		toggleButton.Title.Text = activeTab == "Queue" and "Remove" or "Add"
+		toggleButton.Visible = activeTab ~= "Params"
+		sort.SelectAll.Visible = activeTab ~= "Params"
+		sort.Clear.Visible = activeTab ~= "Params"
+		missingButton.Visible = activeTab == "Map"
 		pauseButton.Text = queuePaused and "REPRENDRE" or "PAUSE"
 		for uid, card in pairs(cards) do
 			local checked = selectedEggs[uid] == true
@@ -1570,11 +1555,15 @@ local function createInterface()
 	refreshEggInterface = function()
 		if destroyed or not ready then updateSelection(); return end
 		local available = {}
+		if activeTab == "Queue" then
+			for _, entry in ipairs(queueOrder()) do table.insert(available, records[entry.Uid] or entry.Record) end
+		else
 		for uid, record in pairs(records) do
 			if (record.State == SLOT_STATE or record.State == "Dropped")
 				and record.CarrierUserId == nil and not ownsEgg(uid) then
 				table.insert(available, record)
 			end
+		end
 		end
 		table.sort(available, function(a, b)
 			local ar, br = getRatePerSecond(a) or 0, getRatePerSecond(b) or 0
@@ -1650,6 +1639,28 @@ local function createInterface()
 		wakeQueue()
 		updateSelection()
 	end)
+	connect(missingButton.Activated, function()
+		if activeTab ~= "Map" or not ready then return end
+		local ok, profile = pcall(Save.Peek)
+		if not ok or type(profile) ~= "table" or type(profile.Index) ~= "table" then
+			setStatus("Index indisponible : attends le chargement du profil.", Color3.fromRGB(255,130,110))
+			return
+		end
+		refreshEggInterface()
+		table.clear(mapSelection)
+		local count = 0
+		for uid in pairs(cards) do
+			local record = records[uid]
+			if record and type(record.AssetCategory) == "string"
+				and Assets.Directory[record.AssetCategory]
+				and profile.Index[record.AssetCategory] ~= true then
+				mapSelection[uid] = true
+				count += 1
+			end
+		end
+		updateSelection()
+		setStatus(tostring(count) .. " oeuf(s) d'animaux manquants selectionne(s). Clique Add.")
+	end)
 	connect(sort.Clear.Activated, function()
 		table.clear(selectedEggs)
 		updateSelection()
@@ -1659,7 +1670,23 @@ local function createInterface()
 		updateSelection()
 	end)
 	connect(toggleButton.Activated, function()
+		if activeTab == "Params" then return end
 		refreshEggInterface()
+		if activeTab == "Queue" then
+			local removed = 0
+			for uid in pairs(queueSelection) do
+				if queuedEggs[uid] then
+					queuedEggs[uid] = nil
+					removedFromAuto[uid] = true
+					removed += 1
+				end
+			end
+			table.clear(queueSelection)
+			setStatus(tostring(removed) .. " oeuf(s) retire(s). Le trajet deja en cours se termine.")
+			refreshQueueInterface()
+			updateSelection()
+			return
+		end
 		if countSelected() == 0 then setStatus("Coche au moins un oeuf puis Add."); return end
 		local added = 0
 		for uid in pairs(selectedEggs) do
