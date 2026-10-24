@@ -51,7 +51,8 @@ local renderControls
 local refreshEggInterface
 local selectedEggs = {}
 local automaticMode = true
-local autoIncludeMissingIndex = true
+local autoIncludeMissingIndex = false
+local stopAfterFlight = false
 local queuedEggs = {}
 local removedFromAuto = {}
 local queuePaused = false
@@ -1165,6 +1166,9 @@ local function treadmillRequest(remote, token)
 		local ok, result, detail = pcall(function() return remote:InvokeServer() end)
 		accepted, reason = ok and result == true, ok and detail or result
 		done, treadmillPending = true, false
+		if accepted and remote == TreadmillRemotes.AskWearStill and (destroyed or not autoEnabled or queuePaused) then
+			task.spawn(function() pcall(function() TreadmillRemotes.AskDoff:InvokeServer() end) end)
+		end
 	end)
 	local deadline = os.clock() + CONFIG.RequestTimeout
 	while not done and not destroyed and generation == token and os.clock() < deadline do task.wait(0.05) end
@@ -1229,10 +1233,33 @@ local function idleOnTreadmill(token)
 	return true
 end
 
+local function requestUserStop(reason)
+	if autoEnabled and (currentCycle ~= nil or autoActivity == "FARM") then
+		stopAfterFlight = true
+		setStatus("Arret demande : fin du vol puis pause.")
+		if renderControls then renderControls() end
+		return
+	end
+	stopAfterFlight = false
+	local wasOnTreadmill = treadmillAssigned or autoActivity == "TREADMILL" or autoActivity == "TO_TREADMILL"
+	stopAutomation(reason or "AUTO arrete")
+	autoActivity = "IDLE"
+	if wasOnTreadmill and TreadmillRemotes and not treadmillPending then
+		local stopToken = generation
+		task.spawn(function() treadmillRequest(TreadmillRemotes.AskDoff, stopToken) end)
+	end
+end
+
 local function worker(token)
 	while autoEnabled and generation == token and not destroyed do
 		if inFlightRequest and not inFlightRequest.done then
 			stopAutomation("Requete serveur en cours : attendre sa reponse")
+			return
+		end
+		if stopAfterFlight and not currentCycle then
+			stopAfterFlight = false
+			stopAutomation("Arret apres le vol")
+			autoActivity = "IDLE"
 			return
 		end
 		local carry = readCarry()
@@ -1297,6 +1324,7 @@ local function worker(token)
 		else
 			if automaticMode then
 				local ok, reason = idleOnTreadmill(token)
+				if not autoEnabled or generation ~= token then return end
 				if not ok then stopAutomation("Tapis : " .. tostring(reason)); return end
 			else
 				stopAutomation("File terminee", false)
@@ -1678,7 +1706,7 @@ local function createInterface()
 	includeMissingButton.Name = "AutoIncludeMissingIndex"
 	includeMissingButton.LayoutOrder = 40
 	includeMissingButton.Parent = paramsPanel
-	caption(includeMissingButton, "Manquants : ON")
+	caption(includeMissingButton, "Manquants : OFF")
 	connect(includeMissingButton.Activated, function()
 		autoIncludeMissingIndex = not autoIncludeMissingIndex
 		caption(includeMissingButton, autoIncludeMissingIndex and "Manquants : ON" or "Manquants : OFF")
@@ -1713,7 +1741,7 @@ local function createInterface()
 			queuePaused = false
 			wakeQueue()
 		else
-			stopAutomation("File en pause")
+			requestUserStop("File en pause")
 		end
 		if renderControls then renderControls() end
 		refreshQueueInterface()
@@ -1747,7 +1775,7 @@ local function createInterface()
 	local function updateSelection()
 		local count = countSelected()
 		info.Value.Text = activeTab == "Params" and ("AUTO >= " .. formatNumber(minimumRatePerSecond) .. "/s") or (tostring(count) .. (count == 1 and " oeuf" or " oeufs"))
-		setAutoCaption(automaticMode and "AUTO : ON" or "AUTO : OFF")
+		setAutoCaption(stopAfterFlight and "ARRET EN ATTENTE" or (automaticMode and "AUTO : ON" or "AUTO : OFF"))
 		caption(includeMissingButton, autoIncludeMissingIndex and "Manquants : ON" or "Manquants : OFF")
 		minimumInput.TextEditable = true
 		thresholdTitle.Visible = true
@@ -1849,8 +1877,14 @@ local function createInterface()
 		if not value then return end
 		minimumRatePerSecond = value * 1e9
 		automaticMode = not automaticMode
-		if automaticMode then queuePaused = false end
-		setStatus(automaticMode and "AUTO : ajout des oeufs au seuil dans la file." or "AUTO OFF : la file existante est conservee.")
+		if automaticMode then
+			stopAfterFlight = false
+			queuePaused = false
+			safeHome = CONFIG.FarmDeparture
+			setStatus("AUTO ON : trajet vers le depart ou le tapis selon la file.")
+		else
+			requestUserStop("AUTO OFF")
+		end
 		syncQueue()
 		wakeQueue()
 		updateSelection()
