@@ -11,7 +11,16 @@ local ok, result = pcall(function()
 end)
 
 if ok then
-    print("Réponse :", result)
+    if type(result) == "table" then
+        print("Succès :", result.Ok)
+        print("Message :", result.Message)
+    
+        for key, value in pairs(result) do
+            print(key, value)
+        end
+    else
+        print("Réponse :", result)
+    end
 else
     warn("Erreur :", result)
 end
