@@ -1,5 +1,5 @@
 local AreaEggService = require(
-    game:GetService("ServerScriptService").Controllers.AreaEggService
+    game:GetService("ServerScriptService").AreaEggService
 )
 
 if type(AreaEggService.SpawnIntoNest) == "function" then
