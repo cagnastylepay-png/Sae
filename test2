@@ -1,7 +1,17 @@
-local AreaEggService = require(
-    game:GetService("ServerScriptService").AreaEggService
-)
+local request = game:GetService("ReplicatedStorage")
+    .ContentCreatorRemotes.Request
 
-if type(AreaEggService.SpawnIntoNest) == "function" then
-    print("La fonction SpawnIntoNest existe")
+local ok, result = pcall(function()
+    return request:InvokeServer("spawnEgg", {
+        asset = "Kitsune",
+        zone = "Cherry Blossom",
+        size = 50,
+        randomSize = false,
+    })
+end)
+
+if ok then
+    print("Réponse :", result)
+else
+    warn("Erreur :", result)
 end
