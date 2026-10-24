@@ -51,7 +51,7 @@ local renderControls
 local refreshEggInterface
 local selectedEggs = {}
 local automaticMode = true
-local autoIncludeMissingIndex = false
+local autoIncludeMissingIndex = true
 local stopAfterFlight = false
 local queuedEggs = {}
 local removedFromAuto = {}
@@ -1851,7 +1851,7 @@ local function createInterface()
 	includeMissingButton.Name = "AutoIncludeMissingIndex"
 	includeMissingButton.LayoutOrder = 40
 	includeMissingButton.Parent = paramsPanel
-	caption(includeMissingButton, "Manquants : OFF")
+	caption(includeMissingButton, "Manquants : ON")
 	connect(includeMissingButton.Activated, function()
 		autoIncludeMissingIndex = not autoIncludeMissingIndex
 		caption(includeMissingButton, autoIncludeMissingIndex and "Manquants : ON" or "Manquants : OFF")
