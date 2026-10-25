@@ -1332,10 +1332,26 @@ local function treadmillRequest(remote, token)
 	return accepted, reason
 end
 
+local function getStartAreaDestination()
+	local world = Workspace:FindFirstChild("World")
+	local areas = world and world:FindFirstChild("Areas")
+	local area = areas and areas:FindFirstChild("StartArea")
+	local center
+	if area and area:IsA("BasePart") then
+		center = area.Position
+	elseif area and area:IsA("Model") and area:FindFirstChildWhichIsA("BasePart", true) then
+		local bounds = area:GetBoundingBox()
+		center = bounds.Position
+	end
+	if not center then return nil, "World.Areas.StartArea introuvable ou sans centre" end
+	local _, humanoid = getCharacterParts()
+	return center + Vector3.new(0, (humanoid and humanoid.HipHeight or 2) + 2, 0)
+end
+
 local function leaveTreadmill(token)
 	if not treadmillAssigned and autoActivity ~= "TREADMILL" and autoActivity ~= "TO_TREADMILL" then return true end
 	autoActivity = "LEAVING_TREADMILL"
-	setStatus("Sortie du tapis puis trajet direct vers l'oeuf...")
+	setStatus("Sortie du tapis puis trajet vers StartArea...")
 	local _, humanoid = getCharacterParts()
 	if treadmillAssigned then
 		local ok, reason = treadmillRequest(TreadmillRemotes.AskDoff, token)
@@ -1347,7 +1363,7 @@ local function leaveTreadmill(token)
 	if humanoid then humanoid.Jump = true end
 	autoActivity = "FARM"
 	safeHome = CONFIG.FarmDeparture
-	log("TREADMILL_EXIT_READY", "Sortie confirmee : trajet direct vers l'oeuf")
+	log("TREADMILL_EXIT_READY", "Sortie confirmee : pathfinding vers le centre de StartArea")
 	return true
 end
 
@@ -1494,8 +1510,18 @@ local function worker(token)
 			local exited, exitReason = leaveTreadmill(token)
 			if not exited then stopAutomation("Sortie tapis : " .. tostring(exitReason)); return end
 			if not autoEnabled or generation ~= token then return end
+			if not recovering then
+				local destination, destinationReason = getStartAreaDestination()
+				if not destination then stopAutomation(destinationReason); return end
+				autoActivity = "TO_FARM"
+				setStatus("Trajet vers le centre de StartArea...")
+				log("START_AREA_PATH", "Destination=%s", formatPosition(destination))
+				local reached, reason = pathTo(destination, token, false)
+				if not reached then stopAutomation("StartArea : " .. tostring(reason)); return end
+			end
+			if not autoEnabled or generation ~= token then return end
 			autoActivity = "FARM"
-			log("FARM_START", "UID=%s : trajet direct vers l'oeuf, sans detour au depart", selected.Uid)
+			log("FARM_START", "UID=%s : sortie StartArea atteinte, trajet vers l'oeuf", selected.Uid)
 			local success, reason = runCycle(selected, rate, recovering)
 			if not autoEnabled or generation ~= token then return end
 			if success then
@@ -2225,7 +2251,7 @@ local function createInterface()
 			stopAfterFlight = false
 			queuePaused = false
 			safeHome = CONFIG.FarmDeparture
-			setStatus("AUTO ON : trajet direct vers l'oeuf ou pathfinding vers le tapis selon la file.")
+			setStatus("AUTO ON : pathfinding vers StartArea ou le tapis selon la file.")
 		else
 			requestUserStop("AUTO OFF")
 		end
