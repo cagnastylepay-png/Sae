@@ -57,6 +57,7 @@ local autoIncludeMissingIndex = true
 local stopAfterFlight = false
 local queuedEggs = {}
 local removedFromAuto = {}
+local queueDecisionLogs = {}
 local queuePaused = false
 local syncQueue, wakeQueue, refreshQueueInterface, startAutomation
 local stopAutomation
@@ -86,6 +87,12 @@ local function log(stage, message, ...)
 	end
 	print(string.format("[Auto_SAE][%04d][%.3f][%s][%s] %s",
 		sequence, os.clock(), stage, currentCycle and currentCycle.uid or "-", text))
+end
+
+local function logQueueDecision(uid, decision)
+	if queueDecisionLogs[uid] == decision then return end
+	queueDecisionLogs[uid] = decision
+	log("QUEUE_DECISION", "UID=%s %s", uid, decision)
 end
 
 local function setStatus(text, color)
@@ -1091,10 +1098,14 @@ local function plotAnimalCategories()
 end
 
 local function enqueueEgg(record, source)
-	if type(record) == "table" and record.IsHalloweenObservation then return false end
 	if type(record) ~= "table" or type(record.Uid) ~= "string" then return false end
-	if plotAnimalCategories()[record.AssetCategory] then return false end
-	if (source == "AUTO" or source == "INDEX") and removedFromAuto[record.Uid] then return false end
+	local function reject(reason)
+		if source == "AUTO" then logQueueDecision(record.Uid, reason) end
+		return false
+	end
+	if record.IsHalloweenObservation then return reject("EXCLU : Halloween en observation") end
+	if plotAnimalCategories()[record.AssetCategory] then return reject("EXCLU : espece deja presente dans ton plot") end
+	if (source == "AUTO" or source == "INDEX") and removedFromAuto[record.Uid] then return reject("EXCLU : retire manuellement de la file") end
 	if source == "MANUEL" then removedFromAuto[record.Uid] = nil end
 	if source == "INDEX" then
 		if currentCycle and currentCycle.record and currentCycle.record.AssetCategory == record.AssetCategory then return false end
@@ -1102,10 +1113,15 @@ local function enqueueEgg(record, source)
 			if entry.Record.AssetCategory == record.AssetCategory then return false end
 		end
 	end
-	if queuedEggs[record.Uid] then return false end
-	if record.State ~= SLOT_STATE and record.State ~= "Dropped" then return false end
-	if record.CarrierUserId ~= nil or ownsEgg(record.Uid) then return false end
+	if queuedEggs[record.Uid] then
+		if source == "AUTO" then logQueueDecision(record.Uid, "EN FILE | Auto=" .. tostring(autoEnabled) .. " Pause=" .. tostring(queuePaused) .. " Activite=" .. autoActivity) end
+		return false
+	end
+	if record.State ~= SLOT_STATE and record.State ~= "Dropped" then return reject("EXCLU : etat=" .. tostring(record.State)) end
+	if record.CarrierUserId ~= nil then return reject("EXCLU : porte par " .. tostring(record.CarrierUserId)) end
+	if ownsEgg(record.Uid) then return reject("EXCLU : oeuf deja possede") end
 	queuedEggs[record.Uid] = {Record = record, Rate = getRatePerSecond(record) or 0, Source = source}
+	logQueueDecision(record.Uid, "AJOUT " .. source .. " | revenu=" .. tostring(queuedEggs[record.Uid].Rate) .. " seuil=" .. tostring(minimumRatePerSecond))
 	return true
 end
 
