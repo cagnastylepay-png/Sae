@@ -1557,12 +1557,14 @@ local function activityValid(token, character)
 		and player.Character == character
 end
 
-local function moveActivity(destination, token, interruptForEgg)
+local function moveActivity(destination, token, interruptForEgg, nextDestination)
 	local character, humanoid, root = getCharacterParts()
 	if not character or not humanoid or not root then return false, "personnage absent" end
-	local deadline = os.clock() + math.clamp(distanceXZ(root.Position, destination) / math.max(humanoid.WalkSpeed, 1) * 3 + 5, 8, 30)
-	local nextMove = 0
-	while distanceXZ(root.Position, destination) > 3 do
+	local started = os.clock()
+	local deadline = started + math.clamp(distanceXZ(root.Position, destination) / math.max(humanoid.WalkSpeed, 1) * 3 + 5, 8, 30)
+	local previous = root.Position
+	local nextCommand = 0
+	while true do
 		if not activityValid(token, character) or humanoid.Health <= 0 then
 			stopMovement()
 			return false, "annule"
@@ -1571,18 +1573,38 @@ local function moveActivity(destination, token, interruptForEgg)
 			stopMovement()
 			return false, "nouvel oeuf"
 		end
-		if os.clock() >= deadline then
-			stopMovement()
-			return false, "MoveTo : destination non atteinte"
-		end
-		if os.clock() >= nextMove then
+		local now = os.clock()
+		local current = root.Position
+		local distance = distanceXZ(current, destination)
+		if distance <= 3 then
 			move(destination, {Radius = 3})
-			nextMove = os.clock() + CONFIG.MoveRefresh
+			log("ACTIVITY_ARRIVED", "Activite=%s Distance=%.2f DureeMs=%.1f", autoActivity, distance, (now-started)*1000)
+			if typeof(nextDestination) == "Vector3" then
+				move(nextDestination, {Radius = CONFIG.PreciseArrivalRadius})
+				log("ACTIVITY_CHAIN", "Depart->oeuf : commande envoyee dans la meme frame que le freinage")
+			end
+			return true
 		end
-		task.wait(0.05)
+		if now >= deadline then stopMovement(true); return false, "MoveTo : destination non atteinte" end
+		if not motionBlockReason({character = character}) then
+			local segment = Vector3.new(current.X-previous.X,0,current.Z-previous.Z)
+			local offset = Vector3.new(destination.X-previous.X,0,destination.Z-previous.Z)
+			if segment.Magnitude > 0.01 then
+				local projection = offset:Dot(segment)/segment:Dot(segment)
+				if projection > 0 and projection < 1 and (offset-segment*projection).Magnitude <= 3 then
+					stopMovement(true)
+					nextCommand = 0
+					log("ACTIVITY_OVERSHOOT_BRAKE", "Activite=%s Distance=%.2f : depassement freine", autoActivity, distance)
+				end
+			end
+			if distance < 100 or now >= nextCommand then
+				move(destination, {Radius = 3})
+				nextCommand = now + CONFIG.MoveRefresh
+			end
+		end
+		previous = current
+		RunService.Heartbeat:Wait()
 	end
-	move(destination, {Radius = 3})
-	return true
 end
 
 -- Serialize treadmill requests, including late replies after a timeout.
@@ -1686,7 +1708,7 @@ local function idleOnTreadmill(token)
 			return false, reason
 		end
 		-- The normal controller detects entry with its downward raycast.
-		local deadline = os.clock() + 3
+		local deadline = os.clock() + 0.35
 		while not treadmillAssigned and autoEnabled and generation == token and os.clock() < deadline
 			and next(queuedEggs) == nil do task.wait(0.1) end
 		if not treadmillAssigned and automaticMode and next(queuedEggs) == nil then
@@ -1774,7 +1796,9 @@ local function worker(token)
 				autoActivity = "TO_FARM"
 				setStatus("Trajet vers le centre de StartArea...")
 				log("START_AREA_MOVETO", "Trajet direct vers %s", formatPosition(destination))
-				local reached, reason = measureAction("TRAJET_STARTAREA", moveActivity, destination, token)
+				local eggPosition = getRecordPosition(records[selected.Uid] or selected)
+				local nextDestination = eggPosition and Vector3.new(eggPosition.X, destination.Y, eggPosition.Z)
+				local reached, reason = measureAction("TRAJET_STARTAREA", moveActivity, destination, token, false, nextDestination)
 				if not reached then stopAutomation("StartArea : " .. tostring(reason)); return end
 			end
 			if not autoEnabled or generation ~= token then return end
