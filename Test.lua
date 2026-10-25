@@ -1168,7 +1168,7 @@ local function enqueueEgg(record, source)
 		return false
 	end
 	if record.IsHalloweenObservation then return reject("EXCLU : Halloween en observation") end
-	if plotAnimalCategories()[record.AssetCategory] then return reject("EXCLU : espece deja presente dans ton plot") end
+	if source == "INDEX" and plotAnimalCategories()[record.AssetCategory] then return reject("EXCLU : espece deja presente dans ton plot") end
 	if (source == "AUTO" or source == "INDEX") and removedFromAuto[record.Uid] then return reject("EXCLU : retire manuellement de la file") end
 	if source == "MANUEL" then removedFromAuto[record.Uid] = nil end
 	if source == "INDEX" then
@@ -1197,7 +1197,7 @@ syncQueue = function()
 		if not currentCycle or currentCycle.uid ~= uid then
 			local record = records[uid]
 			local carriedByMe = record and record.State == "Carried" and record.CarrierUserId == player.UserId
-			if not record or ownsEgg(uid) or plotCategories[record.AssetCategory]
+			if not record or ownsEgg(uid) or (entry.Source == "INDEX" and plotCategories[record.AssetCategory])
 				or (not carriedByMe and record.State ~= SLOT_STATE and record.State ~= "Dropped")
 				or (record.CarrierUserId ~= nil and not carriedByMe) then
 				queuedEggs[uid] = nil
