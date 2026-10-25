@@ -7,14 +7,14 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
 local PathfindingService = game:GetService("PathfindingService")
+local UserInputService = game:GetService("UserInputService")
+local CollectionService = game:GetService("CollectionService")
 local player = Players.LocalPlayer
 assert(player, "Auto_SAE doit etre execute sur le client")
 
 local CONFIG = {
 	Debug = true,
 	FarmDeparture = Vector3.new(519, 71, -387),
-	CollectButterflies = true,
-	ButterflyTargetTimeout = 20,
 	ProgressInterval = 0.5,
 	MoveRefresh = 0.1,
 	ApproachRefresh = 4,
@@ -67,10 +67,10 @@ local hatchInProgress = false
 local wallMaintenancePending = false
 local HaulRemotes
 local lastEquipBestAt = -math.huge
-local ButterflySwarm, ButterflyFlags
-local butterflyCooldowns, butterflyRemoved = {}, {}
-local butterflySessionActive = nil -- nil: attach during an already running session
+local detectedMode = player:GetAttribute("InHalloweenDimension") == true and "Halloween" or "Normal"
+local halloweenRecords = {}
 local activityRecheckPending = false
+local refreshBestEggCard
 local lastDepartureArrival
 local treadmillAssigned, treadmillPending = false, false
 local autoActivity = "IDLE"
@@ -182,7 +182,7 @@ local function isSafe(position)
 end
 
 local function validCycle(ctx)
-	if destroyed or not autoEnabled or generation ~= ctx.generation or currentCycle ~= ctx then
+	if detectedMode ~= "Normal" or destroyed or not autoEnabled or generation ~= ctx.generation or currentCycle ~= ctx then
 		return false, "annule"
 	end
 	local character, humanoid, root = getCharacterParts()
@@ -314,6 +314,7 @@ local function getAnimalName(record)
 end
 
 local function getRatePerSecond(record)
+	if type(record) == "table" and record.IsHalloweenObservation then return record.ObservedRate end
 	if type(record) ~= "table" then
 		return nil
 	end
@@ -351,6 +352,33 @@ local function getWeightKg(record)
 	end
 
 	return nil
+end
+
+local function refreshHalloweenRecords()
+	local updated, seen = {}, {}
+	local map = Workspace:FindFirstChild("HalloweenDimension")
+	local folder = map and map:FindFirstChild("WorldEggs")
+	local models = folder and folder:GetChildren() or {}
+	for _, model in ipairs(CollectionService:GetTagged("HalloweenWorldEgg")) do table.insert(models, model) end
+	for _, model in ipairs(models) do
+		if not seen[model] and model:IsA("Model") and model:IsDescendantOf(Workspace) then
+			seen[model] = true
+			local uid = model:GetAttribute("HalloweenEggUid")
+			if type(uid) == "string" then
+				local category = model:GetAttribute("AssetCategory") or model:GetAttribute("PreparedSourceName")
+				local rate = model:GetAttribute("MoneyPerSecond")
+				updated[uid] = {
+					Uid = uid, AssetCategory = type(category) == "string" and category or "Halloween Egg",
+					AssetScale = model:GetAttribute("AssetScale"),
+					BottomCFrame = model:GetPivot(), AreaId = "Halloween", Zone = model:GetAttribute("Zone"),
+					State = model:GetAttribute("HalloweenEggCanPickUp") == true and "Slot" or "Unavailable",
+					Mutations = {}, IsHalloweenObservation = true,
+					ObservedRate = type(rate) == "number" and rate or nil,
+				}
+			end
+		end
+	end
+	halloweenRecords = updated
 end
 
 local function getRecordPosition(record)
@@ -1063,6 +1091,7 @@ local function plotAnimalCategories()
 end
 
 local function enqueueEgg(record, source)
+	if type(record) == "table" and record.IsHalloweenObservation then return false end
 	if type(record) ~= "table" or type(record.Uid) ~= "string" then return false end
 	if plotAnimalCategories()[record.AssetCategory] then return false end
 	if (source == "AUTO" or source == "INDEX") and removedFromAuto[record.Uid] then return false end
@@ -1082,6 +1111,7 @@ end
 
 syncQueue = function()
 	if not ready or destroyed then return end
+	refreshHalloweenRecords()
 	local plotCategories = plotAnimalCategories()
 	for uid, entry in pairs(queuedEggs) do
 		if not currentCycle or currentCycle.uid ~= uid then
@@ -1168,44 +1198,8 @@ stopAutomation = function(reason, pause)
 end
 
 local function activityValid(token, character)
-	return not destroyed and autoEnabled and generation == token and not queuePaused
+	return detectedMode == "Normal" and not destroyed and autoEnabled and generation == token and not queuePaused
 		and player.Character == character
-end
-
-local BUTTERFLY_RANK = {Green = 1, Blue = 2, Purple = 3, Golden = 4}
-
-local function findButterflyNet()
-	for _, container in pairs({Character = player.Character, Backpack = player:FindFirstChildOfClass("Backpack")}) do
-		if container then
-			for _, tool in ipairs(container:GetChildren()) do
-				if tool:IsA("Tool") and tool:GetAttribute("ButterflyNet") == true then return tool end
-			end
-		end
-	end
-	return nil
-end
-
-local function selectButterfly()
-	if butterflySessionActive == false or not CONFIG.CollectButterflies or not automaticMode or not ButterflySwarm or not ButterflyFlags then return nil end
-	if not ButterflyFlags.Enabled:Get() or not findButterflyNet() then return nil end
-	local ok, profile = pcall(Save.Peek)
-	if not ok or not profile or not profile.Butterflies or profile.Butterflies.NetClaimed ~= true then return nil end
-	local _, _, root = getCharacterParts()
-	if not root then return nil end
-	local best, bestRank, bestDistance, bestId = nil, -1, math.huge, nil
-	for id, state in pairs(ButterflySwarm.Each()) do
-		local flight = state.Flight
-		local rank = flight and BUTTERFLY_RANK[flight.Tier]
-		if rank and typeof(state.Position) == "Vector3" and (state.Alpha or 0) >= 0.5
-			and not butterflyRemoved[id] and (butterflyCooldowns[id] or 0) <= os.clock() then
-			local distance = (state.Position - root.Position).Magnitude
-			if rank > bestRank or (rank == bestRank and (distance < bestDistance
-				or (distance == bestDistance and tostring(id) < tostring(bestId)))) then
-				best, bestRank, bestDistance, bestId = state, rank, distance, id
-			end
-		end
-	end
-	return best
 end
 
 local function pathTo(destination, token, interruptForEgg)
@@ -1226,7 +1220,7 @@ local function pathTo(destination, token, interruptForEgg)
 			for index, waypoint in ipairs(path:GetWaypoints()) do
 				currentIndex = index
 				if not activityValid(token, character) then failed = true; break end
-				if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil or selectButterfly() ~= nil) then
+				if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil) then
 					connection:Disconnect()
 					stopMovement()
 					return false, "nouvel oeuf"
@@ -1238,7 +1232,7 @@ local function pathTo(destination, token, interruptForEgg)
 				while distanceXZ(root.Position, waypoint.Position) > arrivalRadius do
 					if blocked or not activityValid(token, character) or humanoid.Health <= 0
 						or os.clock() > deadline then failed = true; break end
-					if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil or selectButterfly() ~= nil) then
+					if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil) then
 						connection:Disconnect()
 						stopMovement()
 						return false, "nouvel oeuf"
@@ -1295,84 +1289,6 @@ local function leaveTreadmill(token)
 		log("DEPARTURE_READY", "Point de depart atteint : transition directe vers le vol")
 	end
 	return ok, reason, ok
-end
-
-local function farmButterflies(token)
-	local exited, reason = leaveTreadmill(token)
-	if not exited then return false, reason end
-	local character, humanoid, root = getCharacterParts()
-	if not root or not humanoid then return false, "personnage absent" end
-	local net = findButterflyNet()
-	if not net then return false, "filet indisponible" end
-	local previousTools = {}
-	for _, tool in ipairs(character:GetChildren()) do
-		if tool:IsA("Tool") and tool ~= net then table.insert(previousTools, tool) end
-	end
-	autoActivity = "BUTTERFLY"
-	local lastCommand, lastSwing, activeId, targetStarted = -math.huge, -math.huge, nil, 0
-	local ok, failure = xpcall(function()
-		humanoid:EquipTool(net)
-		while activityValid(token, character) and automaticMode do
-			syncQueue()
-			if next(queuedEggs) ~= nil or wallMaintenancePending or activityRecheckPending then break end
-			local target = selectButterfly()
-			if not target then break end
-			local id = target.Flight.Id
-			local now = os.clock()
-			if id ~= activeId then
-				activeId, targetStarted, lastCommand = id, now, -math.huge
-				log("BUTTERFLY_TARGET", "Id=%s Rarete=%s", tostring(id), tostring(target.Flight.Tier))
-			end
-			if now - targetStarted >= CONFIG.ButterflyTargetTimeout then
-				butterflyCooldowns[id] = now + 5
-				activeId = nil
-			elseif not motionBlockReason({character = character}) then
-				if net.Parent ~= character then humanoid:EquipTool(net) end
-				local reach = ButterflyFlags.NetReach:Get()
-				local distance = (root.Position - target.Position).Magnitude
-				setStatus("PAPILLON : " .. tostring(target.Flight.Tier))
-				if distance > reach * 0.65 then
-					if now - lastCommand >= CONFIG.MoveRefresh then
-						lastCommand = now
-						humanoid:MoveTo(Vector3.new(target.Position.X, root.Position.Y, target.Position.Z))
-					end
-				else
-					humanoid:MoveTo(root.Position)
-					-- Use the real tool; its client controller handles range, animation and server verdict.
-					if not ButterflyFlags.AutoSwing:Get() and now - lastSwing >= ButterflyFlags.SwingCooldownSeconds:Get() then
-						lastSwing = now
-						net:Activate()
-					end
-				end
-			else
-				stopMovement()
-			end
-			task.wait(0.05)
-		end
-	end, debug.traceback)
-	if player.Character == character and humanoid.Health > 0 then
-		if net.Parent == character then humanoid:UnequipTools() end
-		for _, tool in ipairs(previousTools) do
-			if tool.Parent == player:FindFirstChildOfClass("Backpack") then humanoid:EquipTool(tool); break end
-		end
-	end
-	if not activityValid(token, character) then return false, "annule" end
-	if not ok then log("BUTTERFLY_ERROR", "%s", tostring(failure)) end
-	if next(queuedEggs) ~= nil then
-		autoActivity = "FARM"
-		stopMovement()
-		return true, nil, true
-	end
-	if activityRecheckPending then
-		autoActivity = "IDLE"
-		stopMovement()
-		return true
-	end
-	autoActivity = "TO_FARM"
-	setStatus("Retour au point de depart...")
-	local returned, detail = pathTo(CONFIG.FarmDeparture, token, false)
-	if returned then autoActivity = "IDLE"; safeHome = CONFIG.FarmDeparture end
-	return returned, detail
 end
 
 local function hatchReadyEggsOnWallClose(token)
@@ -1439,8 +1355,8 @@ local function idleOnTreadmill(token)
 		-- The normal controller detects entry with its downward raycast.
 		local deadline = os.clock() + 3
 		while not treadmillAssigned and autoEnabled and generation == token and os.clock() < deadline
-			and next(queuedEggs) == nil and selectButterfly() == nil do task.wait(0.1) end
-		if not treadmillAssigned and automaticMode and next(queuedEggs) == nil and selectButterfly() == nil then
+			and next(queuedEggs) == nil do task.wait(0.1) end
+		if not treadmillAssigned and automaticMode and next(queuedEggs) == nil then
 			local accepted, detail = treadmillRequest(TreadmillRemotes.AskWearStill, token)
 			if not accepted and not treadmillAssigned then return false, tostring(detail or "entree tapis refusee") end
 			deadline = os.clock() + 5
@@ -1452,7 +1368,7 @@ local function idleOnTreadmill(token)
 	if destroyed or not autoEnabled or generation ~= token then return true end
 	setStatus("TREADMILL : entrainement, attente d'un oeuf...")
 	while autoEnabled and generation == token and automaticMode and not queuePaused
-		and next(queuedEggs) == nil and selectButterfly() == nil and not activityRecheckPending and not destroyed do
+		and next(queuedEggs) == nil and not activityRecheckPending and not destroyed do
 		serviceWallMaintenance(token)
 		syncQueue()
 		task.wait(CONFIG.ScanInterval)
@@ -1478,13 +1394,12 @@ local function requestUserStop(reason)
 end
 
 local function worker(token)
-	local directEggApproach = false
 	while autoEnabled and generation == token and not destroyed do
 		serviceWallMaintenance(token)
 		if activityRecheckPending then
 			activityRecheckPending = false
 			syncQueue()
-			local nextMode = next(queuedEggs) ~= nil and "FARM" or (selectButterfly() and "BUTTERFLY" or "TREADMILL")
+			local nextMode = next(queuedEggs) ~= nil and "FARM" or "TREADMILL"
 			log("RESET_MODE_CHECK", "Reinitialisation/session : mode choisi=%s", nextMode)
 		end
 		if inFlightRequest and not inFlightRequest.done then
@@ -1522,7 +1437,7 @@ local function worker(token)
 			if not recovering then
 				local _, _, root = getCharacterParts()
 				if not root then stopAutomation("Personnage absent"); return end
-				if not recovering and not directEggApproach and not reachedDeparture and distanceXZ(root.Position, CONFIG.FarmDeparture) > 3 then
+				if not reachedDeparture and distanceXZ(root.Position, CONFIG.FarmDeparture) > 3 then
 					autoActivity = "TO_FARM"
 					setStatus("Trajet vers le point de depart...")
 					local reached, detail = pathTo(CONFIG.FarmDeparture, token, false)
@@ -1531,7 +1446,6 @@ local function worker(token)
 				end
 			end
 			autoActivity = "FARM"
-			directEggApproach = false
 			log("FARM_START", "Delai depuis arrivee depart=%.3fs", lastDepartureArrival and (os.clock()-lastDepartureArrival) or 0)
 			local success, reason = runCycle(selected, rate, recovering)
 			if not autoEnabled or generation ~= token then return end
@@ -1559,11 +1473,6 @@ local function worker(token)
 					return
 				end
 			end
-		elseif selectButterfly() ~= nil then
-			local ok, reason, directToEgg = farmButterflies(token)
-			directEggApproach = directToEgg == true
-			if not autoEnabled or generation ~= token then return end
-			if not ok then stopAutomation("Papillons : " .. tostring(reason)); return end
 		else
 			if automaticMode then
 				local ok, reason = idleOnTreadmill(token)
@@ -1579,6 +1488,7 @@ local function worker(token)
 end
 
 startAutomation = function(billions)
+	if detectedMode ~= "Normal" then setStatus("Mode Halloween : observation uniquement."); return false end
 	if destroyed or not ready then
 		setStatus("Les modules du jeu sont indisponibles", Color3.fromRGB(255, 130, 110))
 		return false
@@ -1620,7 +1530,7 @@ startAutomation = function(billions)
 end
 
 wakeQueue = function()
-	if destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
+	if detectedMode ~= "Normal" or destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
 	if inFlightRequest and not inFlightRequest.done then return end
 	startAutomation(minimumRatePerSecond / 1e9)
 end
@@ -1655,44 +1565,26 @@ local function initialize()
 	TreadmillRemotes = remotes.Treadmill
 	HaulRemotes = remotes.Haul
 	-- Optional event support must not prevent the egg interface from starting.
-	local butterflyOK, butterflyError = pcall(function()
-		ButterflySwarm = loadModule("Controllers.Game.AdminAbuseClientController.Events.ButterflyBloom.Swarm")
-		ButterflyFlags = loadModule("Shared.Flags.ButterflyFlags")
-		connect(remotes.Butterflies.Announce.OnClientEvent, function(kind)
-			if kind == "Start" then
-				butterflySessionActive = true
-				table.clear(butterflyCooldowns)
-				table.clear(butterflyRemoved)
-				activityRecheckPending = true
-			elseif kind == "End" then
-				butterflySessionActive = false
-				activityRecheckPending = true
-			end
-		end)
-		connect(remotes.Butterflies.Spawned.OnClientEvent, function(flight)
-			if type(flight) == "table" then
-				butterflyRemoved[flight.Id] = nil
-				butterflySessionActive = true
-			end
-		end)
-		connect(remotes.Butterflies.Removed.OnClientEvent, function(id, reason, userId)
-			butterflyRemoved[id] = true
-			butterflyCooldowns[id] = nil
-			if reason == "Caught" and userId == player.UserId then
-				log("BUTTERFLY_CAUGHT", "Capture confirmee Id=%s", tostring(id))
-			end
-		end)
-	end)
-	if not butterflyOK then
-		ButterflySwarm, ButterflyFlags = nil, nil
-		log("BUTTERFLY_UNAVAILABLE", "%s", tostring(butterflyError))
+	local function updateWorldMode()
+		local nextMode = player:GetAttribute("InHalloweenDimension") == true and "Halloween" or "Normal"
+		if nextMode ~= detectedMode then
+			detectedMode = nextMode
+			if autoEnabled then stopAutomation("Changement de monde : " .. detectedMode, false) end
+			autoActivity = "IDLE"
+			activityRecheckPending = true
+			if detectedMode == "Normal" then syncQueue(); wakeQueue() end
+		end
+		if detectedMode == "Halloween" then setStatus("Mode Halloween : observation uniquement, trajets non actives.") end
+		if renderControls then renderControls() end
 	end
+	connect(player:GetAttributeChangedSignal("InHalloweenDimension"), updateWorldMode)
+	updateWorldMode()
 	local resetWall = loadModule("Client.AreaEggResetWall")
 	connect(resetWall.Changed, function(sealed)
 		if sealed == true and not destroyed and automaticMode then
 			wallMaintenancePending = true
 			activityRecheckPending = true
-			log("EGG_RESET", "Reevaluation de la file, des papillons et du tapis apres le vol actif.")
+			log("EGG_RESET", "Reevaluation de la file et du tapis apres le vol actif.")
 			log("WALL_CLOSED", "Ouverture des oeufs prets puis Equip Best; differe si un vol est en cours.")
 		end
 	end)
@@ -1759,6 +1651,7 @@ local function initialize()
 	syncQueue()
 	wakeQueue()
 	if refreshEggInterface then refreshEggInterface() end
+	if refreshBestEggCard then refreshBestEggCard() end
 	log("READY", "Build=2.4 | MoveTo renouvele / freinage horizontal / distance 3D <= 8 / %d essais en serie / retour / inventaire / reprise meme UID", CONFIG.MaxCarryAttempts)
 end
 
@@ -1971,6 +1864,28 @@ local function createInterface()
 	for _, object in ipairs(info:GetChildren()) do
 		if object.Name == "ShadowDecor" then object.Visible = false end
 	end
+	local function paintEggCard(visual, record)
+		local config = getAssetConfig(record)
+		local icon = config and config.Egg and config.Egg.Icon
+		visual.Icon.Image = icon or "rbxassetid://103094823152347"
+		local rate = getRatePerSecond(record)
+		visual.Amount.Text = rate and (formatNumber(rate) .. "/s") or "?"
+		local weight = getWeightKg(record)
+		visual.Weight.Text = weight and string.format("%.1f kg", weight) or ""
+		local valueHolder = visual:FindFirstChild("ValueHolder")
+		if valueHolder then
+			valueHolder.Value.Text = getAnimalName(record)
+			valueHolder.Value.Size = UDim2.fromScale(0.95, 0.9)
+			valueHolder.Value.Position = UDim2.fromScale(0.5, 0.5)
+			valueHolder.Value.AnchorPoint = Vector2.new(0.5, 0.5)
+			valueHolder.Value.TextScaled = true
+			if valueHolder:FindFirstChild("Icon") then valueHolder.Icon.Visible = false end
+		end
+		if record.IsHalloweenObservation then
+			visual.Weight.Text = "Halloween - Zone " .. tostring(record.Zone or "?")
+			visual.Amount.Text = record.ObservedRate and (formatNumber(record.ObservedRate) .. "/s") or "Revenu inconnu"
+		end
+	end
 	local backdrop = gui:FindFirstChild("Backdrop")
 	local hudToggle = gui:FindFirstChild("HudToggle")
 	if hudToggle then hudToggle:Destroy() end
@@ -1985,25 +1900,82 @@ local function createInterface()
 		connect(backdrop.Activated, function() show(false) end)
 	end
 	gui.Parent = playerGui
-	-- Remain accessible even when the live HUD differs from the saved template.
-	local fallbackOpen = Instance.new("TextButton")
-	fallbackOpen.Name = "OpenAutoEggs"
-	fallbackOpen.AnchorPoint = Vector2.new(1, 0.5)
-	fallbackOpen.Position = UDim2.new(1, -12, 0.55, 0)
-	fallbackOpen.Size = UDim2.fromOffset(78, 54)
-	fallbackOpen.BackgroundColor3 = Color3.fromRGB(73, 190, 35)
-	fallbackOpen.TextColor3 = Color3.new(1, 1, 1)
-	fallbackOpen.Font = Enum.Font.GothamBold
-	fallbackOpen.Text = "AUTO\nEGGS"
-	fallbackOpen.TextSize = 16
-	fallbackOpen.AutoLocalize = false
-	fallbackOpen.ZIndex = 1000
-	fallbackOpen.Parent = gui
-	Instance.new("UICorner", fallbackOpen).CornerRadius = UDim.new(0, 8)
-	local fallbackStroke = Instance.new("UIStroke", fallbackOpen)
-	fallbackStroke.Thickness = 2
-	connect(fallbackOpen.Activated, function() show(not frame.Visible) end)
-
+	local mainCard = template:Clone()
+	mainCard.Name = "BestEggLauncher"
+	mainCard.Visible = true
+	mainCard.AnchorPoint = Vector2.new(1, 0)
+	mainCard.Position = UDim2.new(1, -16, 0, 16)
+	mainCard.Size = UDim2.fromOffset(120, 145)
+	mainCard.ZIndex = 1000
+	mainCard.Parent = gui
+	for _, object in ipairs(mainCard:GetDescendants()) do
+		if object:IsA("GuiObject") then object.ZIndex += 1000 end
+	end
+	mainCard.SelectedOverlay.Visible = false
+	mainCard.SelectedIcon.Visible = false
+	local openCard = Instance.new("TextButton")
+	openCard.Name = "OpenAutoEggs"
+	openCard.BackgroundTransparency = 1
+	openCard.Text = ""
+	openCard.Size = UDim2.fromScale(1, 1)
+	openCard.ZIndex = 2000
+	openCard.Parent = mainCard
+	local dragInput, dragStart, dragPosition, dragging, moved, suppressClickUntil
+	suppressClickUntil = 0
+	connect(openCard.InputBegan, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput, dragStart, dragPosition = input, input.Position, mainCard.Position
+			dragging, moved = true, false
+		end
+	end)
+	connect(UserInputService.InputChanged, function(input)
+		if not dragging then return end
+		if input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement then
+			local delta = input.Position - dragStart
+			if delta.Magnitude > 6 then moved = true end
+			if moved then
+				local viewport = gui.AbsoluteSize
+				local minX = math.min(mainCard.AbsoluteSize.X, viewport.X)
+				local x = math.clamp(dragPosition.X.Scale * viewport.X + dragPosition.X.Offset + delta.X, minX, viewport.X)
+				local y = math.clamp(dragPosition.Y.Scale * viewport.Y + dragPosition.Y.Offset + delta.Y, 0, math.max(0, viewport.Y-mainCard.AbsoluteSize.Y))
+				mainCard.Position = UDim2.fromOffset(x, y)
+			end
+		end
+	end)
+	connect(UserInputService.InputEnded, function(input)
+		if input == dragInput or (dragging and input.UserInputType == Enum.UserInputType.MouseButton1) then
+			if moved then suppressClickUntil = os.clock() + 0.25 end
+			dragging, dragInput = false, nil
+		end
+	end)
+	connect(openCard.Activated, function()
+		if not moved and os.clock() >= suppressClickUntil then show(not frame.Visible) end
+	end)
+	refreshBestEggCard = function()
+		if destroyed or not ready then return end
+		local best, bestRate
+		for _, pool in ipairs({records, halloweenRecords}) do
+			for uid, record in pairs(pool) do
+				if (record.State == SLOT_STATE or record.State == "Dropped") and record.CarrierUserId == nil and not ownsEgg(uid) then
+					local rate = getRatePerSecond(record)
+					local score = rate or -1
+					if not best or score > bestRate or (score == bestRate and uid < best.Uid) then best, bestRate = record, score end
+				end
+			end
+		end
+		local visual = mainCard.Template
+		if best then
+			paintEggCard(visual, best)
+			mainCard:SetAttribute("EggUid", best.Uid)
+		else
+			visual.Icon.Image = "rbxassetid://103094823152347"
+			visual.Amount.Text = "Aucun oeuf"
+			visual.Weight.Text = detectedMode
+			local label = visual:FindFirstChild("ValueHolder")
+			if label then label.Value.Text = "Auto Eggs" end
+			mainCard:SetAttribute("EggUid", nil)
+		end
+	end
 
 	local paramsPanel = Instance.new("Frame")
 	paramsPanel.Name = "Params"
@@ -2012,6 +1984,11 @@ local function createInterface()
 	paramsPanel.Size = scroll.Size
 	paramsPanel.Visible = false
 	paramsPanel.Parent = frame
+	local worldModeLabel = thresholdTitle:Clone()
+	worldModeLabel.Name = "DetectedWorldMode"
+	worldModeLabel.LayoutOrder = 0
+	worldModeLabel.Size = UDim2.fromScale(0.95, 0.10)
+	worldModeLabel.Parent = paramsPanel
 	local paramsLayout = Instance.new("UIListLayout", paramsPanel)
 	paramsLayout.Padding = UDim.new(0, 16)
 	paramsLayout.SortOrder = Enum.SortOrder.LayoutOrder
@@ -2087,6 +2064,11 @@ local function createInterface()
 		return n
 	end
 	local function updateSelection()
+		worldModeLabel.Text = "Mode : " .. detectedMode .. (detectedMode == "Halloween" and " (observation)" or "")
+		for _, name in ipairs({"Title", "Title2Stroke"}) do
+			local title = header:FindFirstChild(name)
+			if title then title.Text = "Auto Eggs - " .. detectedMode end
+		end
 		local count = countSelected()
 		info.Value.Text = activeTab == "Params" and ("AUTO >= " .. formatNumber(minimumRatePerSecond) .. "/s") or (tostring(count) .. (count == 1 and " oeuf" or " oeufs"))
 		setAutoCaption(stopAfterFlight and "ARRET EN ATTENTE" or (automaticMode and "AUTO : ON" or "AUTO : OFF"))
@@ -2123,6 +2105,9 @@ local function createInterface()
 			end
 		end
 		end
+		if activeTab ~= "Queue" then
+			for _, record in pairs(halloweenRecords) do table.insert(available, record) end
+		end
 		table.sort(available, function(a, b)
 			local ar, br = getRatePerSecond(a) or 0, getRatePerSecond(b) or 0
 			if ar ~= br then return ar > br end
@@ -2155,22 +2140,7 @@ local function createInterface()
 				holder.Parent = scroll
 			end
 			card.holder.LayoutOrder = index
-			local config = getAssetConfig(record)
-			local icon = config and config.Egg and config.Egg.Icon
-			card.visual.Icon.Image = icon or "rbxassetid://103094823152347"
-			local rate = getRatePerSecond(record)
-			card.visual.Amount.Text = rate and (formatNumber(rate) .. "/s") or "?"
-			local weight = getWeightKg(record)
-			card.visual.Weight.Text = weight and string.format("%.1f kg", weight) or ""
-			local valueHolder = card.visual:FindFirstChild("ValueHolder")
-			if valueHolder then
-				valueHolder.Value.Text = getAnimalName(record)
-				valueHolder.Value.Size = UDim2.fromScale(0.95, 0.9)
-				valueHolder.Value.Position = UDim2.fromScale(0.5, 0.5)
-				valueHolder.Value.AnchorPoint = Vector2.new(0.5, 0.5)
-				valueHolder.Value.TextScaled = true
-				if valueHolder:FindFirstChild("Icon") then valueHolder.Icon.Visible = false end
-			end
+			paintEggCard(card.visual, record)
 		end
 		for uid, card in pairs(cards) do
 			if not seen[uid] then
@@ -2263,11 +2233,11 @@ local function createInterface()
 		if countSelected() == 0 then setStatus("Coche au moins un oeuf puis Add."); return end
 		local added = 0
 		for uid in pairs(selectedEggs) do
-			if enqueueEgg(records[uid], "MANUEL") then added += 1 end
+			if enqueueEgg(records[uid] or halloweenRecords[uid], "MANUEL") then added += 1 end
 		end
 		table.clear(selectedEggs)
 		queuePaused = false
-		setStatus(tostring(added) .. " oeuf(s) ajoute(s) a la file.")
+		setStatus(tostring(added) .. " oeuf(s) ajoute(s). Halloween : observation uniquement.")
 		syncQueue()
 		wakeQueue()
 		updateSelection()
@@ -2284,12 +2254,13 @@ local function createInterface()
 			if ready and not destroyed then
 				syncQueue()
 				wakeQueue()
+				if refreshBestEggCard then refreshBestEggCard() end
 				if frame.Visible then refreshEggInterface() end
 			end
 		end
 	end)
 	show(true)
-	log("UI_READY", "Interface autonome PlayerGui.AutoSAEGui creee avec bouton OpenAutoEggs permanent.")
+	log("UI_READY", "Interface autonome creee avec carte meilleur oeuf deplacable.")
 	return gui
 end
 
