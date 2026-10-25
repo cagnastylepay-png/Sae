@@ -1330,6 +1330,29 @@ local function pathTo(destination, token, interruptForEgg)
 	return false, "chemin inaccessible"
 end
 
+local function moveToStartArea(destination, token)
+	local character, humanoid, root = getCharacterParts()
+	if not character or not humanoid or not root then return false, "personnage absent" end
+	local deadline = os.clock() + math.clamp(distanceXZ(root.Position, destination) / math.max(humanoid.WalkSpeed, 1) * 3 + 5, 8, 30)
+	local nextMove = 0
+	while distanceXZ(root.Position, destination) > 3 do
+		if not activityValid(token, character) or humanoid.Health <= 0 then
+			stopMovement()
+			return false, "annule"
+		end
+		if os.clock() >= deadline then
+			stopMovement()
+			return false, "MoveTo : destination non atteinte"
+		end
+		if os.clock() >= nextMove then
+			humanoid:MoveTo(destination)
+			nextMove = os.clock() + 0.5
+		end
+		task.wait(0.05)
+	end
+	return true
+end
+
 -- Serialize treadmill requests, including late replies after a timeout.
 local function treadmillRequest(remote, token)
 	if treadmillPending then return false, "requete tapis en cours" end
@@ -1519,6 +1542,11 @@ local function worker(token)
 				setStatus("Trajet vers le centre de StartArea...")
 				log("START_AREA_PATH", "Destination=%s", formatPosition(destination))
 				local reached, reason = pathTo(destination, token, false)
+				if not reached and reason == "chemin inaccessible" and autoEnabled and generation == token then
+					log("START_AREA_MOVETO", "Pathfinding inaccessible : repli MoveTo vers %s", formatPosition(destination))
+					setStatus("StartArea : trajet MoveTo...")
+					reached, reason = moveToStartArea(destination, token)
+				end
 				if not reached then stopAutomation("StartArea : " .. tostring(reason)); return end
 			end
 			if not autoEnabled or generation ~= token then return end
