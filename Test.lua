@@ -1424,7 +1424,7 @@ end
 local function enqueueEgg(record, source)
 	if type(record) ~= "table" or type(record.Uid) ~= "string" then return false end
 	local function reject(reason)
-		if source == "AUTO" then logQueueDecision(record.Uid, reason) end
+		if source == "AUTO" or source == "DIVINE" then logQueueDecision(record.Uid, reason) end
 		return false
 	end
 	if record.IsHalloweenObservation then return reject("EXCLU : Halloween en observation") end
@@ -1438,7 +1438,7 @@ local function enqueueEgg(record, source)
 		end
 	end
 	if queuedEggs[record.Uid] then
-		if source == "AUTO" then logQueueDecision(record.Uid, "EN FILE | Auto=" .. tostring(autoEnabled) .. " Pause=" .. tostring(queuePaused) .. " Activite=" .. autoActivity .. " Cooldown=" .. tostring((cooldowns[record.Uid] or 0) > os.clock())) end
+		if source == "AUTO" or source == "DIVINE" then logQueueDecision(record.Uid, "EN FILE | Auto=" .. tostring(autoEnabled) .. " Pause=" .. tostring(queuePaused) .. " Activite=" .. autoActivity .. " Cooldown=" .. tostring((cooldowns[record.Uid] or 0) > os.clock())) end
 		return false
 	end
 	if record.State ~= SLOT_STATE and record.State ~= "Dropped" then return reject("EXCLU : etat=" .. tostring(record.State)) end
@@ -1479,7 +1479,11 @@ syncQueue = function()
 					and type(record.AssetCategory) == "string" and Assets.Directory[record.AssetCategory] ~= nil
 					and index[record.AssetCategory] ~= true
 					and not backpackCategories[record.AssetCategory]
-				if rate >= minimumRatePerSecond then
+				if getRarityName(record) == "Divine" then
+					local existing = queuedEggs[uid]
+					if existing then existing.Source = "DIVINE" end
+					enqueueEgg(record, "DIVINE")
+				elseif rate >= minimumRatePerSecond then
 					local existing = queuedEggs[uid]
 					if existing and existing.Source == "INDEX" then existing.Source = "AUTO" end
 					enqueueEgg(record, "AUTO")
@@ -1528,6 +1532,7 @@ local function selectBest()
 			if ok and latest and (latest.State == SLOT_STATE or latest.State == "Dropped") and latest.CarrierUserId == nil and not ownsEgg(uid) then
 				records[uid] = latest
 				local rate = getRatePerSecond(latest)
+				if rate == nil and getRarityName(latest) == "Divine" then rate = 0 end
 				if rate then
 					if rate > bestRate or (rate == bestRate and root and best
 						and distanceXZ(latest.BottomCFrame.Position, root.Position)
