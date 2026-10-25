@@ -225,11 +225,25 @@ local function distanceXZ(first, second)
 	return Vector2.new(delta.X, delta.Z).Magnitude
 end
 
-local function stopMovement(hardBrake)
+-- Single movement primitive. Returns true only inside the arrival radius.
+local function move(destination, options)
+	options = options or {}
 	local character, humanoid, root = getCharacterParts()
-	if humanoid and root then
-		humanoid:Move(Vector3.zero)
-		humanoid:MoveTo(root.Position)
+	if not character or not humanoid or not root then return false, "personnage absent" end
+	local stopping = options.Stop == true
+	local arrived = false
+	if not stopping then
+		if typeof(destination) ~= "Vector3" then return false, "destination invalide" end
+		local arrivalPosition = options.ArrivalPosition or destination
+		local distance = options.Flat == false and (root.Position - arrivalPosition).Magnitude
+			or distanceXZ(root.Position, arrivalPosition)
+		arrived = distance <= (options.Radius or 3)
+		stopping = arrived
+	end
+	if stopping then humanoid:Move(Vector3.zero) end
+	humanoid:MoveTo(stopping and root.Position or destination)
+	if stopping then
+		local hardBrake = options.HardBrake == true or arrived
 		if hardBrake and character and humanoid.Health > 0 and not humanoid.PlatformStand and not humanoid.Sit
 			and character:GetAttribute("IsTrapped") ~= true
 			and not (rigPause.Character == character and os.clock() < rigPause.Until) then
@@ -245,6 +259,11 @@ local function stopMovement(hardBrake)
 			end
 		end
 	end
+	return arrived
+end
+
+local function stopMovement(hardBrake)
+	return move(nil, {Stop = true, HardBrake = hardBrake == true})
 end
 
 local function readCarry()
@@ -824,7 +843,7 @@ local function approachEgg(ctx, destination)
 				lastCommand, retryRequested = now, false
 				log(firstCommand and "MOVE_COMMAND" or "MOVE_RENEW", "Destination=%s DistanceXZ=%.2f Temps=%.2fs | sans arret ni changement de vitesse",
 					formatPosition(destination), distance, now - started)
-				humanoid:MoveTo(destination)
+				move(destination, {Radius = CONFIG.ApproachDistance, Flat = false, ArrivalPosition = eggPosition})
 			end
 			if now - lastLog >= CONFIG.ProgressInterval then
 				lastLog = now
@@ -1089,7 +1108,7 @@ local function moveReturnLoop(ctx, destination)
 		if now - started > timeout then return false, "delai de retour depasse" end
 		if now - lastMoved > CONFIG.NoMovementTimeout then return false, "retour bloque" end
 		if now - lastCommand >= CONFIG.MoveRefresh then
-			humanoid:MoveTo(destination)
+			move(destination, {Radius = 3})
 			lastCommand = now
 		end
 		if now - lastLog >= CONFIG.ProgressInterval then
@@ -1441,7 +1460,7 @@ local function activityValid(token, character)
 		and player.Character == character
 end
 
-local function moveToActivity(destination, token, interruptForEgg)
+local function moveActivity(destination, token, interruptForEgg)
 	local character, humanoid, root = getCharacterParts()
 	if not character or not humanoid or not root then return false, "personnage absent" end
 	local deadline = os.clock() + math.clamp(distanceXZ(root.Position, destination) / math.max(humanoid.WalkSpeed, 1) * 3 + 5, 8, 30)
@@ -1460,11 +1479,12 @@ local function moveToActivity(destination, token, interruptForEgg)
 			return false, "MoveTo : destination non atteinte"
 		end
 		if os.clock() >= nextMove then
-			humanoid:MoveTo(destination)
-			nextMove = os.clock() + 0.5
+			move(destination, {Radius = 3})
+			nextMove = os.clock() + CONFIG.MoveRefresh
 		end
 		task.wait(0.05)
 	end
+	move(destination, {Radius = 3})
 	return true
 end
 
@@ -1563,7 +1583,7 @@ local function idleOnTreadmill(token)
 	if not treadmillAssigned then
 		local _, humanoid = getCharacterParts()
 		local destination = bottom.Position + Vector3.new(0, humanoid.HipHeight + 2, 0)
-		local ok, reason = moveToActivity(destination, token, true)
+		local ok, reason = moveActivity(destination, token, true)
 		if not ok then
 			if reason == "nouvel oeuf" then return true end
 			return false, reason
@@ -1657,7 +1677,7 @@ local function worker(token)
 				autoActivity = "TO_FARM"
 				setStatus("Trajet vers le centre de StartArea...")
 				log("START_AREA_MOVETO", "Trajet direct vers %s", formatPosition(destination))
-				local reached, reason = moveToActivity(destination, token)
+				local reached, reason = moveActivity(destination, token)
 				if not reached then stopAutomation("StartArea : " .. tostring(reason)); return end
 			end
 			if not autoEnabled or generation ~= token then return end
