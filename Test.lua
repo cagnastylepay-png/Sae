@@ -2498,6 +2498,106 @@ connect(RunService.Heartbeat, function()
 	humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 end)
 
+-- Explicit, bounded black-box probes; never start automatically.
+local activeProbe
+local function nearestGuard(root)
+	local world = Workspace:FindFirstChild("World")
+	local areas = world and world:FindFirstChild("Areas")
+	local guards = areas and areas:FindFirstChild("GuardAreas")
+	local best, bestDistance
+	for _, model in ipairs(guards and guards:GetDescendants() or {}) do
+		if model:IsA("Model") and model.Name == "Guard" then
+			local part = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+			if part and part:IsA("BasePart") then
+				local distance = distanceXZ(root.Position, part.Position)
+				if distance <= 200 and (not bestDistance or distance < bestDistance) then best, bestDistance = model, distance end
+			end
+		end
+	end
+	return best, bestDistance
+end
+local function startProbe(kind)
+	if activeProbe then return false, "un test est deja actif" end
+	if destroyed or not ready then return false, "script non pret" end
+	local character, humanoid, root = getCharacterParts()
+	if not character or not humanoid or not root or humanoid.Health <= 0 then return false, "personnage absent" end
+	local probe = {Kind = kind, Cancelled = false, Restore = {}}
+	if kind == "SPEED" then
+		local initial = humanoid.WalkSpeed
+		if initial <= 0 or initial >= math.huge then return false, "vitesse initiale invalide" end
+		local requested = initial * 1.5
+		table.insert(probe.Restore, function()
+			if humanoid.Parent and humanoid.WalkSpeed == requested then humanoid.WalkSpeed = initial end
+		end)
+		probe.Apply = function()
+			humanoid.WalkSpeed = requested
+			log("PROBE_SPEED_WRITE", "Initial=%.2f Demande=%.2f | une seule ecriture, aucune boucle de maintien", initial, requested)
+		end
+	else
+		local guard, distance = nearestGuard(root)
+		if not guard then return false, "aucun gardien dans un rayon de 200 studs" end
+		probe.Guard = guard
+		local parts = {}
+		for _, part in ipairs(guard:GetDescendants()) do
+			if part:IsA("BasePart") then
+				local original = part.CanCollide
+				table.insert(parts, part)
+				table.insert(probe.Restore, function()
+					if part.Parent and part.CanCollide == false then part.CanCollide = original end
+				end)
+			end
+		end
+		probe.Apply = function()
+			for _, part in ipairs(parts) do if part.Parent then part.CanCollide = false end end
+			log("PROBE_GUARD_WRITE", "Guard=%s Distance=%.2f Pieces=%d | collisions locales uniquement ; attaque serveur non modifiee", guard:GetFullName(), distance, #parts)
+		end
+	end
+	activeProbe = probe
+	task.spawn(function()
+		local ok, failure = xpcall(function()
+			log("PROBE_BEGIN", "Type=%s Baseline=2s Test=5s | comparaison client, resultat serveur a confirmer", kind)
+			local started, lastTime, lastPosition = os.clock(), os.clock(), root.Position
+			local applied = false
+			while not probe.Cancelled and not destroyed and player.Character == character and humanoid.Health > 0 do
+				local now = os.clock()
+				local elapsed = now - started
+				if elapsed >= 7 then break end
+				if elapsed >= 2 and not applied then probe.Apply(); applied = true end
+				local delta = now - lastTime
+				local speed = delta > 0.01 and distanceXZ(root.Position, lastPosition) / delta or 0
+				local velocity = root.AssemblyLinearVelocity
+				local carry = readCarry()
+				local guard, guardDistance = nearestGuard(root)
+				local guardHumanoid = guard and guard:FindFirstChildWhichIsA("Humanoid")
+				log("PROBE_SAMPLE", "Type=%s Etape=%s T=%.2f Pos=%s WalkSpeed=%.2f DeplacementXZ=%.2f VitessePhysiqueXZ=%.2f Trapped=%s RagdollEnd=%s Carry=%s UID=%s Phase=%s GuardDistance=%s GuardSpeed=%s",
+					kind, applied and "TEST" or "BASELINE", elapsed, formatPosition(root.Position), humanoid.WalkSpeed,
+					speed, Vector2.new(velocity.X, velocity.Z).Magnitude,
+					tostring(character:GetAttribute("IsTrapped")), tostring(player:GetAttribute("RagdollEndTime")),
+					tostring(carry and carry.IsCarrying), tostring(carry and carry.Uid),
+					currentCycle and currentCycle.phase or "MANUEL", tostring(guardDistance), tostring(guardHumanoid and guardHumanoid.WalkSpeed))
+				lastTime, lastPosition = now, root.Position
+				task.wait(0.25)
+			end
+		end, debug.traceback)
+		for _, restore in ipairs(probe.Restore) do
+			local restored, reason = pcall(restore)
+			if not restored then log("PROBE_RESTORE_ERROR", "%s", tostring(reason)) end
+		end
+		activeProbe = nil
+		log("PROBE_END", "Type=%s Termine=%s Annule=%s VitesseFinale=%s Erreur=%s | aucune conclusion automatique de vulnerabilite",
+			kind, tostring(ok), tostring(probe.Cancelled), tostring(humanoid.WalkSpeed), tostring(not ok and failure or "aucune"))
+		executorTools.SaveLog()
+	end)
+	return true, "Test lance : 2 s de reference puis 5 s de test ; garde le meme mouvement"
+end
+function executorTools.RunSpeedTest() return startProbe("SPEED") end
+function executorTools.RunGuardCollisionTest() return startProbe("GUARD_COLLISION") end
+function executorTools.StopTest()
+	if not activeProbe then return false, "aucun test actif" end
+	activeProbe.Cancelled = true
+	return true
+end
+
 loadSettings()
 log("EXECUTOR_CAPABILITIES", "%s", HttpService:JSONEncode(executorTools.Capabilities()))
 local gui = createInterface()
@@ -2507,6 +2607,7 @@ connect(player.CharacterRemoving, function()
 end)
 local function destroy()
 	if destroyed then return end
+	if activeProbe then activeProbe.Cancelled = true end
 	stopAutomation("Script ferme")
 	executorTools.SaveSettings()
 	executorTools.SaveLog()
