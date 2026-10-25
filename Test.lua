@@ -39,6 +39,7 @@ local MINIMUM_BILLIONS, MAXIMUM_BILLIONS, DEFAULT_BILLIONS = 0.1, 999, 2
 local SLOT_STATE = "Slot"
 local CARRY_LOST = "CARRY_LOST"
 local EggState, Assets, EggRecords, AssetEarnings, SlotIdentity, GuardGeometry, Save
+local HalloweenPets
 local ready, destroyed, autoEnabled = false, false, false
 local generation = 0
 local minimumRatePerSecond = DEFAULT_BILLIONS * 1e9
@@ -326,7 +327,16 @@ local function getAnimalName(record)
 end
 
 local function getRatePerSecond(record)
-	if type(record) == "table" and record.IsHalloweenObservation then return record.ObservedRate end
+	if type(record) == "table" and record.IsHalloweenObservation then
+		if record.ObservedRate then return record.ObservedRate end
+		if not Assets.Directory[record.AssetCategory] then return nil end
+		-- Earnings only needs category, scale and mutations; no cosmetic identity is fabricated.
+		local ok, rate = pcall(AssetEarnings.RatePerSecond, {
+			Category = record.AssetCategory, Scale = record.AssetScale,
+			Mutations = record.Mutations or {}, BaseMutation = record.BaseMutation,
+		})
+		return ok and type(rate) == "number" and rate or nil
+	end
 	if type(record) ~= "table" then
 		return nil
 	end
@@ -366,6 +376,20 @@ local function getWeightKg(record)
 	return nil
 end
 
+local function resolveHalloweenCategory(source)
+	if type(source) ~= "string" then return nil end
+	if Assets.Directory[source] then return source end
+	local match
+	for category, spec in pairs(HalloweenPets and HalloweenPets.Specs or {}) do
+		if spec.Group == "World" and (spec.Source == source or spec.EggSource == source
+			or spec.EggModel == source or spec.DisplayName == source) then
+			if match and match ~= category then return nil end
+			match = category
+		end
+	end
+	return match
+end
+
 local function refreshHalloweenRecords()
 	local updated, seen = {}, {}
 	local map = Workspace:FindFirstChild("HalloweenDimension")
@@ -377,15 +401,34 @@ local function refreshHalloweenRecords()
 			seen[model] = true
 			local uid = model:GetAttribute("HalloweenEggUid")
 			if type(uid) == "string" then
-				local category = model:GetAttribute("AssetCategory") or model:GetAttribute("PreparedSourceName")
+				local source = model:GetAttribute("AssetCategory") or model:GetAttribute("PreparedSourceName")
+				local category = resolveHalloweenCategory(source)
+				local scale = model:GetAttribute("AssetScale")
+				local hasScale = type(scale) == "number" and scale > 0 and scale < math.huge
 				local rate = model:GetAttribute("MoneyPerSecond")
+				local mutations, hasMutations = {}, false
+				local encoded = model:GetAttribute("Mutations")
+				if type(encoded) == "string" then
+					local ok, decoded = pcall(function() return game:GetService("HttpService"):JSONDecode(encoded) end)
+					if ok and type(decoded) == "table" then
+						hasMutations = true
+						for key, value in pairs(decoded) do
+							if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or type(value) ~= "string" then hasMutations = false; break end
+						end
+						if hasMutations then mutations = decoded end
+					end
+				end
+				local baseMutation = model:GetAttribute("BaseMutation")
 				updated[uid] = {
-					Uid = uid, AssetCategory = type(category) == "string" and category or "Halloween Egg",
-					AssetScale = model:GetAttribute("AssetScale"),
+					Uid = uid, AssetCategory = category or (type(source) == "string" and source or "Halloween Egg"),
+					AssetScale = hasScale and scale or 1,
+					WeightIsReference = not hasScale,
+					RateIsReference = not hasScale or not hasMutations,
 					BottomCFrame = model:GetPivot(), AreaId = "Halloween", Zone = model:GetAttribute("Zone"),
 					State = model:GetAttribute("HalloweenEggCanPickUp") == true and "Slot" or "Unavailable",
-					Mutations = {}, IsHalloweenObservation = true,
-					ObservedRate = type(rate) == "number" and rate or nil,
+					Mutations = mutations, BaseMutation = type(baseMutation) == "string" and baseMutation or nil,
+					IsHalloweenObservation = true,
+					ObservedRate = type(rate) == "number" and rate >= 0 and rate < math.huge and rate or nil,
 				}
 			end
 		end
@@ -1573,6 +1616,7 @@ end
 local function initialize()
 	EggState = loadModule("Client.EggState")
 	Assets = loadModule("Data.Assets")
+	HalloweenPets = loadModule("Data.HalloweenPets")
 	EggRecords = loadModule("Shared.Util.EggRecords")
 	AssetEarnings = loadModule("Shared.Util.AssetEarnings")
 	SlotIdentity = loadModule("Shared.Util.AreaEggSlotIdentity")
@@ -1909,8 +1953,8 @@ local function createInterface()
 			if valueHolder:FindFirstChild("Icon") then valueHolder.Icon.Visible = false end
 		end
 		if record.IsHalloweenObservation then
-			visual.Weight.Text = "Halloween - Zone " .. tostring(record.Zone or "?")
-			visual.Amount.Text = record.ObservedRate and (formatNumber(record.ObservedRate) .. "/s") or "Revenu inconnu"
+			visual.Weight.Text = weight and (string.format("%.1f kg", weight) .. (record.WeightIsReference and " base" or "")) or "Poids inconnu"
+			visual.Amount.Text = rate and (formatNumber(rate) .. "/s" .. (not record.ObservedRate and record.RateIsReference and " base" or "")) or "Revenu inconnu"
 		end
 	end
 	local backdrop = gui:FindFirstChild("Backdrop")
