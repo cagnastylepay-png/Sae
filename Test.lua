@@ -78,6 +78,50 @@ local function isEggInCurrentWorld(record)
 		and ((record.IsHalloweenObservation == true) == (detectedMode == "Halloween"))
 end
 
+-- Optional executor APIs. Capture once; never replace Roblox services or remotes.
+local debugLogLines = {}
+local executorEnvironment = getfenv()
+if type(getgenv) == "function" then
+	local ok, environment = pcall(getgenv)
+	if ok and type(environment) == "table" then executorEnvironment = environment end
+end
+local function executorFunction(name)
+	local candidate = executorEnvironment[name]
+	if type(candidate) ~= "function" then candidate = getfenv()[name] end
+	return type(candidate) == "function" and candidate or nil
+end
+local executorTools = {}
+local executorLogPath = "AutoSAE_debug.txt"
+function executorTools.Capabilities()
+	local result = {}
+	for _, name in ipairs({"fireproximityprompt", "writefile", "readfile", "openfile", "isfile", "appendfile"}) do
+		result[name] = executorFunction(name) ~= nil
+	end
+	return result
+end
+local function callExecutor(name, ...)
+	local fn = executorFunction(name)
+	if not fn then return false, name .. " indisponible dans cet environnement" end
+	return pcall(fn, ...)
+end
+function executorTools.SaveLog()
+	local ok, result = callExecutor("writefile", executorLogPath, table.concat(debugLogLines, "\n"))
+	return ok, ok and executorLogPath or tostring(result)
+end
+function executorTools.ReadLog()
+	return callExecutor("readfile", executorLogPath)
+end
+function executorTools.OpenLog()
+	return callExecutor("openfile", executorLogPath)
+end
+function executorTools.FirePrompt(prompt)
+	if typeof(prompt) ~= "Instance" or not prompt:IsA("ProximityPrompt") or not prompt:IsDescendantOf(Workspace) then
+		return false, "ProximityPrompt de Workspace requis"
+	end
+	return callExecutor("fireproximityprompt", prompt)
+end
+shared.__AutoSAEExecutorTools = executorTools
+
 local function log(stage, message, ...)
 	if not CONFIG.Debug and stage ~= "ERROR" and stage ~= "CLAIM_CONFIRMED" then
 		return
@@ -87,8 +131,44 @@ local function log(stage, message, ...)
 	if not ok then
 		text = message .. " | format=" .. tostring(text)
 	end
-	print(string.format("[Auto_SAE][%04d][%.3f][%s][%s] %s",
-		sequence, os.clock(), stage, currentCycle and currentCycle.uid or "-", text))
+	local line = string.format("[Auto_SAE][%04d][%.3f][%s][%s] %s",
+		sequence, os.clock(), stage, currentCycle and currentCycle.uid or "-", text)
+	table.insert(debugLogLines, line)
+	if #debugLogLines > 1000 then table.remove(debugLogLines, 1) end
+	print(line)
+end
+
+local settingsPath = "AutoSAE_settings.json"
+local lastSettingsJSON, lastSavedLogSequence = nil, -1
+function executorTools.SaveSettings()
+	local json = HttpService:JSONEncode({
+		Version = 1, AutomaticMode = automaticMode,
+		IncludeMissingIndex = autoIncludeMissingIndex,
+		MinimumBillions = minimumRatePerSecond / 1e9,
+	})
+	if json == lastSettingsJSON then return true, settingsPath end
+	local ok, result = callExecutor("writefile", settingsPath, json)
+	if ok then
+		lastSettingsJSON = json
+		log("SETTINGS_SAVED", "Auto=%s Index=%s Minimum=%s B/s", tostring(automaticMode), tostring(autoIncludeMissingIndex), tostring(minimumRatePerSecond / 1e9))
+	end
+	return ok, ok and settingsPath or tostring(result)
+end
+local function loadSettings()
+	local ok, content = callExecutor("readfile", settingsPath)
+	if not ok then log("SETTINGS_LOAD", "Valeurs par defaut : %s", tostring(content)); return end
+	local decoded, settings = pcall(HttpService.JSONDecode, HttpService, content)
+	if not decoded or type(settings) ~= "table" or settings.Version ~= 1 then
+		log("SETTINGS_LOAD", "Fichier invalide : valeurs par defaut conservees")
+		return
+	end
+	if type(settings.AutomaticMode) == "boolean" then automaticMode = settings.AutomaticMode end
+	if type(settings.IncludeMissingIndex) == "boolean" then autoIncludeMissingIndex = settings.IncludeMissingIndex end
+	local minimum = settings.MinimumBillions
+	if type(minimum) == "number" and minimum == minimum and minimum >= MINIMUM_BILLIONS and minimum <= MAXIMUM_BILLIONS then
+		minimumRatePerSecond = minimum * 1e9
+	end
+	log("SETTINGS_LOADED", "Auto=%s Index=%s Minimum=%s B/s", tostring(automaticMode), tostring(autoIncludeMissingIndex), tostring(minimumRatePerSecond / 1e9))
 end
 
 local function logQueueDecision(uid, decision)
@@ -97,7 +177,12 @@ local function logQueueDecision(uid, decision)
 	log("QUEUE_DECISION", "UID=%s %s", uid, decision)
 end
 
+local lastStatusText
 local function setStatus(text, color)
+	if text ~= lastStatusText then
+		lastStatusText = text
+		log("STATUS", "%s", tostring(text))
+	end
 	if statusLabel then
 		statusLabel.Text = text
 		statusLabel.TextColor3 = color or Color3.fromRGB(225, 230, 245)
@@ -1652,6 +1737,7 @@ wakeQueue = function()
 end
 
 local function loadModule(path)
+	log("MODULE_LOADING", "%s", path)
 	local deadline, node = os.clock() + 12, ReplicatedStorage
 	for name in string.gmatch(path, "[^%.]+") do
 		local child = node:FindFirstChild(name)
@@ -1662,7 +1748,9 @@ local function loadModule(path)
 		assert(child, "ReplicatedStorage." .. path .. " introuvable")
 		node = child
 	end
-	return require(node)
+	local module = require(node)
+	log("MODULE_READY", "%s", path)
+	return module
 end
 
 local function initialize()
@@ -1686,6 +1774,7 @@ local function initialize()
 		local nextMode = player:GetAttribute("InHalloweenDimension") == true and "Halloween" or "Normal"
 		if nextMode ~= detectedMode then
 			detectedMode = nextMode
+			log("WORLD_MODE", "%s", detectedMode)
 			if autoEnabled then stopAutomation("Changement de monde : " .. detectedMode, false) end
 			autoActivity = "IDLE"
 			activityRecheckPending = true
@@ -1906,7 +1995,7 @@ local function createInterface()
 	minimumInput.TextSize = 16
 	minimumInput.ClearTextOnFocus = false
 	minimumInput.PlaceholderText = "0.1 - 999"
-	minimumInput.Text = tostring(DEFAULT_BILLIONS)
+	minimumInput.Text = tostring(minimumRatePerSecond / 1e9)
 	minimumInput.Parent = sort
 	local thresholdCorner = Instance.new("UICorner", minimumInput)
 	thresholdCorner.CornerRadius = UDim.new(0, 8)
@@ -2409,6 +2498,8 @@ connect(RunService.Heartbeat, function()
 	humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 end)
 
+loadSettings()
+log("EXECUTOR_CAPABILITIES", "%s", HttpService:JSONEncode(executorTools.Capabilities()))
 local gui = createInterface()
 setStatus("Chargement des modules du jeu...")
 connect(player.CharacterRemoving, function()
@@ -2417,6 +2508,8 @@ end)
 local function destroy()
 	if destroyed then return end
 	stopAutomation("Script ferme")
+	executorTools.SaveSettings()
+	executorTools.SaveLog()
 	destroyed = true
 	for _, connection in ipairs(lifetimeConnections) do connection:Disconnect() end
 	table.clear(lifetimeConnections)
@@ -2433,6 +2526,22 @@ end
 shared.__AutoSAEController = {Destroy = destroy, Gui = gui}
 connect(gui.Destroying, destroy)
 connect(script.Destroying, destroy)
+task.spawn(function()
+	while not destroyed do
+		task.wait(2)
+		if destroyed then break end
+		if executorFunction("writefile") then
+			local settingsOK, settingsError = executorTools.SaveSettings()
+			if not settingsOK then warn("[Auto_SAE] Ecriture parametres : " .. tostring(settingsError)) end
+			if sequence ~= lastSavedLogSequence then
+				local sequenceToSave = sequence
+				local logOK, logError = executorTools.SaveLog()
+				if logOK then lastSavedLogSequence = sequenceToSave
+				else warn("[Auto_SAE] Ecriture logs : " .. tostring(logError)) end
+			end
+		end
+	end
+end)
 task.spawn(function()
 	local ok, failure = xpcall(initialize, debug.traceback)
 	if not ok and not destroyed then
