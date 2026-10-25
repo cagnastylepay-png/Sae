@@ -14,7 +14,6 @@ assert(player, "Auto_SAE doit etre execute sur le client")
 
 local CONFIG = {
 	Debug = true,
-	FarmDeparture = Vector3.new(519, 71, -387),
 	ProgressInterval = 0.5,
 	MoveRefresh = 0.1,
 	ApproachRefresh = 4,
@@ -1013,12 +1012,30 @@ local function cleanupCycle(ctx)
 	currentCycle = nil
 end
 
+local function getStartAreaDestination()
+	local world = Workspace:FindFirstChild("World")
+	local areas = world and world:FindFirstChild("Areas")
+	local area = areas and areas:FindFirstChild("StartArea")
+	local center
+	if area and area:IsA("BasePart") then
+		center = area.Position
+	elseif area and area:IsA("Model") and area:FindFirstChildWhichIsA("BasePart", true) then
+		local bounds = area:GetBoundingBox()
+		center = bounds.Position
+	end
+	if not center then return nil, "World.Areas.StartArea introuvable ou sans centre" end
+	local _, humanoid = getCharacterParts()
+	return center + Vector3.new(0, (humanoid and humanoid.HipHeight or 2) + 2, 0)
+end
+
 local function runCycle(record, rate, recovering)
 	local character, humanoid, root = getCharacterParts()
 	if not character or not humanoid or not root then return false, "personnage absent" end
+	local destination, destinationReason = getStartAreaDestination()
+	if not destination then return false, destinationReason end
+	safeHome = destination
 	local startIsSafe = isSafe(root.Position)
 	if startIsSafe then
-		safeHome = CONFIG.FarmDeparture
 		local carry = readCarry()
 		if not (carry and carry.IsCarrying) and humanoid.WalkSpeed > 0 then
 			safeSpeedHumanoid, safeWalkSpeed = humanoid, humanoid.WalkSpeed
@@ -1332,21 +1349,6 @@ local function treadmillRequest(remote, token)
 	return accepted, reason
 end
 
-local function getStartAreaDestination()
-	local world = Workspace:FindFirstChild("World")
-	local areas = world and world:FindFirstChild("Areas")
-	local area = areas and areas:FindFirstChild("StartArea")
-	local center
-	if area and area:IsA("BasePart") then
-		center = area.Position
-	elseif area and area:IsA("Model") and area:FindFirstChildWhichIsA("BasePart", true) then
-		local bounds = area:GetBoundingBox()
-		center = bounds.Position
-	end
-	if not center then return nil, "World.Areas.StartArea introuvable ou sans centre" end
-	local _, humanoid = getCharacterParts()
-	return center + Vector3.new(0, (humanoid and humanoid.HipHeight or 2) + 2, 0)
-end
 
 local function leaveTreadmill(token)
 	if not treadmillAssigned and autoActivity ~= "TREADMILL" and autoActivity ~= "TO_TREADMILL" then return true end
@@ -1362,7 +1364,7 @@ local function leaveTreadmill(token)
 	end
 	if humanoid then humanoid.Jump = true end
 	autoActivity = "FARM"
-	safeHome = CONFIG.FarmDeparture
+	safeHome = getStartAreaDestination()
 	log("TREADMILL_EXIT_READY", "Sortie confirmee : pathfinding vers le centre de StartArea")
 	return true
 end
@@ -1577,7 +1579,7 @@ startAutomation = function(billions)
 		setStatus("Personnage indisponible")
 		return false
 	end
-	if isSafe(CONFIG.FarmDeparture) == true then safeHome = CONFIG.FarmDeparture end
+	safeHome = getStartAreaDestination()
 	if not safeHome or isSafe(safeHome) ~= true then
 		setStatus("File en attente : rejoins la zone sure", Color3.fromRGB(255, 190, 100))
 		return false
@@ -2250,7 +2252,7 @@ local function createInterface()
 		if automaticMode then
 			stopAfterFlight = false
 			queuePaused = false
-			safeHome = CONFIG.FarmDeparture
+			safeHome = getStartAreaDestination()
 			setStatus("AUTO ON : pathfinding vers StartArea ou le tapis selon la file.")
 		else
 			requestUserStop("AUTO OFF")
