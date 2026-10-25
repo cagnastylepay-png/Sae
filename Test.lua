@@ -54,6 +54,7 @@ local automaticMode = true
 local autoIncludeMissingIndex = true
 local autoOpenEgg = true
 local autoEquipBest = true
+local automaticTests = true
 local stopAfterFlight = false
 local queuedEggs = {}
 local removedFromAuto = {}
@@ -148,6 +149,7 @@ function executorTools.SaveSettings()
 		Version = 1, AutomaticMode = automaticMode,
 		IncludeMissingIndex = autoIncludeMissingIndex,
 		AutoOpenEgg = autoOpenEgg, AutoEquipBest = autoEquipBest,
+		AutomaticTests = automaticTests,
 		MinimumBillions = minimumRatePerSecond / 1e9,
 	})
 	if json == lastSettingsJSON then return true, settingsPath end
@@ -170,6 +172,7 @@ local function loadSettings()
 	if type(settings.IncludeMissingIndex) == "boolean" then autoIncludeMissingIndex = settings.IncludeMissingIndex end
 	if type(settings.AutoOpenEgg) == "boolean" then autoOpenEgg = settings.AutoOpenEgg end
 	if type(settings.AutoEquipBest) == "boolean" then autoEquipBest = settings.AutoEquipBest end
+	if type(settings.AutomaticTests) == "boolean" then automaticTests = settings.AutomaticTests end
 	local minimum = settings.MinimumBillions
 	if type(minimum) == "number" and minimum == minimum and minimum >= MINIMUM_BILLIONS and minimum <= MAXIMUM_BILLIONS then
 		minimumRatePerSecond = minimum * 1e9
@@ -2302,13 +2305,13 @@ local function createInterface()
 		log("PARAM_CHANGED", "AutoEquipBest=%s", tostring(autoEquipBest))
 		executorTools.SaveSettings()
 	end)
-	paramButton("ProbeSpeed", 70, "Test vitesse x1.5 (5 s)", function()
-		local ok, message = executorTools.RunSpeedTest()
-		setStatus((ok and "" or "Test refuse : ") .. tostring(message))
-	end)
-	paramButton("ProbeGuard", 80, "Test collisions gardien (5 s)", function()
-		local ok, message = executorTools.RunGuardCollisionTest()
-		setStatus((ok and "" or "Test refuse : ") .. tostring(message))
+	local testsAutoButton
+	testsAutoButton = paramButton("AutomaticTests", 70, automaticTests and "Tests auto : ON" or "Tests auto : OFF", function()
+		automaticTests = not automaticTests
+		caption(testsAutoButton, automaticTests and "Tests auto : ON" or "Tests auto : OFF")
+		if not automaticTests then executorTools.StopTest() end
+		log("PARAM_CHANGED", "AutomaticTests=%s", tostring(automaticTests))
+		executorTools.SaveSettings()
 	end)
 	paramButton("StopProbe", 90, "Arreter le test", function()
 		local ok, message = executorTools.StopTest()
@@ -2619,12 +2622,57 @@ local function nearestGuard(root)
 	end
 	return best, bestDistance
 end
-local function startProbe(kind)
+local function applyLocalAntiKnock(character, humanoid)
+	local restore, connections, seen = {}, {}, {}
+	local active = true
+	for _, state in ipairs({Enum.HumanoidStateType.FallingDown, Enum.HumanoidStateType.Ragdoll, Enum.HumanoidStateType.Physics}) do
+		local original = humanoid:GetStateEnabled(state)
+		table.insert(restore, function()
+			if humanoid.Parent then humanoid:SetStateEnabled(state, original) end
+		end)
+		humanoid:SetStateEnabled(state, false)
+	end
+	local function watchPart(part)
+		if seen[part] then return end
+		local isConstraint = (part:IsA("BallSocketConstraint") or part:IsA("HingeConstraint"))
+			and part.Name:find("RagdollConstraint", 1, true) ~= nil
+		local isMotor = part:IsA("Motor6D")
+		if not isConstraint and not isMotor then return end
+		seen[part] = true
+		local desired, original = isMotor, part.Enabled
+		table.insert(restore, function()
+			if part.Parent and part.Enabled == desired then part.Enabled = original end
+		end)
+		local function apply()
+			if active and part.Parent and part.Enabled ~= desired then
+				part.Enabled = desired
+				log("PROBE_ANTIKNOCK_PART", "Type=%s Nom=%s Enabled=%s", part.ClassName, part.Name, tostring(desired))
+			end
+		end
+		table.insert(connections, part:GetPropertyChangedSignal("Enabled"):Connect(apply))
+		apply()
+	end
+	-- Attach before scanning so newly replicated constraints are included.
+	table.insert(connections, character.DescendantAdded:Connect(watchPart))
+	for _, part in ipairs(character:GetDescendants()) do watchPart(part) end
+	log("PROBE_ANTIKNOCK_WRITE", "Etats ragdoll desactives localement ; contraintes conservees et desactivees ; aucun CFrame, aucune vitesse ni attribut serveur modifies")
+	return function()
+		active = false
+		for _, connection in ipairs(connections) do connection:Disconnect() end
+		for _, action in ipairs(restore) do
+			local ok, reason = pcall(action)
+			if not ok then log("PROBE_RESTORE_ERROR", "%s", tostring(reason)) end
+		end
+	end
+end
+
+local function startProbe(kind, automatic)
 	if activeProbe then return false, "un test est deja actif" end
 	if destroyed or not ready then return false, "script non pret" end
 	local character, humanoid, root = getCharacterParts()
 	if not character or not humanoid or not root or humanoid.Health <= 0 then return false, "personnage absent" end
-	local probe = {Kind = kind, Cancelled = false, Restore = {}}
+	local probe = {Kind = kind, Cancelled = false, Restore = {}, Cycle = automatic and currentCycle or nil}
+	local baselineSeconds = automatic and 0 or 2
 	if kind == "SPEED" then
 		local initial = humanoid.WalkSpeed
 		if initial <= 0 or initial >= math.huge then return false, "vitesse initiale invalide" end
@@ -2635,6 +2683,11 @@ local function startProbe(kind)
 		probe.Apply = function()
 			humanoid.WalkSpeed = requested
 			log("PROBE_SPEED_WRITE", "Initial=%.2f Demande=%.2f | une seule ecriture, aucune boucle de maintien", initial, requested)
+		end
+	elseif kind == "ANTI_KNOCK" then
+		probe.Apply = function()
+			local cleanup = applyLocalAntiKnock(character, humanoid)
+			table.insert(probe.Restore, cleanup)
 		end
 	else
 		local guard, distance = nearestGuard(root)
@@ -2658,14 +2711,15 @@ local function startProbe(kind)
 	activeProbe = probe
 	task.spawn(function()
 		local ok, failure = xpcall(function()
-			log("PROBE_BEGIN", "Type=%s Baseline=2s Test=5s | comparaison client, resultat serveur a confirmer", kind)
+			log("PROBE_BEGIN", "Type=%s Auto=%s Baseline=%ss Test=5s | resultat serveur a confirmer", kind, tostring(automatic == true), tostring(baselineSeconds))
 			local started, lastTime, lastPosition = os.clock(), os.clock(), root.Position
 			local applied = false
-			while not probe.Cancelled and not destroyed and player.Character == character and humanoid.Health > 0 do
+			while not probe.Cancelled and not destroyed and player.Character == character and humanoid.Health > 0
+				and (not automatic or currentCycle == probe.Cycle) do
 				local now = os.clock()
 				local elapsed = now - started
-				if elapsed >= 7 then break end
-				if elapsed >= 2 and not applied then probe.Apply(); applied = true end
+				if elapsed >= baselineSeconds + 5 then break end
+				if elapsed >= baselineSeconds and not applied then probe.Apply(); applied = true end
 				local delta = now - lastTime
 				local speed = delta > 0.01 and distanceXZ(root.Position, lastPosition) / delta or 0
 				local velocity = root.AssemblyLinearVelocity
@@ -2679,13 +2733,13 @@ local function startProbe(kind)
 					guard, guardDistance = nearestGuard(root)
 				end
 				local guardHumanoid = guard and guard:FindFirstChildWhichIsA("Humanoid")
-				log("PROBE_SAMPLE", "Type=%s Etape=%s T=%.2f Pos=%s WalkSpeed=%.2f DeplacementXZ=%.2f VitessePhysiqueXZ=%.2f Trapped=%s RagdollEnd=%s Carry=%s UID=%s Phase=%s GuardDistance=%s GuardSpeed=%s Guard=%s GuardState=%s",
+				log("PROBE_SAMPLE", "Type=%s Etape=%s T=%.2f Pos=%s WalkSpeed=%.2f DeplacementXZ=%.2f VitessePhysiqueXZ=%.2f Trapped=%s RagdollEnd=%s Carry=%s UID=%s Phase=%s GuardDistance=%s GuardSpeed=%s Guard=%s GuardState=%s HumanoidState=%s PlatformStand=%s",
 					kind, applied and "TEST" or "BASELINE", elapsed, formatPosition(root.Position), humanoid.WalkSpeed,
 					speed, Vector2.new(velocity.X, velocity.Z).Magnitude,
 					tostring(character:GetAttribute("IsTrapped")), tostring(player:GetAttribute("RagdollEndTime")),
 					tostring(carry and carry.IsCarrying), tostring(carry and carry.Uid),
 					currentCycle and currentCycle.phase or "MANUEL", tostring(guardDistance), tostring(guardHumanoid and guardHumanoid.WalkSpeed),
-					guard and guard:GetFullName() or "absent", tostring(guard and guard:GetAttribute("GuardState")))
+					guard and guard:GetFullName() or "absent", tostring(guard and guard:GetAttribute("GuardState")), tostring(humanoid:GetState()), tostring(humanoid.PlatformStand))
 				lastTime, lastPosition = now, root.Position
 				task.wait(0.25)
 			end
@@ -2702,12 +2756,49 @@ local function startProbe(kind)
 	return true, "Test lance : 2 s de reference puis 5 s de test ; garde le meme mouvement"
 end
 function executorTools.RunSpeedTest() return startProbe("SPEED") end
+function executorTools.RunAntiKnockTest() return startProbe("ANTI_KNOCK") end
 function executorTools.RunGuardCollisionTest() return startProbe("GUARD_COLLISION") end
 function executorTools.StopTest()
 	if not activeProbe then return false, "aucun test actif" end
 	activeProbe.Cancelled = true
 	return true
 end
+
+-- Reevaluate needs continuously; serialize probes without a per-flight quota.
+local nextProbeScan = 0
+local probeRetryAfter = {}
+connect(RunService.Heartbeat, function()
+	if destroyed or not ready or not automaticTests or activeProbe or os.clock() < nextProbeScan then return end
+	nextProbeScan = os.clock() + 0.2
+	local ctx = currentCycle
+	if not ctx or not validCycle(ctx) or ctx.braking then return end
+	local character, humanoid, root = getCharacterParts()
+	if not character or not humanoid or not root or humanoid.Health <= 0 then return end
+	if isSafe(root.Position) == true then return end
+	local kind, reason
+	local ragdollEndsAt = player:GetAttribute("RagdollEndTime")
+	local ragdoll = type(ragdollEndsAt) == "number" and ragdollEndsAt > Workspace:GetServerTimeNow()
+	local impulse = rigPause.Character == character and os.clock() < rigPause.Until
+		and tostring(rigPause.Reason):find("Impulse", 1, true) ~= nil
+	local guard, guardDistance = nearestGuard(root)
+	if (probeRetryAfter.ANTI_KNOCK or 0) <= os.clock() and (ragdoll or impulse) then
+		kind, reason = "ANTI_KNOCK", ragdoll and "ragdoll observe" or "impulsion observee"
+	elseif not motionBlockReason(ctx) and ctx.phase == "RETURN" then
+		if (probeRetryAfter.GUARD_COLLISION or 0) <= os.clock() and guard and guardDistance <= 100
+			and guard:GetAttribute("TargetPlayer") == tostring(player.UserId) then
+			kind, reason = "GUARD_COLLISION", "gardien cible le joueur a moins de 100 studs"
+		elseif (probeRetryAfter.SPEED or 0) <= os.clock() and distanceXZ(root.Position, ctx.home) > 200 then
+			kind, reason = "SPEED", "retour hors zone sure, distance superieure a 200 studs"
+		end
+	end
+	if kind then
+		local ok, detail = startProbe(kind, true)
+		if ok then
+			probeRetryAfter[kind] = os.clock() + 6
+			log("AUTO_PROBE_TRIGGER", "Type=%s Raison=%s UID=%s", kind, reason, ctx.uid)
+		else log("AUTO_PROBE_SKIPPED", "Type=%s Raison=%s", kind, tostring(detail)) end
+	end
+end)
 
 loadSettings()
 log("EXECUTOR_CAPABILITIES", "%s", HttpService:JSONEncode(executorTools.Capabilities()))
