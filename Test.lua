@@ -23,7 +23,7 @@ local CONFIG = {
 	MaxCarryAttempts = 3,
 	CarryRetryDelay = 0.35,
 	EnableArrivalBrake = true,
-	ArrivalBrakeDuration = 0.1,
+	ArrivalBrakeDuration = 0.03,
 	ObserveRigSync = true,
 	MotionPauseTimeout = 12,
 	RigSettleTime = 0.15,
@@ -54,7 +54,7 @@ local automaticMode = true
 local autoIncludeMissingIndex = true
 local autoOpenEgg = true
 local autoEquipBest = true
-local automaticTests = true
+local timingEnabled = true
 local stopAfterFlight = false
 local queuedEggs = {}
 local removedFromAuto = {}
@@ -142,6 +142,19 @@ local function log(stage, message, ...)
 	print(line)
 end
 
+local function measureAction(name, action, ...)
+	if not timingEnabled then return action(...) end
+	local started = os.clock()
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local beforeSpeed = humanoid and humanoid.WalkSpeed
+	local result = table.pack(pcall(action, ...))
+	log("TIMING_ACTION", "Action=%s DureeMs=%.1f ExecutionOK=%s Resultat=%s Detail=%s WalkSpeedAvant=%s WalkSpeedApres=%s",
+		name, (os.clock() - started) * 1000, tostring(result[1]), tostring(result[2]), tostring(result[3]), tostring(beforeSpeed), tostring(humanoid and humanoid.WalkSpeed))
+	if not result[1] then error(result[2], 0) end
+	return table.unpack(result, 2, result.n)
+end
+
 local settingsPath = "AutoSAE_settings.json"
 local lastSettingsJSON, lastSavedLogSequence = nil, -1
 function executorTools.SaveSettings()
@@ -149,7 +162,7 @@ function executorTools.SaveSettings()
 		Version = 1, AutomaticMode = automaticMode,
 		IncludeMissingIndex = autoIncludeMissingIndex,
 		AutoOpenEgg = autoOpenEgg, AutoEquipBest = autoEquipBest,
-		AutomaticTests = automaticTests,
+		TimingEnabled = timingEnabled,
 		MinimumBillions = minimumRatePerSecond / 1e9,
 	})
 	if json == lastSettingsJSON then return true, settingsPath end
@@ -172,7 +185,7 @@ local function loadSettings()
 	if type(settings.IncludeMissingIndex) == "boolean" then autoIncludeMissingIndex = settings.IncludeMissingIndex end
 	if type(settings.AutoOpenEgg) == "boolean" then autoOpenEgg = settings.AutoOpenEgg end
 	if type(settings.AutoEquipBest) == "boolean" then autoEquipBest = settings.AutoEquipBest end
-	if type(settings.AutomaticTests) == "boolean" then automaticTests = settings.AutomaticTests end
+	if type(settings.TimingEnabled) == "boolean" then timingEnabled = settings.TimingEnabled end
 	local minimum = settings.MinimumBillions
 	if type(minimum) == "number" and minimum == minimum and minimum >= MINIMUM_BILLIONS and minimum <= MAXIMUM_BILLIONS then
 		minimumRatePerSecond = minimum * 1e9
@@ -419,6 +432,11 @@ end
 
 local function setPhase(ctx, phase, message)
 	if ctx.phase ~= phase then
+		if timingEnabled then
+			local now = os.clock()
+			log("TIMING_PHASE", "Phase=%s DureeMs=%.1f DepuisDepartMs=%.1f", tostring(ctx.phase), (now - (ctx.phaseStartedAt or now)) * 1000, (now - (ctx.startedAt or now)) * 1000)
+			ctx.phaseStartedAt = now
+		end
 		log("PHASE", "%s -> %s | %s", tostring(ctx.phase), phase, message or "")
 		ctx.phase = phase
 	end
@@ -1169,6 +1187,10 @@ end
 
 local function cleanupCycle(ctx)
 	if currentCycle ~= ctx then return end
+	if timingEnabled then
+		local now = os.clock()
+		log("TIMING_CYCLE", "TotalMs=%.1f DernierePhase=%s PhaseMs=%.1f", (now - (ctx.startedAt or now)) * 1000, tostring(ctx.phase), (now - (ctx.phaseStartedAt or now)) * 1000)
+	end
 	if ctx.cancelPendingWait then ctx.cancelPendingWait() end
 	stopMovement()
 	if shared.__AutoSAEMovementLock == ctx.movementLock then shared.__AutoSAEMovementLock = nil end
@@ -1203,6 +1225,7 @@ local function runCycle(record, rate, recovering, findNext)
 	end
 	local ctx = {
 		uid = record.Uid, record = record, generation = generation, character = character, findNext = findNext,
+		startedAt = os.clock(), phaseStartedAt = os.clock(),
 		home = safeHome, eggPosition = record.BottomCFrame and record.BottomCFrame.Position,
 		attempts = 0, lastRequest = -math.huge, phase = "SELECTED", ownerBefore = ownerSnapshot(),
 		remoteAccepted = recovering == true, sawCarry = recovering == true,
@@ -1222,7 +1245,7 @@ local function runCycle(record, rate, recovering, findNext)
 			return false, "position de l'oeuf absente"
 		else
 			local destination = Vector3.new(ctx.eggPosition.X, ctx.home.Y, ctx.eggPosition.Z)
-			grabbed, grabReason = moveThenCarry(ctx, destination)
+			grabbed, grabReason = measureAction("APPROCHE_ET_PRISE", moveThenCarry, ctx, destination)
 		end
 		if not validCycle(ctx) then return false, "annule" end
 		if not grabbed and inFlightRequest and not inFlightRequest.done then
@@ -1232,14 +1255,14 @@ local function runCycle(record, rate, recovering, findNext)
 		ctx.watchForReappearance = not grabbed
 		if not grabbed then log("TARGET_RETURN_EMPTY", "UID=%s : retour en surveillant sa reapparition", ctx.uid) end
 		while validCycle(ctx) do
-			local returned, returnReason = moveReturnLoop(ctx, ctx.home)
+			local returned, returnReason = measureAction("RETOUR", moveReturnLoop, ctx, ctx.home)
 			if returned then
 				local _, _, currentRoot = getCharacterParts()
 				if not currentRoot or isSafe(currentRoot.Position) ~= true then
 					return false, "retour termine mais ligne safe non franchie"
 				end
 				if not grabbed then return false, "TARGET_UNAVAILABLE" end
-				local claimed, claimReason = waitForClaim(ctx)
+				local claimed, claimReason = measureAction("CONFIRMATION_ATTRIBUTION", waitForClaim, ctx)
 				if claimed then return true end
 				if claimReason ~= CARRY_LOST then return false, claimReason end
 				returnReason = CARRY_LOST
@@ -1602,7 +1625,7 @@ local function idleOnTreadmill(token)
 	if not treadmillAssigned then
 		local _, humanoid = getCharacterParts()
 		local destination = bottom.Position + Vector3.new(0, humanoid.HipHeight + 2, 0)
-		local ok, reason = moveActivity(destination, token, true)
+		local ok, reason = measureAction("ENTREE_TAPIS", moveActivity, destination, token, true)
 		if not ok then
 			if reason == "nouvel oeuf" then return true end
 			return false, reason
@@ -1687,7 +1710,7 @@ local function worker(token)
 			selected, rate = selectBest()
 		end
 		if selected then
-			local exited, exitReason = leaveTreadmill(token)
+			local exited, exitReason = measureAction("SORTIE_TAPIS", leaveTreadmill, token)
 			if not exited then stopAutomation("Sortie tapis : " .. tostring(exitReason)); return end
 			if not autoEnabled or generation ~= token then return end
 			if not recovering and not directNext then
@@ -1696,14 +1719,14 @@ local function worker(token)
 				autoActivity = "TO_FARM"
 				setStatus("Trajet vers le centre de StartArea...")
 				log("START_AREA_MOVETO", "Trajet direct vers %s", formatPosition(destination))
-				local reached, reason = moveActivity(destination, token)
+				local reached, reason = measureAction("TRAJET_STARTAREA", moveActivity, destination, token)
 				if not reached then stopAutomation("StartArea : " .. tostring(reason)); return end
 			end
 			if not autoEnabled or generation ~= token then return end
 			autoActivity = "FARM"
 			log("FARM_START", "UID=%s : sortie StartArea atteinte, trajet vers l'oeuf", selected.Uid)
 			directNext = false
-			local success, reason = runCycle(selected, rate, recovering, selectBest)
+			local success, reason = measureAction("VOL_COMPLET", runCycle, selected, rate, recovering, selectBest)
 			if not autoEnabled or generation ~= token then return end
 			if success then
 				selectedEggs[selected.Uid] = nil
@@ -1744,7 +1767,7 @@ local function worker(token)
 				return
 			end
 		end
-		task.wait(CONFIG.ScanInterval)
+		task.wait() -- Yield one frame, then immediately select the next available egg.
 	end
 end
 
@@ -2305,17 +2328,11 @@ local function createInterface()
 		log("PARAM_CHANGED", "AutoEquipBest=%s", tostring(autoEquipBest))
 		executorTools.SaveSettings()
 	end)
-	local testsAutoButton
-	testsAutoButton = paramButton("AutomaticTests", 70, automaticTests and "Tests auto : ON" or "Tests auto : OFF", function()
-		automaticTests = not automaticTests
-		caption(testsAutoButton, automaticTests and "Tests auto : ON" or "Tests auto : OFF")
-		if not automaticTests then executorTools.StopTest() end
-		log("PARAM_CHANGED", "AutomaticTests=%s", tostring(automaticTests))
+	local timingButton
+	timingButton = paramButton("TimingEnabled", 70, timingEnabled and "Timing / latence : ON" or "Timing / latence : OFF", function()
+		timingEnabled = not timingEnabled
+		caption(timingButton, timingEnabled and "Timing / latence : ON" or "Timing / latence : OFF")
 		executorTools.SaveSettings()
-	end)
-	paramButton("StopProbe", 90, "Arreter le test", function()
-		local ok, message = executorTools.StopTest()
-		setStatus(ok and "Arret du test : restauration en cours" or tostring(message))
 	end)
 	paramButton("SaveLogs", 100, "Sauvegarder les logs", function()
 		local ok, message = executorTools.SaveLog()
@@ -2605,199 +2622,24 @@ connect(RunService.Heartbeat, function()
 end)
 
 -- Explicit, bounded black-box probes; never start automatically.
-local activeProbe
-local function nearestGuard(root)
-	local world = Workspace:FindFirstChild("World")
-	local areas = world and world:FindFirstChild("Areas")
-	local guards = areas and areas:FindFirstChild("GuardAreas")
-	local best, bestDistance
-	for _, model in ipairs(guards and guards:GetDescendants() or {}) do
-		if model:IsA("Model") and model.Name == "Guard" then
-			local part = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
-			if part and part:IsA("BasePart") then
-				local distance = distanceXZ(root.Position, part.Position)
-				if distance <= 200 and (not bestDistance or distance < bestDistance) then best, bestDistance = model, distance end
-			end
-		end
-	end
-	return best, bestDistance
-end
-local function applyLocalAntiKnock(character, humanoid)
-	local restore, connections, seen = {}, {}, {}
-	local active = true
-	for _, state in ipairs({Enum.HumanoidStateType.FallingDown, Enum.HumanoidStateType.Ragdoll, Enum.HumanoidStateType.Physics}) do
-		local original = humanoid:GetStateEnabled(state)
-		table.insert(restore, function()
-			if humanoid.Parent then humanoid:SetStateEnabled(state, original) end
-		end)
-		humanoid:SetStateEnabled(state, false)
-	end
-	local function watchPart(part)
-		if seen[part] then return end
-		local isConstraint = (part:IsA("BallSocketConstraint") or part:IsA("HingeConstraint"))
-			and part.Name:find("RagdollConstraint", 1, true) ~= nil
-		local isMotor = part:IsA("Motor6D")
-		if not isConstraint and not isMotor then return end
-		seen[part] = true
-		local desired, original = isMotor, part.Enabled
-		table.insert(restore, function()
-			if part.Parent and part.Enabled == desired then part.Enabled = original end
-		end)
-		local function apply()
-			if active and part.Parent and part.Enabled ~= desired then
-				part.Enabled = desired
-				log("PROBE_ANTIKNOCK_PART", "Type=%s Nom=%s Enabled=%s", part.ClassName, part.Name, tostring(desired))
-			end
-		end
-		table.insert(connections, part:GetPropertyChangedSignal("Enabled"):Connect(apply))
-		apply()
-	end
-	-- Attach before scanning so newly replicated constraints are included.
-	table.insert(connections, character.DescendantAdded:Connect(watchPart))
-	for _, part in ipairs(character:GetDescendants()) do watchPart(part) end
-	log("PROBE_ANTIKNOCK_WRITE", "Etats ragdoll desactives localement ; contraintes conservees et desactivees ; aucun CFrame, aucune vitesse ni attribut serveur modifies")
-	return function()
-		active = false
-		for _, connection in ipairs(connections) do connection:Disconnect() end
-		for _, action in ipairs(restore) do
-			local ok, reason = pcall(action)
-			if not ok then log("PROBE_RESTORE_ERROR", "%s", tostring(reason)) end
-		end
-	end
-end
 
-local function startProbe(kind, automatic)
-	if activeProbe then return false, "un test est deja actif" end
-	if destroyed or not ready then return false, "script non pret" end
-	local character, humanoid, root = getCharacterParts()
-	if not character or not humanoid or not root or humanoid.Health <= 0 then return false, "personnage absent" end
-	local probe = {Kind = kind, Cancelled = false, Restore = {}, Cycle = automatic and currentCycle or nil}
-	local baselineSeconds = automatic and 0 or 2
-	if kind == "SPEED" then
-		local initial = humanoid.WalkSpeed
-		if initial <= 0 or initial >= math.huge then return false, "vitesse initiale invalide" end
-		local requested = initial * 1.5
-		table.insert(probe.Restore, function()
-			if humanoid.Parent and humanoid.WalkSpeed == requested then humanoid.WalkSpeed = initial end
-		end)
-		probe.Apply = function()
-			humanoid.WalkSpeed = requested
-			log("PROBE_SPEED_WRITE", "Initial=%.2f Demande=%.2f | une seule ecriture, aucune boucle de maintien", initial, requested)
-		end
-	elseif kind == "ANTI_KNOCK" then
-		probe.Apply = function()
-			local cleanup = applyLocalAntiKnock(character, humanoid)
-			table.insert(probe.Restore, cleanup)
-		end
-	else
-		local guard, distance = nearestGuard(root)
-		if not guard then return false, "aucun gardien dans un rayon de 200 studs" end
-		probe.Guard = guard
-		local parts = {}
-		for _, part in ipairs(guard:GetDescendants()) do
-			if part:IsA("BasePart") then
-				local original = part.CanCollide
-				table.insert(parts, part)
-				table.insert(probe.Restore, function()
-					if part.Parent and part.CanCollide == false then part.CanCollide = original end
-				end)
-			end
-		end
-		probe.Apply = function()
-			for _, part in ipairs(parts) do if part.Parent then part.CanCollide = false end end
-			log("PROBE_GUARD_WRITE", "Guard=%s Distance=%.2f Pieces=%d | collisions locales uniquement ; attaque serveur non modifiee", guard:GetFullName(), distance, #parts)
-		end
-	end
-	activeProbe = probe
-	task.spawn(function()
-		local ok, failure = xpcall(function()
-			log("PROBE_BEGIN", "Type=%s Auto=%s Baseline=%ss Test=5s | resultat serveur a confirmer", kind, tostring(automatic == true), tostring(baselineSeconds))
-			local started, lastTime, lastPosition = os.clock(), os.clock(), root.Position
-			local applied = false
-			while not probe.Cancelled and not destroyed and player.Character == character and humanoid.Health > 0
-				and (not automatic or currentCycle == probe.Cycle) do
-				local now = os.clock()
-				local elapsed = now - started
-				if elapsed >= baselineSeconds + 5 then break end
-				if elapsed >= baselineSeconds and not applied then probe.Apply(); applied = true end
-				local delta = now - lastTime
-				local speed = delta > 0.01 and distanceXZ(root.Position, lastPosition) / delta or 0
-				local velocity = root.AssemblyLinearVelocity
-				local carry = readCarry()
-				local guard, guardDistance
-				if probe.Guard then
-					guard = probe.Guard.Parent and probe.Guard or nil
-					local guardRoot = guard and (guard:FindFirstChild("HumanoidRootPart") or guard.PrimaryPart)
-					guardDistance = guardRoot and distanceXZ(root.Position, guardRoot.Position) or nil
-				else
-					guard, guardDistance = nearestGuard(root)
-				end
-				local guardHumanoid = guard and guard:FindFirstChildWhichIsA("Humanoid")
-				log("PROBE_SAMPLE", "Type=%s Etape=%s T=%.2f Pos=%s WalkSpeed=%.2f DeplacementXZ=%.2f VitessePhysiqueXZ=%.2f Trapped=%s RagdollEnd=%s Carry=%s UID=%s Phase=%s GuardDistance=%s GuardSpeed=%s Guard=%s GuardState=%s HumanoidState=%s PlatformStand=%s",
-					kind, applied and "TEST" or "BASELINE", elapsed, formatPosition(root.Position), humanoid.WalkSpeed,
-					speed, Vector2.new(velocity.X, velocity.Z).Magnitude,
-					tostring(character:GetAttribute("IsTrapped")), tostring(player:GetAttribute("RagdollEndTime")),
-					tostring(carry and carry.IsCarrying), tostring(carry and carry.Uid),
-					currentCycle and currentCycle.phase or "MANUEL", tostring(guardDistance), tostring(guardHumanoid and guardHumanoid.WalkSpeed),
-					guard and guard:GetFullName() or "absent", tostring(guard and guard:GetAttribute("GuardState")), tostring(humanoid:GetState()), tostring(humanoid.PlatformStand))
-				lastTime, lastPosition = now, root.Position
-				task.wait(0.25)
-			end
-		end, debug.traceback)
-		for _, restore in ipairs(probe.Restore) do
-			local restored, reason = pcall(restore)
-			if not restored then log("PROBE_RESTORE_ERROR", "%s", tostring(reason)) end
-		end
-		activeProbe = nil
-		log("PROBE_END", "Type=%s Termine=%s Annule=%s VitesseFinale=%s Erreur=%s | aucune conclusion automatique de vulnerabilite",
-			kind, tostring(ok), tostring(probe.Cancelled), tostring(humanoid.WalkSpeed), tostring(not ok and failure or "aucune"))
-		executorTools.SaveLog()
-	end)
-	return true, "Test lance : 2 s de reference puis 5 s de test ; garde le meme mouvement"
-end
-function executorTools.RunSpeedTest() return startProbe("SPEED") end
-function executorTools.RunAntiKnockTest() return startProbe("ANTI_KNOCK") end
-function executorTools.RunGuardCollisionTest() return startProbe("GUARD_COLLISION") end
-function executorTools.StopTest()
-	if not activeProbe then return false, "aucun test actif" end
-	activeProbe.Cancelled = true
-	return true
-end
-
--- Reevaluate needs continuously; serialize probes without a per-flight quota.
-local nextProbeScan = 0
-local probeRetryAfter = {}
+local lastTimingSample
 connect(RunService.Heartbeat, function()
-	if destroyed or not ready or not automaticTests or activeProbe or os.clock() < nextProbeScan then return end
-	nextProbeScan = os.clock() + 0.2
+	if destroyed or not ready or not timingEnabled or not currentCycle then lastTimingSample = nil; return end
 	local ctx = currentCycle
-	if not ctx or not validCycle(ctx) or ctx.braking then return end
-	local character, humanoid, root = getCharacterParts()
-	if not character or not humanoid or not root or humanoid.Health <= 0 then return end
-	if isSafe(root.Position) == true then return end
-	local kind, reason
-	local ragdollEndsAt = player:GetAttribute("RagdollEndTime")
-	local ragdoll = type(ragdollEndsAt) == "number" and ragdollEndsAt > Workspace:GetServerTimeNow()
-	local impulse = rigPause.Character == character and os.clock() < rigPause.Until
-		and tostring(rigPause.Reason):find("Impulse", 1, true) ~= nil
-	local guard, guardDistance = nearestGuard(root)
-	if (probeRetryAfter.ANTI_KNOCK or 0) <= os.clock() and (ragdoll or impulse) then
-		kind, reason = "ANTI_KNOCK", ragdoll and "ragdoll observe" or "impulsion observee"
-	elseif not motionBlockReason(ctx) and ctx.phase == "RETURN" then
-		if (probeRetryAfter.GUARD_COLLISION or 0) <= os.clock() and guard and guardDistance <= 100
-			and guard:GetAttribute("TargetPlayer") == tostring(player.UserId) then
-			kind, reason = "GUARD_COLLISION", "gardien cible le joueur a moins de 100 studs"
-		elseif (probeRetryAfter.SPEED or 0) <= os.clock() and distanceXZ(root.Position, ctx.home) > 200 then
-			kind, reason = "SPEED", "retour hors zone sure, distance superieure a 200 studs"
-		end
+	local _, humanoid, root = getCharacterParts()
+	if not humanoid or not root then return end
+	local now = os.clock()
+	if lastTimingSample and lastTimingSample.Cycle == ctx and now - lastTimingSample.Time < 0.5 then return end
+	local measured = 0
+	if lastTimingSample and lastTimingSample.Cycle == ctx then
+		measured = distanceXZ(root.Position, lastTimingSample.Position) / math.max(now - lastTimingSample.Time, 0.001)
 	end
-	if kind then
-		local ok, detail = startProbe(kind, true)
-		if ok then
-			probeRetryAfter[kind] = os.clock() + 6
-			log("AUTO_PROBE_TRIGGER", "Type=%s Raison=%s UID=%s", kind, reason, ctx.uid)
-		else log("AUTO_PROBE_SKIPPED", "Type=%s Raison=%s", kind, tostring(detail)) end
-	end
+	local velocity = root.AssemblyLinearVelocity
+	log("TIMING_SPEED", "Phase=%s WalkSpeed=%.2f PhysiqueXZ=%.2f DeplacementXZ=%.2f Pos=%s Safe=%s",
+		tostring(ctx.phase), humanoid.WalkSpeed, Vector2.new(velocity.X, velocity.Z).Magnitude,
+		measured, formatPosition(root.Position), tostring(isSafe(root.Position)))
+	lastTimingSample = {Cycle = ctx, Time = now, Position = root.Position}
 end)
 
 loadSettings()
@@ -2809,7 +2651,6 @@ connect(player.CharacterRemoving, function()
 end)
 local function destroy()
 	if destroyed then return end
-	if activeProbe then activeProbe.Cancelled = true end
 	stopAutomation("Script ferme")
 	executorTools.SaveSettings()
 	executorTools.SaveLog()
