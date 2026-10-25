@@ -1388,7 +1388,7 @@ local function leaveTreadmill(token)
 	if humanoid then humanoid.Jump = true end
 	autoActivity = "FARM"
 	safeHome = getStartAreaDestination()
-	log("TREADMILL_EXIT_READY", "Sortie confirmee : pathfinding vers le centre de StartArea")
+	log("TREADMILL_EXIT_READY", "Sortie confirmee : MoveTo direct vers le centre de StartArea")
 	return true
 end
 
@@ -1540,13 +1540,8 @@ local function worker(token)
 				if not destination then stopAutomation(destinationReason); return end
 				autoActivity = "TO_FARM"
 				setStatus("Trajet vers le centre de StartArea...")
-				log("START_AREA_PATH", "Destination=%s", formatPosition(destination))
-				local reached, reason = pathTo(destination, token, false)
-				if not reached and reason == "chemin inaccessible" and autoEnabled and generation == token then
-					log("START_AREA_MOVETO", "Pathfinding inaccessible : repli MoveTo vers %s", formatPosition(destination))
-					setStatus("StartArea : trajet MoveTo...")
-					reached, reason = moveToStartArea(destination, token)
-				end
+				log("START_AREA_MOVETO", "Trajet direct vers %s", formatPosition(destination))
+				local reached, reason = moveToStartArea(destination, token)
 				if not reached then stopAutomation("StartArea : " .. tostring(reason)); return end
 			end
 			if not autoEnabled or generation ~= token then return end
@@ -2281,7 +2276,7 @@ local function createInterface()
 			stopAfterFlight = false
 			queuePaused = false
 			safeHome = getStartAreaDestination()
-			setStatus("AUTO ON : pathfinding vers StartArea ou le tapis selon la file.")
+			setStatus("AUTO ON : MoveTo vers StartArea ou pathfinding vers le tapis selon la file.")
 		else
 			requestUserStop("AUTO OFF")
 		end
