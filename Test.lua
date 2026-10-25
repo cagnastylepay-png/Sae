@@ -6,7 +6,6 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
-local PathfindingService = game:GetService("PathfindingService")
 local UserInputService = game:GetService("UserInputService")
 local CollectionService = game:GetService("CollectionService")
 local player = Players.LocalPlayer
@@ -45,7 +44,6 @@ local minimumRatePerSecond = DEFAULT_BILLIONS * 1e9
 local records, loggedVersions, cooldowns = {}, {}, {}
 local lifetimeConnections = {}
 local currentCycle, safeHome
-local safeSpeedHumanoid, safeWalkSpeed
 local inFlightRequest = shared.__AutoSAERemoteLock
 local statusLabel, toggleButton, minimumInput
 local sequence = 0
@@ -1067,13 +1065,7 @@ local function runCycle(record, rate, recovering, findNext)
 	local destination, destinationReason = getStartAreaDestination()
 	if not destination then return false, destinationReason end
 	safeHome = destination
-	local startIsSafe = isSafe(root.Position)
-	if startIsSafe then
-		local carry = readCarry()
-		if not (carry and carry.IsCarrying) and humanoid.WalkSpeed > 0 then
-			safeSpeedHumanoid, safeWalkSpeed = humanoid, humanoid.WalkSpeed
-		end
-	end
+
 	if not safeHome or isSafe(safeHome) ~= true then
 		return false, "position de retour sure non disponible"
 	end
@@ -1340,55 +1332,7 @@ local function activityValid(token, character)
 		and player.Character == character
 end
 
-local function pathTo(destination, token, interruptForEgg)
-	local character, humanoid, root = getCharacterParts()
-	if not root or not humanoid then return false, "personnage absent" end
-	if distanceXZ(root.Position, destination) <= 3 then return true end
-	for attempt = 1, 3 do
-		if not activityValid(token, character) then return false, "annule" end
-		local path = PathfindingService:CreatePath({AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 4})
-		local ok = pcall(function() path:ComputeAsync(root.Position, destination) end)
-		if ok and path.Status == Enum.PathStatus.Success then
-			local blocked = false
-			local currentIndex = 1
-			local connection = path.Blocked:Connect(function(index)
-				if index >= currentIndex then blocked = true end
-			end)
-			local failed = false
-			for index, waypoint in ipairs(path:GetWaypoints()) do
-				currentIndex = index
-				if not activityValid(token, character) then failed = true; break end
-				if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil) then
-					connection:Disconnect()
-					stopMovement()
-					return false, "nouvel oeuf"
-				end
-				if waypoint.Action == Enum.PathWaypointAction.Jump then humanoid.Jump = true end
-				humanoid:MoveTo(waypoint.Position)
-				local deadline = os.clock() + math.clamp((root.Position-waypoint.Position).Magnitude / math.max(humanoid.WalkSpeed, 1) * 3 + 2, 3, 12)
-				local arrivalRadius = index == #path:GetWaypoints() and 3 or 2
-				while distanceXZ(root.Position, waypoint.Position) > arrivalRadius do
-					if blocked or not activityValid(token, character) or humanoid.Health <= 0
-						or os.clock() > deadline then failed = true; break end
-					if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil) then
-						connection:Disconnect()
-						stopMovement()
-						return false, "nouvel oeuf"
-					end
-					task.wait(0.05)
-				end
-				if failed then break end
-			end
-			connection:Disconnect()
-			if not failed and distanceXZ(root.Position, destination) <= 3 then return true end
-		end
-		task.wait(0.2)
-	end
-	stopMovement()
-	return false, "chemin inaccessible"
-end
-
-local function moveToStartArea(destination, token)
+local function moveToActivity(destination, token, interruptForEgg)
 	local character, humanoid, root = getCharacterParts()
 	if not character or not humanoid or not root then return false, "personnage absent" end
 	local deadline = os.clock() + math.clamp(distanceXZ(root.Position, destination) / math.max(humanoid.WalkSpeed, 1) * 3 + 5, 8, 30)
@@ -1397,6 +1341,10 @@ local function moveToStartArea(destination, token)
 		if not activityValid(token, character) or humanoid.Health <= 0 then
 			stopMovement()
 			return false, "annule"
+		end
+		if interruptForEgg and (not automaticMode or next(queuedEggs) ~= nil) then
+			stopMovement()
+			return false, "nouvel oeuf"
 		end
 		if os.clock() >= deadline then
 			stopMovement()
@@ -1506,7 +1454,7 @@ local function idleOnTreadmill(token)
 	if not treadmillAssigned then
 		local _, humanoid = getCharacterParts()
 		local destination = bottom.Position + Vector3.new(0, humanoid.HipHeight + 2, 0)
-		local ok, reason = pathTo(destination, token, true)
+		local ok, reason = moveToActivity(destination, token, true)
 		if not ok then
 			if reason == "nouvel oeuf" then return true end
 			return false, reason
@@ -1600,7 +1548,7 @@ local function worker(token)
 				autoActivity = "TO_FARM"
 				setStatus("Trajet vers le centre de StartArea...")
 				log("START_AREA_MOVETO", "Trajet direct vers %s", formatPosition(destination))
-				local reached, reason = moveToStartArea(destination, token)
+				local reached, reason = moveToActivity(destination, token)
 				if not reached then stopAutomation("StartArea : " .. tostring(reason)); return end
 			end
 			if not autoEnabled or generation ~= token then return end
@@ -2341,7 +2289,7 @@ local function createInterface()
 			stopAfterFlight = false
 			queuePaused = false
 			safeHome = getStartAreaDestination()
-			setStatus("AUTO ON : MoveTo vers StartArea ou pathfinding vers le tapis selon la file.")
+			setStatus("AUTO ON : MoveTo vers StartArea ou MoveTo vers le tapis selon la file.")
 		else
 			requestUserStop("AUTO OFF")
 		end
@@ -2440,36 +2388,20 @@ local function createInterface()
 	return gui
 end
 
--- Cache the current character's unladen safe-zone speed; freeze it during each trip.
+-- Repeat return jumps after landing, without overriding the game's speed.
 connect(RunService.Heartbeat, function()
 	if destroyed or not ready then return end
-	local character, humanoid, root = getCharacterParts()
-	if not humanoid or not root or humanoid.Health <= 0 then return end
-	if safeSpeedHumanoid ~= humanoid then
-		safeSpeedHumanoid, safeWalkSpeed = nil, nil
-	end
 	local ctx = currentCycle
-	if not ctx then
-		local carry = readCarry()
-		if isSafe(root.Position) == true and not (carry and carry.IsCarrying)
-			and not motionBlockReason({character = character})
-			and humanoid.WalkSpeed > 0 and humanoid.WalkSpeed < math.huge then
-			safeSpeedHumanoid, safeWalkSpeed = humanoid, humanoid.WalkSpeed
-		end
-		return
-	end
-	if not validCycle(ctx) then return end
-	if safeSpeedHumanoid == humanoid and safeWalkSpeed then
-		if math.abs(humanoid.WalkSpeed - safeWalkSpeed) > 0.001 then
-			humanoid.WalkSpeed = safeWalkSpeed
-		end
-	end
-	-- Request another jump after landing; leave ragdoll/traps and airborne states alone.
-	if ctx.phase == "RETURN" and not ctx.braking and not motionBlockReason(ctx)
-		and humanoid.FloorMaterial ~= Enum.Material.Air
-		and humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping) then
-		humanoid.Jump = true
-	end
+	if not ctx or not validCycle(ctx) or ctx.phase ~= "RETURN" or ctx.braking then return end
+	local _, humanoid = getCharacterParts()
+	if not humanoid or humanoid.Health <= 0 or motionBlockReason(ctx) then return end
+	if humanoid.FloorMaterial == Enum.Material.Air then return end
+	if not humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping) then return end
+	local now = os.clock()
+	if now - (ctx.lastReturnJump or -math.huge) < 0.2 then return end
+	ctx.lastReturnJump = now
+	humanoid.Jump = true
+	humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 end)
 
 local gui = createInterface()
