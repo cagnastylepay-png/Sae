@@ -71,6 +71,7 @@ local PlotState, TreadmillRemotes, AssetRoster
 local PlacedEggRenderer, EggGrowthPolicy
 local hatchInProgress = false
 local wallMaintenancePending = false
+local EggSaleRemote
 local HaulRemotes
 local lastEquipBestAt = -math.huge
 local detectedMode = player:GetAttribute("InHalloweenDimension") == true and "Halloween" or "Normal"
@@ -1942,6 +1943,7 @@ local function initialize()
 	local remotes = loadModule("Shared.Remotes")
 	TreadmillRemotes = remotes.Treadmill
 	HaulRemotes = remotes.Haul
+	EggSaleRemote = remotes.PetSatchel.SellSelection
 	-- Optional event support must not prevent the egg interface from starting.
 	local function updateWorldMode()
 		local nextMode = player:GetAttribute("InHalloweenDimension") == true and "Halloween" or "Normal"
@@ -2126,6 +2128,23 @@ connect(RunService.Heartbeat, function()
 	end
 end)
 
+local function inventoryEggRecords()
+	local result = {}
+	local ok, profile = pcall(Save.Peek)
+	if not ok or type(profile) ~= "table" then return result end
+	for uid, saved in pairs(profile.EggInventory or {}) do
+		if type(uid) == "string" and type(saved) == "table" then
+			local decoded, record = pcall(EggRecords.Decode, saved)
+			if decoded and type(record) == "table" then
+				record.Uid, record.InventoryOwned = uid, true
+				record.InventoryPlaced = saved.Placement ~= nil
+				result[uid] = record
+			end
+		end
+	end
+	return result
+end
+
 local function createInterface()
 	local playerGui = player:WaitForChild("PlayerGui")
 	local previous = shared.__AutoSAEController
@@ -2161,8 +2180,13 @@ local function createInterface()
 	paramsTab.Name = "ParamsTab"
 	paramsTab.Title.Text = "Params"
 	paramsTab.Parent = tabs
-	mapTab.LayoutOrder, queueTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3
-	for _, tabButton in ipairs({mapTab, queueTab, paramsTab}) do
+	local eggsTab = mapTab:Clone()
+	eggsTab.Name = "InventoryEggsTab"
+	eggsTab.Title.Text = "Eggs"
+	eggsTab.Parent = tabs
+	mapTab.LayoutOrder, queueTab.LayoutOrder, eggsTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3, 4
+	tabs.Size = UDim2.new(tabs.Size.X.Scale * 0.75, tabs.Size.X.Offset * 0.75, tabs.Size.Y.Scale, tabs.Size.Y.Offset)
+	for _, tabButton in ipairs({mapTab, queueTab, eggsTab, paramsTab}) do
 		tabButton.Size = UDim2.fromScale(1, 0)
 		local aspect = tabButton:FindFirstChildOfClass("UIAspectRatioConstraint")
 		if not aspect then aspect = Instance.new("UIAspectRatioConstraint", tabButton) end
@@ -2173,6 +2197,9 @@ local function createInterface()
 	local activeTab = "Map"
 	local mapSelection = selectedEggs
 	local queueSelection = {}
+	local inventorySelection = {}
+	local inventoryRecords = {}
+	local saleConfirmation, salePending
 	local sort = frame:WaitForChild("SortByHolder")
 	for _, name in ipairs({"Weight", "Value", "PaddingTop", "PaddingSelect"}) do
 		local object = sort:FindFirstChild(name)
@@ -2561,20 +2588,23 @@ local function createInterface()
 
 	local function switchTab(name)
 		activeTab = name
-		selectedEggs = name == "Queue" and queueSelection or mapSelection
+		selectedEggs = name == "Queue" and queueSelection or (name == "Eggs" and inventorySelection or mapSelection)
+		saleConfirmation = nil
 		scroll.Visible = name ~= "Params"
 		paramsPanel.Visible = name == "Params"
 		sort.Visible = name ~= "Params"
+		eggsTab.Title.TextColor3 = name == "Eggs" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		paramsTab.Title.TextColor3 = name == "Params" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		mapTab.Title.TextColor3 = name == "Map" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
 		queueTab.Title.TextColor3 = name == "Queue" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
 		if name == "Queue" and refreshQueueInterface then refreshQueueInterface() end
-		if name == "Map" and refreshEggInterface then refreshEggInterface() end
+		if (name == "Map" or name == "Eggs") and refreshEggInterface then refreshEggInterface() end
 		if renderControls then renderControls() end
 	end
 	connect(mapTab.Activated, function() switchTab("Map") end)
 	connect(queueTab.Activated, function() switchTab("Queue") end)
 	connect(paramsTab.Activated, function() switchTab("Params") end)
+	connect(eggsTab.Activated, function() switchTab("Eggs") end)
 	switchTab("Map")
 	local cards = {}
 	local function countSelected()
@@ -2597,24 +2627,30 @@ local function createInterface()
 		minimumInput.Visible = true
 		sort.Clear.Active = true
 		sort.SelectAll.Active = true
-		toggleButton.Title.Text = activeTab == "Queue" and "Remove" or "Add"
+		toggleButton.Title.Text = activeTab == "Eggs" and (salePending and "Vente..." or (saleConfirmation and "Confirmer vente" or "Vendre")) or (activeTab == "Queue" and "Remove" or "Add")
 		toggleButton.Visible = activeTab ~= "Params"
 		sort.SelectAll.Visible = activeTab ~= "Params"
 		sort.Clear.Visible = activeTab ~= "Params"
 		missingButton.Visible = activeTab == "Map"
-		pauseButton.Visible = not queuePaused
-		pausedButton.Visible = queuePaused
+		pauseButton.Visible = activeTab ~= "Eggs" and not queuePaused
+		pausedButton.Visible = activeTab ~= "Eggs" and queuePaused
+		sort.Title.Visible = activeTab ~= "Eggs"
+		collectionSpacer.Visible = activeTab ~= "Eggs"
 		for uid, card in pairs(cards) do
 			local checked = selectedEggs[uid] == true
 			card.holder.SelectedOverlay.Visible = checked
 			card.holder.SelectedIcon.Visible = checked
-			card.button.Active = true
+			card.button.Active = not salePending and not (activeTab == "Eggs" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced)
 		end
 	end
 	refreshEggInterface = function()
 		if destroyed or not ready then updateSelection(); return end
 		local available = {}
-		if activeTab == "Queue" then
+		if activeTab == "Eggs" then
+			inventoryRecords = inventoryEggRecords()
+			for _, record in pairs(inventoryRecords) do table.insert(available, record) end
+			eggsTab.Title.Text = "Eggs (" .. #available .. ")"
+		elseif activeTab == "Queue" then
 			for _, entry in ipairs(queueOrder()) do
 				local record = records[entry.Uid] or entry.Record
 				if isEggInCurrentWorld(record) then table.insert(available, record) end
@@ -2653,6 +2689,8 @@ local function createInterface()
 				card = {holder = holder, visual = visual, button = click}
 				cards[uid] = card
 				card.connection = click.Activated:Connect(function()
+					if salePending or (activeTab == "Eggs" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced) then return end
+					saleConfirmation = nil
 					selectedEggs[uid] = not selectedEggs[uid] or nil
 					updateSelection()
 				end)
@@ -2660,6 +2698,7 @@ local function createInterface()
 			end
 			card.holder.LayoutOrder = index
 			paintEggCard(card.visual, record)
+			if record.InventoryPlaced then card.visual.Weight.Text = "Place - indisponible a la vente" end
 		end
 		for uid, card in pairs(cards) do
 			if not seen[uid] then
@@ -2724,16 +2763,65 @@ local function createInterface()
 		setStatus(tostring(count) .. " oeuf(s) d'animaux manquants selectionne(s). Clique Add.")
 	end)
 	connect(sort.Clear.Activated, function()
+		if salePending then return end
+		saleConfirmation = nil
 		table.clear(selectedEggs)
 		updateSelection()
 	end)
 	connect(sort.SelectAll.Activated, function()
-		for uid in pairs(cards) do selectedEggs[uid] = true end
+		if salePending then return end
+		saleConfirmation = nil
+		for uid in pairs(cards) do
+			if activeTab ~= "Eggs" or (inventoryRecords[uid] and not inventoryRecords[uid].InventoryPlaced) then selectedEggs[uid] = true end
+		end
 		updateSelection()
 	end)
 	connect(toggleButton.Activated, function()
 		if activeTab == "Params" then return end
 		refreshEggInterface()
+		if activeTab == "Eggs" then
+			if salePending then return end
+			local _, _, root = getCharacterParts()
+			if not root or isSafe(root.Position) ~= true then setStatus("Rejoins la zone sure pour vendre tes oeufs."); return end
+			local latest = inventoryEggRecords()
+			local ids, saleValue = {}, 0
+			for uid in pairs(inventorySelection) do
+				local egg = latest[uid]
+				if egg and not egg.InventoryPlaced then
+					table.insert(ids, uid)
+					local ok, price = pcall(EggRecords.SellPrice, egg)
+					if ok and type(price) == "number" then saleValue += price end
+				end
+			end
+			table.sort(ids)
+			if #ids == 0 then setStatus("Selectionne des oeufs non places a vendre."); return end
+			local signature = table.concat(ids, "|")
+			if not saleConfirmation or saleConfirmation.Signature ~= signature or os.clock() > saleConfirmation.Expires then
+				saleConfirmation = {Signature = signature, Expires = os.clock()+10}
+				setStatus("Vendre " .. #ids .. " oeuf(s) pour $" .. formatNumber(saleValue) .. " ? Clique Confirmer vente.")
+				updateSelection()
+				return
+			end
+			if not EggSaleRemote then setStatus("Vente indisponible : remote absent."); return end
+			saleConfirmation, salePending = nil, true
+			updateSelection()
+			task.spawn(function()
+				local ok, reason = pcall(function()
+					for offset = 1, #ids, 512 do
+						local batch = {}
+						for index = offset, math.min(offset+511,#ids) do table.insert(batch,ids[index]) end
+						EggSaleRemote:FireServer({Assets = {}, Eggs = batch})
+						log("INVENTORY_SELL_REQUEST", "Lot=%d Oeufs=%d | confirmation via inventaire", offset, #batch)
+						if offset+512 <= #ids then task.wait() end
+					end
+				end)
+				salePending = false
+				table.clear(inventorySelection)
+				setStatus(ok and ("Vente demandee pour " .. #ids .. " oeuf(s) ; mise a jour inventaire en attente.") or ("Vente echouee : " .. tostring(reason)))
+				refreshEggInterface()
+			end)
+			return
+		end
 		if activeTab == "Queue" then
 			local removed = 0
 			for uid in pairs(queueSelection) do
