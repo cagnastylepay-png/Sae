@@ -738,9 +738,19 @@ local function requestCarry(ctx)
 		if SlotIdentity.LooksLikeFirstAreaUid(ctx.uid) then
 			slotKey = SlotIdentity.SlotKey(ctx.record.AreaId, ctx.record.NestId)
 		end
+		local areas = Workspace:FindFirstChild("World")
+		areas = areas and areas:FindFirstChild("Areas")
+		local line = areas and areas:FindFirstChild("SeparationLine")
+		local depth = root and line and line:IsA("BasePart") and line.CFrame.LookVector:Dot(root.Position - line.Position)
+		log("CARRY_CONTEXT", "Pos=%s Distance3D=%s ProfondeurLigne=%s Halloween=%s SlotKey=%s",
+			root and formatPosition(root.Position) or "absent", tostring(distance), tostring(depth),
+			tostring(player:GetAttribute("InHalloweenDimension")), tostring(slotKey))
 		local ok, accepted, reason = pcall(EggState.CarryFieldEgg, ctx.uid, slotKey)
+		if ok and accepted ~= true and type(reason) == "string" and reason:find("Enter the gameplay area first", 1, true) then
+			ctx.gameplayEntryRejected = true
+		end
 		request.done = true
-		request.callOK, request.retryable = ok, ok and accepted ~= true
+		request.callOK, request.retryable = ok, ok and accepted ~= true and not ctx.gameplayEntryRejected
 		request.accepted = ok and accepted == true
 		request.reason = ok and reason or tostring(accepted)
 		-- A timed-out InvokeServer may finish later. It never controls a newer cycle.
@@ -1287,6 +1297,9 @@ local function runCycle(record, rate, recovering, findNext)
 			local destination = Vector3.new(ctx.eggPosition.X, ctx.home.Y, ctx.eggPosition.Z)
 			grabbed, grabReason = measureAction("APPROCHE_ET_PRISE", moveThenCarry, ctx, destination)
 		end
+		if ctx.gameplayEntryRejected then
+			return false, "GAMEPLAY_ENTRY_REQUIRED"
+		end
 		if not validCycle(ctx) then return false, "annule" end
 		if not grabbed and inFlightRequest and not inFlightRequest.done then
 			return false, grabReason or "requete serveur encore en cours"
@@ -1321,6 +1334,7 @@ local function runCycle(record, rate, recovering, findNext)
 				ctx.attempts, ctx.lastRequest = 0, -math.huge
 				local target = Vector3.new(ctx.eggPosition.X, ctx.home.Y, ctx.eggPosition.Z)
 				grabbed, grabReason = moveThenCarry(ctx, target)
+				if ctx.gameplayEntryRejected then return false, "GAMEPLAY_ENTRY_REQUIRED" end
 				if not validCycle(ctx) then return false, "annule" end
 				if not grabbed and inFlightRequest and not inFlightRequest.done then
 					return false, grabReason or "requete serveur encore en cours"
@@ -1776,6 +1790,10 @@ local function worker(token)
 				if renderControls then renderControls() end
 			end
 			if not success then
+				if reason == "GAMEPLAY_ENTRY_REQUIRED" then
+					stopAutomation("Prise refusee : entre manuellement dans la zone de jeu puis relance la collecte.")
+					return
+				end
 				log("CYCLE_FAILED", "UID=%s Raison=%s", selected.Uid, tostring(reason))
 				cooldowns[selected.Uid] = (reason == "TARGET_UNAVAILABLE" or reason == "NEXT_AVAILABLE") and 0 or (os.clock() + CONFIG.FailedTargetCooldown)
 				queuedEggs[selected.Uid] = nil
