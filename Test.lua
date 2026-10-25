@@ -52,6 +52,8 @@ local refreshEggInterface
 local selectedEggs = {}
 local automaticMode = true
 local autoIncludeMissingIndex = true
+local autoOpenEgg = true
+local autoEquipBest = true
 local stopAfterFlight = false
 local queuedEggs = {}
 local removedFromAuto = {}
@@ -144,6 +146,7 @@ function executorTools.SaveSettings()
 	local json = HttpService:JSONEncode({
 		Version = 1, AutomaticMode = automaticMode,
 		IncludeMissingIndex = autoIncludeMissingIndex,
+		AutoOpenEgg = autoOpenEgg, AutoEquipBest = autoEquipBest,
 		MinimumBillions = minimumRatePerSecond / 1e9,
 	})
 	if json == lastSettingsJSON then return true, settingsPath end
@@ -164,6 +167,8 @@ local function loadSettings()
 	end
 	if type(settings.AutomaticMode) == "boolean" then automaticMode = settings.AutomaticMode end
 	if type(settings.IncludeMissingIndex) == "boolean" then autoIncludeMissingIndex = settings.IncludeMissingIndex end
+	if type(settings.AutoOpenEgg) == "boolean" then autoOpenEgg = settings.AutoOpenEgg end
+	if type(settings.AutoEquipBest) == "boolean" then autoEquipBest = settings.AutoEquipBest end
 	local minimum = settings.MinimumBillions
 	if type(minimum) == "number" and minimum == minimum and minimum >= MINIMUM_BILLIONS and minimum <= MAXIMUM_BILLIONS then
 		minimumRatePerSecond = minimum * 1e9
@@ -1487,7 +1492,7 @@ local function leaveTreadmill(token)
 end
 
 local function hatchReadyEggsOnWallClose(token)
-	if hatchInProgress or not PlacedEggRenderer or not EggGrowthPolicy then return end
+	if not autoOpenEgg or hatchInProgress or not PlacedEggRenderer or not EggGrowthPolicy then return end
 	local ok, eggs = pcall(EggState.ReadOwnerEggs, player.UserId)
 	if not ok or type(eggs) ~= "table" then log("HATCH_SCAN", "Lecture des oeufs indisponible"); return end
 	local readyUids = {}
@@ -1499,7 +1504,7 @@ local function hatchReadyEggsOnWallClose(token)
 	end
 	table.sort(readyUids)
 	for _, uid in ipairs(readyUids) do
-		if destroyed or not autoEnabled or generation ~= token or not automaticMode or queuePaused then break end
+		if destroyed or not autoEnabled or generation ~= token or not automaticMode or queuePaused or not autoOpenEgg then break end
 		local readOK, latest = pcall(EggState.ReadOwnedEgg, player.UserId, uid)
 		local readyOK, grown = false, false
 		if readOK and type(latest) == "table" and latest.Placement ~= nil then
@@ -1520,9 +1525,9 @@ local function serviceWallMaintenance(token)
 	local _, _, root = getCharacterParts()
 	if not root or isSafe(root.Position) ~= true then return end
 	wallMaintenancePending = false
-	hatchReadyEggsOnWallClose(token)
+	if autoOpenEgg then hatchReadyEggsOnWallClose(token) end
 	if destroyed or not autoEnabled or generation ~= token or queuePaused then return end
-	if HaulRemotes and os.clock() - lastEquipBestAt >= 5 then
+	if autoEquipBest and HaulRemotes and os.clock() - lastEquipBestAt >= 5 then
 		lastEquipBestAt = os.clock()
 		setStatus("Mur ferme : Equip Best...")
 		local ok, accepted, reason = pcall(function() return HaulRemotes.WearBest:InvokeServer() end)
@@ -2189,8 +2194,13 @@ local function createInterface()
 		end
 	end
 
-	local paramsPanel = Instance.new("Frame")
+	local paramsPanel = Instance.new("ScrollingFrame")
 	paramsPanel.Name = "Params"
+	paramsPanel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	paramsPanel.CanvasSize = UDim2.new()
+	paramsPanel.ScrollBarThickness = 6
+	paramsPanel.ScrollingDirection = Enum.ScrollingDirection.Y
+	paramsPanel.BorderSizePixel = 0
 	paramsPanel.BackgroundTransparency = 1
 	paramsPanel.Position = scroll.Position
 	paramsPanel.Size = scroll.Size
@@ -2215,6 +2225,46 @@ local function createInterface()
 		caption(includeMissingButton, autoIncludeMissingIndex and "Manquants : ON" or "Manquants : OFF")
 		setStatus(autoIncludeMissingIndex and "AUTO : seuil OU animaux manquants." or "AUTO : seuil de revenu uniquement. File existante conservee.")
 		if ready then syncQueue(); wakeQueue() end
+	end)
+
+	local function paramButton(name, order, text, callback)
+		local button = autoButton:Clone()
+		button.Name = name
+		button.LayoutOrder = order
+		button.Size = UDim2.new(0.9, 0, 0, 44)
+		button.Parent = paramsPanel
+		caption(button, text)
+		connect(button.Activated, callback)
+		return button
+	end
+	local openEggButton, equipBestButton
+	openEggButton = paramButton("AutoOpenEgg", 50, autoOpenEgg and "Auto open egg : ON" or "Auto open egg : OFF", function()
+		autoOpenEgg = not autoOpenEgg
+		caption(openEggButton, autoOpenEgg and "Auto open egg : ON" or "Auto open egg : OFF")
+		log("PARAM_CHANGED", "AutoOpenEgg=%s", tostring(autoOpenEgg))
+		executorTools.SaveSettings()
+	end)
+	equipBestButton = paramButton("AutoEquipBest", 60, autoEquipBest and "Auto equip best : ON" or "Auto equip best : OFF", function()
+		autoEquipBest = not autoEquipBest
+		caption(equipBestButton, autoEquipBest and "Auto equip best : ON" or "Auto equip best : OFF")
+		log("PARAM_CHANGED", "AutoEquipBest=%s", tostring(autoEquipBest))
+		executorTools.SaveSettings()
+	end)
+	paramButton("ProbeSpeed", 70, "Test vitesse x1.5 (5 s)", function()
+		local ok, message = executorTools.RunSpeedTest()
+		setStatus((ok and "" or "Test refuse : ") .. tostring(message))
+	end)
+	paramButton("ProbeGuard", 80, "Test collisions gardien (5 s)", function()
+		local ok, message = executorTools.RunGuardCollisionTest()
+		setStatus((ok and "" or "Test refuse : ") .. tostring(message))
+	end)
+	paramButton("StopProbe", 90, "Arreter le test", function()
+		local ok, message = executorTools.StopTest()
+		setStatus(ok and "Arret du test : restauration en cours" or tostring(message))
+	end)
+	paramButton("SaveLogs", 100, "Sauvegarder les logs", function()
+		local ok, message = executorTools.SaveLog()
+		setStatus((ok and "Logs : " or "Echec logs : ") .. tostring(message))
 	end)
 	thresholdTitle.Parent = paramsPanel
 	minimumInput.Parent = paramsPanel
