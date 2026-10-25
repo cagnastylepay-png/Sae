@@ -55,6 +55,8 @@ local autoIncludeMissingIndex = true
 local autoOpenEgg = true
 local autoEquipBest = true
 local timingEnabled = true
+local manualSession
+local toggleManualRecording, manualCarryChanged
 local stopAfterFlight = false
 local queuedEggs = {}
 local removedFromAuto = {}
@@ -1772,6 +1774,7 @@ local function worker(token)
 end
 
 startAutomation = function(billions)
+	if manualSession then setStatus("Arrete le test manuel avant de relancer AUTO."); return false end
 	if detectedMode ~= "Normal" then setStatus("Mode Halloween : observation uniquement."); return false end
 	if destroyed or not ready then
 		setStatus("Les modules du jeu sont indisponibles", Color3.fromRGB(255, 130, 110))
@@ -1814,6 +1817,7 @@ startAutomation = function(billions)
 end
 
 wakeQueue = function()
+	if manualSession then return end
 	if detectedMode ~= "Normal" or destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
 	if inFlightRequest and not inFlightRequest.done then return end
 	startAutomation(minimumRatePerSecond / 1e9)
@@ -1915,6 +1919,7 @@ local function initialize()
 		log("FIELD_GONE", "UID=%s | ne prouve pas la possession", tostring(uid))
 	end)
 	connect(EggState.CarryChanged, function(state)
+		manualCarryChanged(state)
 		local ctx = currentCycle
 		log("CARRY_CHANGED", "Carrying=%s UID=%s Area=%s SpeedMultiplier=%s",
 			tostring(state.IsCarrying), tostring(state.Uid), tostring(state.AreaId), tostring(state.SpeedMultiplier))
@@ -1926,6 +1931,7 @@ local function initialize()
 		end
 	end)
 	connect(EggState.FieldClaimed, function(payload)
+		if manualSession and manualSession.sawCarry and payload.AssetCategory == manualSession.record.AssetCategory then manualSession.claimFeedback = true end
 		local ctx = currentCycle
 		log("FIELD_CLAIMED", "Animal=%s Rarity=%s Pos=%s | payload sans UID",
 			tostring(payload.AssetCategory), tostring(payload.Rarity), formatPosition(payload.Position))
@@ -1949,6 +1955,90 @@ local function initialize()
 	if refreshBestEggCard then refreshBestEggCard() end
 	log("READY", "Build=2.4 | MoveTo renouvele / freinage horizontal / distance 3D <= 8 / %d essais en serie / retour / inventaire / reprise meme UID", CONFIG.MaxCarryAttempts)
 end
+
+toggleManualRecording = function()
+	if manualSession then
+		log("MANUAL_END", "DureeMs=%.1f | enregistrement termine, collecte reste en pause", (os.clock() - manualSession.startedAt) * 1000)
+		manualSession = nil
+		executorTools.SaveLog()
+		setStatus("Test manuel termine : logs sauvegardes, collecte en pause.")
+		return false, "Enregistrer un vol manuel"
+	end
+	if not ready then setStatus("Attends le chargement du script."); return false, "Enregistrer un vol manuel" end
+	if currentCycle or (inFlightRequest and not inFlightRequest.done) then
+		setStatus("Termine le vol actif avant de lancer le test manuel.")
+		return false, "Enregistrer un vol manuel"
+	end
+	stopAutomation("Enregistrement manuel : collecte en pause")
+	autoActivity = "IDLE"
+	local _, humanoid, root = getCharacterParts()
+	if not humanoid or not root then return false, "Enregistrer un vol manuel" end
+	local now = os.clock()
+	manualSession = {
+		startedAt = now, phaseStartedAt = now, phase = "MANUAL_READY",
+		ownerBefore = ownerSnapshot(), record = {}, character = player.Character,
+		lastPosition = root.Position, lastSampleAt = now, lastSafe = isSafe(root.Position),
+	}
+	log("MANUAL_BEGIN", "Mode=MANUAL WalkSpeed=%.2f Pos=%s | commandes manette laissees au joueur ; aucune requete de prise envoyee par le test", humanoid.WalkSpeed, formatPosition(root.Position))
+	setStatus("Test manuel ON : joue a la manette, puis arrete l'enregistrement.")
+	return true, "Arreter le test manuel"
+end
+
+manualCarryChanged = function(state)
+	local session = manualSession
+	if not session then return end
+	local now = os.clock()
+	log("MANUAL_CARRY", "Carrying=%s UID=%s DepuisDebutMs=%.1f", tostring(state.IsCarrying), tostring(state.Uid), (now - session.startedAt) * 1000)
+	if state.IsCarrying and state.Uid then
+		session.uid = state.Uid
+		session.record = readField(state.Uid) or {AssetCategory = state.AssetCategory}
+		session.sawCarry, session.claimed, session.claimFeedback = true, false, false
+		session.pickupAt = now
+		setPhase(session, "RETURN", "Test manuel : oeuf porte, retour observe")
+	else
+		session.releasedAt = now
+		setPhase(session, "CONFIRM_CLAIM", "Test manuel : transport termine, attribution a verifier")
+	end
+end
+
+local nextManualSample = 0
+connect(RunService.Heartbeat, function()
+	local session = manualSession
+	if not session or not ready or destroyed or os.clock() < nextManualSample then return end
+	local now = os.clock()
+	nextManualSample = now + 0.5
+	local character, humanoid, root = getCharacterParts()
+	if not root or not humanoid or character ~= session.character then
+		log("MANUAL_INTERRUPTED", "Personnage change ou absent")
+		toggleManualRecording()
+		return
+	end
+	local safe = isSafe(root.Position)
+	if safe ~= session.lastSafe then
+		session.lastSafe = safe
+		log("MANUAL_SAFE_CHANGED", "Safe=%s DepuisDebutMs=%.1f DepuisPriseMs=%s", tostring(safe), (now - session.startedAt)*1000, session.pickupAt and tostring((now-session.pickupAt)*1000) or "sans prise")
+		if safe ~= true and not session.sawCarry then setPhase(session, "APPROACH", "Test manuel : sortie de zone sure") end
+	end
+	local measured = distanceXZ(root.Position, session.lastPosition) / math.max(now - session.lastSampleAt, 0.001)
+	local velocity = root.AssemblyLinearVelocity
+	local moving = Vector2.new(velocity.X, velocity.Z).Magnitude > 1
+	if moving ~= session.moving then
+		log("MANUAL_MOVEMENT", "Action=%s DepuisDebutMs=%.1f WalkSpeed=%.2f", moving and "MARCHE" or "ARRET", (now-session.startedAt)*1000, humanoid.WalkSpeed)
+		session.moving = moving
+	end
+	log("TIMING_SPEED", "Mode=MANUAL Phase=%s WalkSpeed=%.2f PhysiqueXZ=%.2f DeplacementXZ=%.2f Pos=%s Safe=%s Input=%s",
+		session.phase, humanoid.WalkSpeed, Vector2.new(velocity.X,velocity.Z).Magnitude, measured,
+		formatPosition(root.Position), tostring(safe), tostring(UserInputService:GetLastInputType()))
+	session.lastPosition, session.lastSampleAt = root.Position, now
+	if session.uid and not session.claimed then
+		local confirmed, source = claimEvidence(session)
+		if confirmed then
+			session.claimed = true
+			log("MANUAL_CLAIM_CONFIRMED", "UID=%s Source=%s DepuisDebutMs=%.1f DepuisPriseMs=%s", session.uid, tostring(source), (now-session.startedAt)*1000, session.pickupAt and tostring((now-session.pickupAt)*1000) or "?")
+			setPhase(session, "CLAIM_CONFIRMED", "Test manuel : attribution confirmee")
+		end
+	end
+end)
 
 local function createInterface()
 	local playerGui = player:WaitForChild("PlayerGui")
@@ -2334,6 +2424,11 @@ local function createInterface()
 		caption(timingButton, timingEnabled and "Timing / latence : ON" or "Timing / latence : OFF")
 		executorTools.SaveSettings()
 	end)
+	local manualButton
+	manualButton = paramButton("RecordManual", 80, "Enregistrer un vol manuel", function()
+		local _, title = toggleManualRecording()
+		caption(manualButton, title)
+	end)
 	paramButton("SaveLogs", 100, "Sauvegarder les logs", function()
 		local ok, message = executorTools.SaveLog()
 		setStatus((ok and "Logs : " or "Echec logs : ") .. tostring(message))
@@ -2636,7 +2731,7 @@ connect(RunService.Heartbeat, function()
 		measured = distanceXZ(root.Position, lastTimingSample.Position) / math.max(now - lastTimingSample.Time, 0.001)
 	end
 	local velocity = root.AssemblyLinearVelocity
-	log("TIMING_SPEED", "Phase=%s WalkSpeed=%.2f PhysiqueXZ=%.2f DeplacementXZ=%.2f Pos=%s Safe=%s",
+	log("TIMING_SPEED", "Mode=AUTO Phase=%s WalkSpeed=%.2f PhysiqueXZ=%.2f DeplacementXZ=%.2f Pos=%s Safe=%s",
 		tostring(ctx.phase), humanoid.WalkSpeed, Vector2.new(velocity.X, velocity.Z).Magnitude,
 		measured, formatPosition(root.Position), tostring(isSafe(root.Position)))
 	lastTimingSample = {Cycle = ctx, Time = now, Position = root.Position}
