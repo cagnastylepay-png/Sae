@@ -55,6 +55,9 @@ local automaticMode = true
 local autoIncludeMissingIndex = true
 local autoOpenEgg = true
 local autoEquipBest = true
+local autoKeepBest100 = true
+local inventoryEggRecords
+local inventorySaleBusy = false
 local timingEnabled = true
 local manualSession
 local toggleManualRecording, manualCarryChanged
@@ -166,6 +169,7 @@ function executorTools.SaveSettings()
 		Version = 1, AutomaticMode = automaticMode,
 		IncludeMissingIndex = autoIncludeMissingIndex,
 		AutoOpenEgg = autoOpenEgg, AutoEquipBest = autoEquipBest,
+		AutoKeepBest100 = autoKeepBest100,
 		TimingEnabled = timingEnabled,
 		MinimumBillions = minimumRatePerSecond / 1e9,
 	})
@@ -190,6 +194,7 @@ local function loadSettings()
 	if type(settings.AutoOpenEgg) == "boolean" then autoOpenEgg = settings.AutoOpenEgg end
 	if type(settings.AutoEquipBest) == "boolean" then autoEquipBest = settings.AutoEquipBest end
 	if type(settings.TimingEnabled) == "boolean" then timingEnabled = settings.TimingEnabled end
+	if type(settings.AutoKeepBest100) == "boolean" then autoKeepBest100 = settings.AutoKeepBest100 end
 	local minimum = settings.MinimumBillions
 	if type(minimum) == "number" and minimum == minimum and minimum >= MINIMUM_BILLIONS and minimum <= MAXIMUM_BILLIONS then
 		minimumRatePerSecond = minimum * 1e9
@@ -1681,6 +1686,60 @@ local function hatchReadyEggsOnWallClose(token)
 	end
 end
 
+local function planInventoryRetention(eggs)
+	local candidates, protectedCount, total = {}, 0, 0
+	for uid, egg in pairs(eggs) do
+		if not egg.InventoryPlaced then
+			total += 1
+			local rate = getRatePerSecond(egg)
+			if getRarityName(egg) == "Divine" or rate == nil then
+				protectedCount += 1
+			else
+				table.insert(candidates, {Uid = uid, Rate = rate})
+			end
+		end
+	end
+	table.sort(candidates, function(a,b)
+		if a.Rate ~= b.Rate then return a.Rate > b.Rate end
+		return a.Uid < b.Uid
+	end)
+	local slots = math.max(0, 100-protectedCount)
+	local sell = {}
+	for index = slots+1, #candidates do table.insert(sell, candidates[index].Uid) end
+	return sell, total, protectedCount
+end
+
+local function retainBestInventoryEggs(token)
+	if not autoKeepBest100 or inventorySaleBusy or not EggSaleRemote or not inventoryEggRecords then return end
+	if destroyed or not autoEnabled or generation ~= token or queuePaused or currentCycle then return end
+	local _, _, root = getCharacterParts()
+	if not root or isSafe(root.Position) ~= true then return end
+	local ids, total, protected = planInventoryRetention(inventoryEggRecords())
+	log("INVENTORY_RETENTION", "InventaireNonPlace=%d ProtegesDivineOuRevenuInconnu=%d A_Vendre=%d Limite=100", total, protected, #ids)
+	if #ids == 0 then return end
+	inventorySaleBusy = true
+	local ok, reason = pcall(function()
+		for offset = 1, #ids, 512 do
+			if destroyed or not autoEnabled or generation ~= token or queuePaused then break end
+			-- Recompute before each batch: never sell an egg now inside the best 100.
+			local freshPlan = planInventoryRetention(inventoryEggRecords())
+			local allowed = {}
+			for _, uid in ipairs(freshPlan) do allowed[uid] = true end
+			local batch = {}
+			for index = offset, math.min(offset+511,#ids) do
+				if allowed[ids[index]] then table.insert(batch, ids[index]) end
+			end
+			if #batch > 0 then
+				EggSaleRemote:FireServer({Assets = {}, Eggs = batch})
+				log("WALL_INVENTORY_SELL", "Oeufs=%d | Divine conserves, confirmation via inventaire", #batch)
+			end
+			if offset+512 <= #ids then task.wait() end
+		end
+	end)
+	inventorySaleBusy = false
+	if not ok then log("ERROR", "Vente inventaire : %s", tostring(reason)) end
+end
+
 local function serviceWallMaintenance(token)
 	if not wallMaintenancePending or destroyed or not autoEnabled or generation ~= token or currentCycle then return end
 	local _, _, root = getCharacterParts()
@@ -1694,6 +1753,7 @@ local function serviceWallMaintenance(token)
 		local ok, accepted, reason = pcall(function() return HaulRemotes.WearBest:InvokeServer() end)
 		log("WALL_EQUIP_BEST", "Accepte=%s Raison=%s", tostring(ok and accepted == true), tostring(ok and reason or accepted))
 	end
+	retainBestInventoryEggs(token)
 end
 
 local function idleOnTreadmill(token)
@@ -2128,7 +2188,7 @@ connect(RunService.Heartbeat, function()
 	end
 end)
 
-local function inventoryEggRecords()
+inventoryEggRecords = function()
 	local result = {}
 	local ok, profile = pcall(Save.Peek)
 	if not ok or type(profile) ~= "table" then return result end
@@ -2531,6 +2591,13 @@ local function createInterface()
 		log("PARAM_CHANGED", "AutoEquipBest=%s", tostring(autoEquipBest))
 		executorTools.SaveSettings()
 	end)
+	local keep100Button
+	keep100Button = paramButton("AutoKeepBest100", 65, autoKeepBest100 and "Garder 100 + Divine : ON" or "Garder 100 + Divine : OFF", function()
+		autoKeepBest100 = not autoKeepBest100
+		caption(keep100Button, autoKeepBest100 and "Garder 100 + Divine : ON" or "Garder 100 + Divine : OFF")
+		log("PARAM_CHANGED", "AutoKeepBest100=%s", tostring(autoKeepBest100))
+		executorTools.SaveSettings()
+	end)
 	local timingButton
 	timingButton = paramButton("TimingEnabled", 70, timingEnabled and "Timing / latence : ON" or "Timing / latence : OFF", function()
 		timingEnabled = not timingEnabled
@@ -2780,7 +2847,7 @@ local function createInterface()
 		if activeTab == "Params" then return end
 		refreshEggInterface()
 		if activeTab == "Eggs" then
-			if salePending then return end
+			if salePending or inventorySaleBusy then return end
 			local _, _, root = getCharacterParts()
 			if not root or isSafe(root.Position) ~= true then setStatus("Rejoins la zone sure pour vendre tes oeufs."); return end
 			local latest = inventoryEggRecords()
@@ -2804,6 +2871,7 @@ local function createInterface()
 			end
 			if not EggSaleRemote then setStatus("Vente indisponible : remote absent."); return end
 			saleConfirmation, salePending = nil, true
+			inventorySaleBusy = true
 			updateSelection()
 			task.spawn(function()
 				local ok, reason = pcall(function()
@@ -2816,6 +2884,7 @@ local function createInterface()
 					end
 				end)
 				salePending = false
+				inventorySaleBusy = false
 				table.clear(inventorySelection)
 				setStatus(ok and ("Vente demandee pour " .. #ids .. " oeuf(s) ; mise a jour inventaire en attente.") or ("Vente echouee : " .. tostring(reason)))
 				refreshEggInterface()
