@@ -938,8 +938,19 @@ local function moveReturnLoop(ctx, destination)
 	while true do
 		local valid, reason = validCycle(ctx)
 		if not valid then return false, reason end
-		if carryWasLost(ctx) then
-			stopMovement()
+		if ctx.watchForReappearance then
+			local carry = readCarry()
+			if carry and carry.IsCarrying and carry.Uid == ctx.uid then
+				ctx.hadCarry, ctx.sawCarry, ctx.watchForReappearance = true, true, false
+				return false, "TARGET_CARRIED"
+			end
+			local latest, readOK = readField(ctx.uid)
+			if readOK and latest and (latest.State == SLOT_STATE or latest.State == "Dropped")
+				and latest.CarrierUserId == nil and getRecordPosition(latest) and not ownsEgg(ctx.uid) then
+				ctx.record, ctx.eggPosition = latest, getRecordPosition(latest)
+				return false, "TARGET_REAPPEARED"
+			end
+		elseif carryWasLost(ctx) then
 			return false, CARRY_LOST
 		end
 		if motionBlockReason(ctx) then
@@ -1072,22 +1083,47 @@ local function runCycle(record, rate, recovering)
 			return false, grabReason or "requete serveur encore en cours"
 		end
 		ctx.hadCarry = grabbed == true
+		ctx.watchForReappearance = not grabbed
+		if not grabbed then log("TARGET_RETURN_EMPTY", "UID=%s : retour en surveillant sa reapparition", ctx.uid) end
 		while validCycle(ctx) do
 			local returned, returnReason = moveReturnLoop(ctx, ctx.home)
-			if not returned and returnReason ~= CARRY_LOST then return false, returnReason end
 			if returned then
 				local _, _, currentRoot = getCharacterParts()
 				if not currentRoot or isSafe(currentRoot.Position) ~= true then
 					return false, "retour termine mais ligne safe non franchie"
 				end
-				if not grabbed then return false, grabReason end
+				if not grabbed then return false, "TARGET_UNAVAILABLE" end
 				local claimed, claimReason = waitForClaim(ctx)
 				if claimed then return true end
 				if claimReason ~= CARRY_LOST then return false, claimReason end
+				returnReason = CARRY_LOST
 			end
-			local recovered, recoveryReason = recoverSameEgg(ctx)
-			if not recovered then return false, recoveryReason end
-			grabbed = true
+			if returnReason == "TARGET_CARRIED" then
+				grabbed = true
+			elseif returnReason == "TARGET_REAPPEARED" then
+				if inFlightRequest and not inFlightRequest.done then
+					return false, "requete serveur encore en cours"
+				end
+				log("TARGET_REAPPEARED", "UID=%s : reprise du trajet vers l'oeuf", ctx.uid)
+				ctx.pickupVersion = ctx.record.Version
+				ctx.remoteAccepted, ctx.sawCarry, ctx.claimed, ctx.claimFeedback = false, false, false, false
+				ctx.carryLostAt, ctx.lossLogged, ctx.reacquiring = nil, false, false
+				ctx.attempts, ctx.lastRequest = 0, -math.huge
+				local target = Vector3.new(ctx.eggPosition.X, ctx.home.Y, ctx.eggPosition.Z)
+				grabbed, grabReason = moveThenCarry(ctx, target)
+				if not validCycle(ctx) then return false, "annule" end
+				if not grabbed and inFlightRequest and not inFlightRequest.done then
+					return false, grabReason or "requete serveur encore en cours"
+				end
+				ctx.hadCarry = grabbed == true
+				ctx.watchForReappearance = not grabbed
+			elseif returnReason == CARRY_LOST then
+				grabbed = false
+				ctx.hadCarry, ctx.watchForReappearance = false, true
+				log("TARGET_RETURN_EMPTY", "UID=%s : port perdu, retour sans arret en surveillant l'oeuf", ctx.uid)
+			else
+				return false, returnReason
+			end
 		end
 		return false, "annule"
 	end, debug.traceback)
@@ -1557,7 +1593,7 @@ local function worker(token)
 			end
 			if not success then
 				log("CYCLE_FAILED", "UID=%s Raison=%s", selected.Uid, tostring(reason))
-				cooldowns[selected.Uid] = os.clock() + CONFIG.FailedTargetCooldown
+				cooldowns[selected.Uid] = reason == "TARGET_UNAVAILABLE" and 0 or (os.clock() + CONFIG.FailedTargetCooldown)
 				queuedEggs[selected.Uid] = nil
 				-- Never continue after ambiguous ownership or an unresolved request.
 				if recovering or (inFlightRequest and not inFlightRequest.done) then
