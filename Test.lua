@@ -73,7 +73,6 @@ local detectedMode = player:GetAttribute("InHalloweenDimension") == true and "Ha
 local halloweenRecords = {}
 local activityRecheckPending = false
 local refreshBestEggCard
-local lastDepartureArrival
 local treadmillAssigned, treadmillPending = false, false
 local autoActivity = "IDLE"
 
@@ -1336,7 +1335,7 @@ end
 local function leaveTreadmill(token)
 	if not treadmillAssigned and autoActivity ~= "TREADMILL" and autoActivity ~= "TO_TREADMILL" then return true end
 	autoActivity = "LEAVING_TREADMILL"
-	setStatus("Sortie du tapis puis trajet vers le depart...")
+	setStatus("Sortie du tapis puis trajet direct vers l'oeuf...")
 	local _, humanoid = getCharacterParts()
 	if treadmillAssigned then
 		local ok, reason = treadmillRequest(TreadmillRemotes.AskDoff, token)
@@ -1346,13 +1345,10 @@ local function leaveTreadmill(token)
 		if treadmillAssigned then return false, "sortie du tapis non confirmee" end
 	end
 	if humanoid then humanoid.Jump = true end
-	local ok, reason = pathTo(CONFIG.FarmDeparture, token, false)
-	if ok then
-		autoActivity = "FARM"; safeHome = CONFIG.FarmDeparture
-		lastDepartureArrival = os.clock()
-		log("DEPARTURE_READY", "Point de depart atteint : transition directe vers le vol")
-	end
-	return ok, reason, ok
+	autoActivity = "FARM"
+	safeHome = CONFIG.FarmDeparture
+	log("TREADMILL_EXIT_READY", "Sortie confirmee : trajet direct vers l'oeuf")
+	return true
 end
 
 local function hatchReadyEggsOnWallClose(token)
@@ -1495,22 +1491,11 @@ local function worker(token)
 			selected, rate = selectBest()
 		end
 		if selected then
-			local exited, exitReason, reachedDeparture = leaveTreadmill(token)
+			local exited, exitReason = leaveTreadmill(token)
 			if not exited then stopAutomation("Sortie tapis : " .. tostring(exitReason)); return end
 			if not autoEnabled or generation ~= token then return end
-			if not recovering then
-				local _, _, root = getCharacterParts()
-				if not root then stopAutomation("Personnage absent"); return end
-				if not reachedDeparture and distanceXZ(root.Position, CONFIG.FarmDeparture) > 3 then
-					autoActivity = "TO_FARM"
-					setStatus("Trajet vers le point de depart...")
-					local reached, detail = pathTo(CONFIG.FarmDeparture, token, false)
-					if not reached then stopAutomation("Depart : " .. tostring(detail)); return end
-					lastDepartureArrival = os.clock()
-				end
-			end
 			autoActivity = "FARM"
-			log("FARM_START", "Delai depuis arrivee depart=%.3fs", lastDepartureArrival and (os.clock()-lastDepartureArrival) or 0)
+			log("FARM_START", "UID=%s : trajet direct vers l'oeuf, sans detour au depart", selected.Uid)
 			local success, reason = runCycle(selected, rate, recovering)
 			if not autoEnabled or generation ~= token then return end
 			if success then
@@ -2240,7 +2225,7 @@ local function createInterface()
 			stopAfterFlight = false
 			queuePaused = false
 			safeHome = CONFIG.FarmDeparture
-			setStatus("AUTO ON : trajet vers le depart ou le tapis selon la file.")
+			setStatus("AUTO ON : trajet direct vers l'oeuf ou pathfinding vers le tapis selon la file.")
 		else
 			requestUserStop("AUTO OFF")
 		end
