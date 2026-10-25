@@ -58,6 +58,7 @@ local stopAfterFlight = false
 local queuedEggs = {}
 local removedFromAuto = {}
 local queueDecisionLogs = {}
+local lastQueueSummary
 local queuePaused = false
 local syncQueue, wakeQueue, refreshQueueInterface, startAutomation
 local stopAutomation
@@ -1321,7 +1322,7 @@ local function enqueueEgg(record, source)
 		end
 	end
 	if queuedEggs[record.Uid] then
-		if source == "AUTO" then logQueueDecision(record.Uid, "EN FILE | Auto=" .. tostring(autoEnabled) .. " Pause=" .. tostring(queuePaused) .. " Activite=" .. autoActivity) end
+		if source == "AUTO" then logQueueDecision(record.Uid, "EN FILE | Auto=" .. tostring(autoEnabled) .. " Pause=" .. tostring(queuePaused) .. " Activite=" .. autoActivity .. " Cooldown=" .. tostring((cooldowns[record.Uid] or 0) > os.clock())) end
 		return false
 	end
 	if record.State ~= SLOT_STATE and record.State ~= "Dropped" then return reject("EXCLU : etat=" .. tostring(record.State)) end
@@ -1355,8 +1356,9 @@ syncQueue = function()
 		local backpackCategories = backpackEggCategories(ok and profile or nil)
 		local candidates = {}
 		for uid, record in pairs(records) do
-			if (cooldowns[uid] or 0) <= os.clock() then
-				local rate = getRatePerSecond(record) or 0
+			do
+				local calculatedRate = getRatePerSecond(record)
+				local rate = calculatedRate or 0
 				local missing = autoIncludeMissingIndex and type(index) == "table"
 					and type(record.AssetCategory) == "string" and Assets.Directory[record.AssetCategory] ~= nil
 					and index[record.AssetCategory] ~= true
@@ -1367,6 +1369,8 @@ syncQueue = function()
 					enqueueEgg(record, "AUTO")
 				elseif missing then
 					table.insert(candidates, record)
+				else
+					logQueueDecision(uid, calculatedRate and ("HORS SEUIL : revenu=" .. tostring(rate) .. " seuil=" .. tostring(minimumRatePerSecond) .. " | index non eligible") or "REVENU INDISPONIBLE : calcul impossible")
 				end
 			end
 		end
@@ -1382,6 +1386,18 @@ syncQueue = function()
 			return a.Uid < b.Uid
 		end)
 		for _, record in ipairs(candidates) do enqueueEgg(record, "INDEX") end
+	end
+	local total, queued, above = 0, 0, 0
+	for _, record in pairs(records) do
+		total += 1
+		if (getRatePerSecond(record) or 0) >= minimumRatePerSecond then above += 1 end
+	end
+	for _ in pairs(queuedEggs) do queued += 1 end
+	local summary = string.format("Mode=%s AutoParam=%s Collecte=%s Pause=%s Seuil=%s Detectes=%d AuDessusSeuil=%d EnFile=%d",
+		detectedMode, tostring(automaticMode), tostring(autoEnabled), tostring(queuePaused), tostring(minimumRatePerSecond), total, above, queued)
+	if summary ~= lastQueueSummary then
+		lastQueueSummary = summary
+		log("QUEUE_SUMMARY", "%s", summary)
 	end
 	if refreshQueueInterface then refreshQueueInterface() end
 end
