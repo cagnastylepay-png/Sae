@@ -136,11 +136,25 @@ local function distanceXZ(first, second)
 	return Vector2.new(delta.X, delta.Z).Magnitude
 end
 
-local function stopMovement()
-	local _, humanoid, root = getCharacterParts()
+local function stopMovement(hardBrake)
+	local character, humanoid, root = getCharacterParts()
 	if humanoid and root then
 		humanoid:Move(Vector3.zero)
 		humanoid:MoveTo(root.Position)
+		if hardBrake and character and humanoid.Health > 0 and not humanoid.PlatformStand and not humanoid.Sit
+			and character:GetAttribute("IsTrapped") ~= true
+			and not (rigPause.Character == character and os.clock() < rigPause.Until) then
+			local endsAt = player:GetAttribute("RagdollEndTime")
+			local state = humanoid:GetState()
+			if (type(endsAt) ~= "number" or endsAt <= Workspace:GetServerTimeNow())
+				and state ~= Enum.HumanoidStateType.Ragdoll
+				and state ~= Enum.HumanoidStateType.FallingDown
+				and state ~= Enum.HumanoidStateType.Physics then
+				humanoid.Jump = false
+				local velocity = root.AssemblyLinearVelocity
+				root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+			end
+		end
 	end
 end
 
@@ -269,23 +283,27 @@ local function brakeAtArrival(ctx, destination, radius, flat)
 	local started, before = os.clock(), root.AssemblyLinearVelocity
 	stopMovement()
 	if not CONFIG.EnableArrivalBrake then return true end
+	ctx.braking = true
+	local function finish(ok, reason)
+		ctx.braking = false
+		return ok, reason
+	end
 	repeat
 		local valid, reason = validCycle(ctx)
-		if not valid then return false, reason end
+		if not valid then return finish(false, reason) end
 		local blocked = motionBlockReason(ctx)
-		if blocked then return false, "freinage interrompu : " .. blocked end
+		if blocked then return finish(false, "freinage interrompu : " .. blocked) end
 		local distance = flat and distanceXZ(root.Position, destination) or (root.Position - destination).Magnitude
-		if distance > radius then return false, "derive apres arrivee" end
-		local velocity = root.AssemblyLinearVelocity
-		-- Preserve vertical physics; do not change WalkSpeed, CFrame, or humanoid state.
-		root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+		if distance > radius then return finish(false, "derive apres arrivee") end
+		ctx.braking = true
+		stopMovement(true)
 		if os.clock() - started >= CONFIG.ArrivalBrakeDuration then break end
 		RunService.Heartbeat:Wait()
 	until false
 	log("ARRIVAL_BRAKE", "Phase=%s HorizontalAvant=%.2f HorizontalApres=%.2f Duree=%.3fs",
 		ctx.phase, Vector2.new(before.X, before.Z).Magnitude,
 		Vector2.new(root.AssemblyLinearVelocity.X, root.AssemblyLinearVelocity.Z).Magnitude, os.clock() - started)
-	return true
+	return finish(true)
 end
 
 local function setPhase(ctx, phase, message)
@@ -1307,7 +1325,7 @@ stopAutomation = function(reason, pause)
 	autoEnabled = false
 	generation += 1
 	if currentCycle then cleanupCycle(currentCycle) end
-	stopMovement()
+	stopMovement(true)
 	setStatus(reason or "Arrete", Color3.fromRGB(255, 150, 120))
 	if renderControls then renderControls() end
 	log("STOP", "%s | RemoteEnCours=%s", reason or "utilisateur", tostring(inFlightRequest and not inFlightRequest.done))
@@ -2436,7 +2454,7 @@ connect(RunService.Heartbeat, function()
 		end
 	end
 	-- Request another jump after landing; leave ragdoll/traps and airborne states alone.
-	if ctx.phase == "RETURN" and not motionBlockReason(ctx)
+	if ctx.phase == "RETURN" and not ctx.braking and not motionBlockReason(ctx)
 		and humanoid.FloorMaterial ~= Enum.Material.Air
 		and humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping) then
 		humanoid.Jump = true
