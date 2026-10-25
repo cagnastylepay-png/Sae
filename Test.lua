@@ -76,6 +76,11 @@ local lastDepartureArrival
 local treadmillAssigned, treadmillPending = false, false
 local autoActivity = "IDLE"
 
+local function isEggInCurrentWorld(record)
+	return type(record) == "table"
+		and ((record.IsHalloweenObservation == true) == (detectedMode == "Halloween"))
+end
+
 local function log(stage, message, ...)
 	if not CONFIG.Debug and stage ~= "ERROR" and stage ~= "CLAIM_CONFIRMED" then
 		return
@@ -1591,6 +1596,12 @@ local function initialize()
 			if detectedMode == "Normal" then syncQueue(); wakeQueue() end
 		end
 		if detectedMode == "Halloween" then setStatus("Mode Halloween : observation uniquement, trajets non actives.") end
+		if ready then
+			refreshHalloweenRecords()
+			if refreshEggInterface then refreshEggInterface() end
+			if refreshQueueInterface then refreshQueueInterface() end
+			if refreshBestEggCard then refreshBestEggCard() end
+		end
 		if renderControls then renderControls() end
 	end
 	connect(player:GetAttributeChangedSignal("InHalloweenDimension"), updateWorldMode)
@@ -1970,7 +1981,7 @@ local function createInterface()
 	refreshBestEggCard = function()
 		if destroyed or not ready then return end
 		local best, bestRate
-		for _, pool in ipairs({records, halloweenRecords}) do
+		for _, pool in ipairs({detectedMode == "Halloween" and halloweenRecords or records}) do
 			for uid, record in pairs(pool) do
 				if (record.State == SLOT_STATE or record.State == "Dropped") and record.CarrierUserId == nil and not ownsEgg(uid) then
 					local rate = getRatePerSecond(record)
@@ -2027,7 +2038,11 @@ local function createInterface()
 	minimumInput.Size = UDim2.fromScale(0.65, 0.14)
 	refreshQueueInterface = function()
 		local entries = queueOrder()
-		queueTab.Title.Text = "Queue (" .. #entries .. ")"
+		local visibleCount = 0
+		for _, entry in ipairs(entries) do
+			if isEggInCurrentWorld(records[entry.Uid] or entry.Record) then visibleCount += 1 end
+		end
+		queueTab.Title.Text = "Queue (" .. visibleCount .. ")"
 		for uid in pairs(queueSelection) do
 			if not queuedEggs[uid] then queueSelection[uid] = nil end
 		end
@@ -2112,17 +2127,17 @@ local function createInterface()
 		if destroyed or not ready then updateSelection(); return end
 		local available = {}
 		if activeTab == "Queue" then
-			for _, entry in ipairs(queueOrder()) do table.insert(available, records[entry.Uid] or entry.Record) end
+			for _, entry in ipairs(queueOrder()) do
+				local record = records[entry.Uid] or entry.Record
+				if isEggInCurrentWorld(record) then table.insert(available, record) end
+			end
 		else
-		for uid, record in pairs(records) do
+		for uid, record in pairs(detectedMode == "Halloween" and halloweenRecords or records) do
 			if (record.State == SLOT_STATE or record.State == "Dropped")
 				and record.CarrierUserId == nil and not ownsEgg(uid) then
 				table.insert(available, record)
 			end
 		end
-		end
-		if activeTab ~= "Queue" then
-			for _, record in pairs(halloweenRecords) do table.insert(available, record) end
 		end
 		table.sort(available, function(a, b)
 			local ar, br = getRatePerSecond(a) or 0, getRatePerSecond(b) or 0
