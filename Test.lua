@@ -968,6 +968,10 @@ local function moveReturnLoop(ctx, destination)
 				ctx.record, ctx.eggPosition = latest, getRecordPosition(latest)
 				return false, "TARGET_REAPPEARED"
 			end
+			if carry and not carry.IsCarrying and ctx.findNext and not (inFlightRequest and not inFlightRequest.done) then
+				local nextEgg = ctx.findNext()
+				if nextEgg and nextEgg.Uid ~= ctx.uid then return false, "NEXT_AVAILABLE" end
+			end
 		elseif carryWasLost(ctx) then
 			return false, CARRY_LOST
 		end
@@ -1057,7 +1061,7 @@ local function getStartAreaDestination()
 	return center + Vector3.new(0, (humanoid and humanoid.HipHeight or 2) + 2, 0)
 end
 
-local function runCycle(record, rate, recovering)
+local function runCycle(record, rate, recovering, findNext)
 	local character, humanoid, root = getCharacterParts()
 	if not character or not humanoid or not root then return false, "personnage absent" end
 	local destination, destinationReason = getStartAreaDestination()
@@ -1074,7 +1078,7 @@ local function runCycle(record, rate, recovering)
 		return false, "position de retour sure non disponible"
 	end
 	local ctx = {
-		uid = record.Uid, record = record, generation = generation, character = character,
+		uid = record.Uid, record = record, generation = generation, character = character, findNext = findNext,
 		home = safeHome, eggPosition = record.BottomCFrame and record.BottomCFrame.Position,
 		attempts = 0, lastRequest = -math.huge, phase = "SELECTED", ownerBefore = ownerSnapshot(),
 		remoteAccepted = recovering == true, sawCarry = recovering == true,
@@ -1549,6 +1553,7 @@ local function requestUserStop(reason)
 end
 
 local function worker(token)
+	local directNext = false
 	while autoEnabled and generation == token and not destroyed do
 		serviceWallMaintenance(token)
 		if activityRecheckPending then
@@ -1589,7 +1594,7 @@ local function worker(token)
 			local exited, exitReason = leaveTreadmill(token)
 			if not exited then stopAutomation("Sortie tapis : " .. tostring(exitReason)); return end
 			if not autoEnabled or generation ~= token then return end
-			if not recovering then
+			if not recovering and not directNext then
 				local destination, destinationReason = getStartAreaDestination()
 				if not destination then stopAutomation(destinationReason); return end
 				autoActivity = "TO_FARM"
@@ -1601,7 +1606,8 @@ local function worker(token)
 			if not autoEnabled or generation ~= token then return end
 			autoActivity = "FARM"
 			log("FARM_START", "UID=%s : sortie StartArea atteinte, trajet vers l'oeuf", selected.Uid)
-			local success, reason = runCycle(selected, rate, recovering)
+			directNext = false
+			local success, reason = runCycle(selected, rate, recovering, selectBest)
 			if not autoEnabled or generation ~= token then return end
 			if success then
 				selectedEggs[selected.Uid] = nil
@@ -1611,7 +1617,7 @@ local function worker(token)
 			end
 			if not success then
 				log("CYCLE_FAILED", "UID=%s Raison=%s", selected.Uid, tostring(reason))
-				cooldowns[selected.Uid] = reason == "TARGET_UNAVAILABLE" and 0 or (os.clock() + CONFIG.FailedTargetCooldown)
+				cooldowns[selected.Uid] = (reason == "TARGET_UNAVAILABLE" or reason == "NEXT_AVAILABLE") and 0 or (os.clock() + CONFIG.FailedTargetCooldown)
 				queuedEggs[selected.Uid] = nil
 				-- Never continue after ambiguous ownership or an unresolved request.
 				if recovering or (inFlightRequest and not inFlightRequest.done) then
@@ -1620,14 +1626,19 @@ local function worker(token)
 				end
 				local after = readCarry()
 				local _, _, root = getCharacterParts()
-				if not after or after.IsCarrying or not root or isSafe(root.Position) ~= true
+				if not after or after.IsCarrying or not root or (reason ~= "NEXT_AVAILABLE" and isSafe(root.Position) ~= true)
 					or string.find(tostring(reason), "attribution", 1, true)
 					or string.find(tostring(reason), "recuperation", 1, true) then
 					stopAutomation(tostring(reason))
 					return
 				end
+				if reason == "NEXT_AVAILABLE" then
+					directNext = true
+					log("NEXT_TARGET", "Oeuf disparu : trajet direct vers le prochain oeuf de la file")
+				end
 			end
 		else
+			directNext = false
 			if automaticMode then
 				local ok, reason = idleOnTreadmill(token)
 				if not autoEnabled or generation ~= token then return end
