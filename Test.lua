@@ -950,6 +950,9 @@ local function moveReturnLoop(ctx, destination)
 	local lastMoved, lastPosition = started, root.Position
 	local distance = distanceXZ(root.Position, destination)
 	local timeout = math.clamp(distance / math.max(humanoid.WalkSpeed, 1) * 4 + 15, 15, 150) + CONFIG.MotionPauseTimeout
+	ctx.returnStartDistance = distance
+	ctx.returnDestination = destination
+	ctx.lastReturnJump = nil
 	setPhase(ctx, "RETURN", "Retour vers la zone sure")
 	while true do
 		local valid, reason = validCycle(ctx)
@@ -2393,8 +2396,10 @@ connect(RunService.Heartbeat, function()
 	if destroyed or not ready then return end
 	local ctx = currentCycle
 	if not ctx or not validCycle(ctx) or ctx.phase ~= "RETURN" or ctx.braking then return end
-	local _, humanoid = getCharacterParts()
-	if not humanoid or humanoid.Health <= 0 or motionBlockReason(ctx) then return end
+	local _, humanoid, root = getCharacterParts()
+	if not humanoid or not root or humanoid.Health <= 0 or motionBlockReason(ctx) then return end
+	if not ctx.returnDestination or not ctx.returnStartDistance then return end
+	if distanceXZ(root.Position, ctx.returnDestination) > ctx.returnStartDistance * 0.5 then return end
 	if humanoid.FloorMaterial == Enum.Material.Air then return end
 	if not humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping) then return end
 	local now = os.clock()
