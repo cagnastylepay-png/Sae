@@ -1094,11 +1094,27 @@ local function moveReturnLoop(ctx, destination)
 		end
 		local now = os.clock()
 		distance = distanceXZ(root.Position, destination)
+		local insideSafe = isSafe(root.Position) == true
+		local arrivalRadius = CONFIG.ReturnDistance
+		if insideSafe then
+			humanoid.Jump = false
+			local velocity = root.AssemblyLinearVelocity
+			local horizontalSpeed = Vector2.new(velocity.X, velocity.Z).Magnitude
+			arrivalRadius = math.max(arrivalRadius, math.min(30, horizontalSpeed * 0.1))
+			local claimed, source = claimEvidence(ctx)
+			if claimed then
+				ctx.claimed, ctx.claimSource = true, source
+				stopMovement(true)
+				log("RETURN_CLAIM_EARLY", "Attribution confirmee en zone sure : fin du trajet, distance=%.2f", distance)
+				return true
+			end
+		end
 		if distanceXZ(lastPosition, root.Position) >= 0.5 then
 			lastMoved, lastPosition = now, root.Position
 		end
-		if distance <= CONFIG.ReturnDistance then
-			local braked, brakeReason = brakeAtArrival(ctx, destination, CONFIG.ReturnDistance, true)
+		if distance <= arrivalRadius then
+			log("RETURN_BRAKE_ZONE", "Distance=%.2f Rayon=%.2f Safe=%s", distance, arrivalRadius, tostring(insideSafe))
+			local braked, brakeReason = brakeAtArrival(ctx, destination, arrivalRadius, true)
 			if carryWasLost(ctx) then return false, CARRY_LOST end
 			if braked then return true end
 			if not validCycle(ctx) then return false, brakeReason end
@@ -1107,8 +1123,8 @@ local function moveReturnLoop(ctx, destination)
 		end
 		if now - started > timeout then return false, "delai de retour depasse" end
 		if now - lastMoved > CONFIG.NoMovementTimeout then return false, "retour bloque" end
-		if now - lastCommand >= CONFIG.MoveRefresh then
-			move(destination, {Radius = 3})
+		if distance < 100 or now - lastCommand >= CONFIG.MoveRefresh then
+			move(destination, {Radius = arrivalRadius})
 			lastCommand = now
 		end
 		if now - lastLog >= CONFIG.ProgressInterval then
@@ -2574,6 +2590,7 @@ connect(RunService.Heartbeat, function()
 	local _, humanoid, root = getCharacterParts()
 	if not humanoid or not root or humanoid.Health <= 0 or motionBlockReason(ctx) then return end
 	if not ctx.returnDestination or not ctx.returnStartDistance then return end
+	if isSafe(root.Position) == true then humanoid.Jump = false; return end
 	if distanceXZ(root.Position, ctx.returnDestination) > ctx.returnStartDistance * 0.5 then return end
 	if humanoid.FloorMaterial == Enum.Material.Air then return end
 	if not humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping) then return end
@@ -2653,14 +2670,22 @@ local function startProbe(kind)
 				local speed = delta > 0.01 and distanceXZ(root.Position, lastPosition) / delta or 0
 				local velocity = root.AssemblyLinearVelocity
 				local carry = readCarry()
-				local guard, guardDistance = nearestGuard(root)
+				local guard, guardDistance
+				if probe.Guard then
+					guard = probe.Guard.Parent and probe.Guard or nil
+					local guardRoot = guard and (guard:FindFirstChild("HumanoidRootPart") or guard.PrimaryPart)
+					guardDistance = guardRoot and distanceXZ(root.Position, guardRoot.Position) or nil
+				else
+					guard, guardDistance = nearestGuard(root)
+				end
 				local guardHumanoid = guard and guard:FindFirstChildWhichIsA("Humanoid")
-				log("PROBE_SAMPLE", "Type=%s Etape=%s T=%.2f Pos=%s WalkSpeed=%.2f DeplacementXZ=%.2f VitessePhysiqueXZ=%.2f Trapped=%s RagdollEnd=%s Carry=%s UID=%s Phase=%s GuardDistance=%s GuardSpeed=%s",
+				log("PROBE_SAMPLE", "Type=%s Etape=%s T=%.2f Pos=%s WalkSpeed=%.2f DeplacementXZ=%.2f VitessePhysiqueXZ=%.2f Trapped=%s RagdollEnd=%s Carry=%s UID=%s Phase=%s GuardDistance=%s GuardSpeed=%s Guard=%s GuardState=%s",
 					kind, applied and "TEST" or "BASELINE", elapsed, formatPosition(root.Position), humanoid.WalkSpeed,
 					speed, Vector2.new(velocity.X, velocity.Z).Magnitude,
 					tostring(character:GetAttribute("IsTrapped")), tostring(player:GetAttribute("RagdollEndTime")),
 					tostring(carry and carry.IsCarrying), tostring(carry and carry.Uid),
-					currentCycle and currentCycle.phase or "MANUEL", tostring(guardDistance), tostring(guardHumanoid and guardHumanoid.WalkSpeed))
+					currentCycle and currentCycle.phase or "MANUEL", tostring(guardDistance), tostring(guardHumanoid and guardHumanoid.WalkSpeed),
+					guard and guard:GetFullName() or "absent", tostring(guard and guard:GetAttribute("GuardState")))
 				lastTime, lastPosition = now, root.Position
 				task.wait(0.25)
 			end
