@@ -17,6 +17,7 @@ local CONFIG = {
 	MoveRefresh = 0.1,
 	ApproachRefresh = 4,
 	ApproachDistance = 8,
+	PreciseArrivalRadius = 3,
 	ScanInterval = 0.25,
 	ReturnDistance = 3,
 	RequestTimeout = 10,
@@ -683,6 +684,19 @@ local function updateCarryEvidence(ctx)
 	return ctx.remoteAccepted == true
 end
 
+local function startReturnImmediately(ctx, source)
+	if currentCycle ~= ctx or generation ~= ctx.generation or ctx.returnKickAt then return end
+	if not validCycle(ctx) or motionBlockReason(ctx) then return end
+	local character, humanoid, root = getCharacterParts()
+	if character ~= ctx.character or not humanoid or not root then return end
+	ctx.returnKickAt = os.clock()
+	ctx.hadCarry = true
+	setPhase(ctx, "RETURN", "Prise confirmee : retour immediat")
+	move(ctx.home, {Radius = CONFIG.ReturnDistance})
+	log("GRAB_TO_RETURN", "Source=%s DelaiDepuisRequeteMs=%.1f WalkSpeed=%.2f | commande retour envoyee sans pause",
+		source, (ctx.returnKickAt - (ctx.lastRequest or ctx.returnKickAt)) * 1000, humanoid.WalkSpeed)
+end
+
 local function requestCarry(ctx)
 	if inFlightRequest and not inFlightRequest.done then return end
 	if ctx.attempts >= CONFIG.MaxCarryAttempts then return end
@@ -735,6 +749,7 @@ local function requestCarry(ctx)
 			os.clock() - request.started, tostring(validCycle(ctx)))
 		if not validCycle(ctx) then return end
 		ctx.remoteAccepted = request.accepted
+		if request.accepted then startReturnImmediately(ctx, "CARRY_REPLY") end
 		ctx.denial = request.reason
 		if ctx.onCarryReply then ctx.onCarryReply(request) end
 	end)
@@ -804,6 +819,7 @@ local function approachEgg(ctx, destination)
 	local timeout = math.clamp(initialDistance / math.max(humanoid.WalkSpeed, 1) * 4 + 15, 15, 150) + CONFIG.MotionPauseTimeout
 	local nativeReached, retryRequested = nil, false
 	local pausedAt
+	local previousApproachPosition = root.Position
 	log("MOVE_APPROACH_START", "Destination=%s Pos=%s WalkSpeed=%.1f Renouvellement=%.1fs Maximum=%.1fs",
 		formatPosition(destination), formatPosition(root.Position), humanoid.WalkSpeed,
 		CONFIG.ApproachRefresh, timeout)
@@ -852,21 +868,37 @@ local function approachEgg(ctx, destination)
 			if distanceXZ(lastPosition, root.Position) >= 0.5 then
 				lastMoved, lastPosition = now, root.Position
 			end
-			if (root.Position - eggPosition).Magnitude <= CONFIG.ApproachDistance then
+			local preciseRadius = CONFIG.PreciseArrivalRadius
+			local currentPosition = root.Position
+			local segment = Vector3.new(currentPosition.X - previousApproachPosition.X, 0, currentPosition.Z - previousApproachPosition.Z)
+			local offset = Vector3.new(eggPosition.X - previousApproachPosition.X, 0, eggPosition.Z - previousApproachPosition.Z)
+			local crossed = false
+			if segment.Magnitude > 0.01 then
+				local projection = offset:Dot(segment) / segment:Dot(segment)
+				crossed = projection > 0 and projection < 1
+					and (offset - segment * projection).Magnitude <= preciseRadius
+			end
+			previousApproachPosition = currentPosition
+			if distance <= preciseRadius and (root.Position - eggPosition).Magnitude <= CONFIG.ApproachDistance then
 				traceMoveEnd(ctx, root, destination, true)
 				complete(true, "distance verifiee")
 				return
+			end
+			if crossed then
+				stopMovement(true)
+				retryRequested = true
+				log("APPROACH_OVERSHOOT_BRAKE", "Cible franchie entre deux frames, distance=%.2f : freinage puis correction", distance)
 			end
 			if now - lastMoved > CONFIG.NoMovementTimeout then
 				complete(false, "course bloquee sans progression")
 				return
 			end
-			if targetMoved or retryRequested or now - lastCommand >= CONFIG.ApproachRefresh then
+			if distance < 100 or targetMoved or retryRequested or now - lastCommand >= CONFIG.ApproachRefresh then
 				local firstCommand = lastCommand == -math.huge
 				lastCommand, retryRequested = now, false
 				log(firstCommand and "MOVE_COMMAND" or "MOVE_RENEW", "Destination=%s DistanceXZ=%.2f Temps=%.2fs | sans arret ni changement de vitesse",
 					formatPosition(destination), distance, now - started)
-				move(destination, {Radius = CONFIG.ApproachDistance, Flat = false, ArrivalPosition = eggPosition})
+				move(destination, {Radius = CONFIG.PreciseArrivalRadius, Flat = true, ArrivalPosition = eggPosition})
 			end
 			if now - lastLog >= CONFIG.ProgressInterval then
 				lastLog = now
@@ -897,7 +929,11 @@ local function approachEgg(ctx, destination)
 		return false, "MoveTo interrompu : " .. tostring(moveReason)
 	end
 	if not validCycle(ctx) then return false, "annule" end
-	local braked, brakeReason = brakeAtArrival(ctx, ctx.eggPosition, CONFIG.ApproachDistance, false)
+	-- Cancel momentum immediately; no fixed settling wait before the direct request.
+	stopMovement(true)
+	local braked = distanceXZ(root.Position, ctx.eggPosition) <= CONFIG.PreciseArrivalRadius
+		and (root.Position - ctx.eggPosition).Magnitude <= CONFIG.ApproachDistance
+	local brakeReason = "derive apres arrivee"
 	if not braked then return false, brakeReason end
 	log("MOVE_APPROACH_FINISHED", "NativeReached=%s Pos=%s DistanceRestanteXZ=%.2f | une tentative serveur apres verification",
 		tostring(nativeReached), formatPosition(root.Position), distanceXZ(root.Position, destination))
@@ -1014,6 +1050,7 @@ local function waitForRecoverableEgg(ctx)
 				and (not ctx.pickupVersion or latest.Version > ctx.pickupVersion)))
 			and (not latest or (latest.State == "Carried" and latest.CarrierUserId == player.UserId)) then
 			ctx.sawCarry, ctx.carryLostAt = true, nil
+			startReturnImmediately(ctx, "CARRY_CHANGED")
 			return nil, "CARRIED"
 		end
 		if latest and (latest.State == "Dropped" or latest.State == SLOT_STATE)
@@ -1057,6 +1094,7 @@ local function recoverSameEgg(ctx)
 		ctx.remoteAccepted, ctx.sawCarry, ctx.claimed, ctx.claimFeedback = false, false, false, false
 		ctx.carryLostAt, ctx.lossLogged, ctx.reacquiring = nil, false, true
 		ctx.attempts, ctx.lastRequest = 0, -math.huge
+		ctx.returnKickAt = nil
 		local destination = Vector3.new(ctx.eggPosition.X, ctx.home.Y, ctx.eggPosition.Z)
 		local grabbed, reason = moveThenCarry(ctx, destination)
 		if grabbed then
@@ -1277,6 +1315,7 @@ local function runCycle(record, rate, recovering, findNext)
 				end
 				log("TARGET_REAPPEARED", "UID=%s : reprise du trajet vers l'oeuf", ctx.uid)
 				ctx.pickupVersion = ctx.record.Version
+				ctx.returnKickAt = nil
 				ctx.remoteAccepted, ctx.sawCarry, ctx.claimed, ctx.claimFeedback = false, false, false, false
 				ctx.carryLostAt, ctx.lossLogged, ctx.reacquiring = nil, false, false
 				ctx.attempts, ctx.lastRequest = 0, -math.huge
