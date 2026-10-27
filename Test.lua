@@ -58,7 +58,9 @@ local autoEquipBest = true
 local autoKeepBest100 = true
 local inventoryEggRecords
 local inventorySaleBusy = false
-local timingEnabled = true
+local timingEnabled = false
+local flightHistory = {}
+local refreshFlightLog
 local manualSession
 local toggleManualRecording, manualCarryChanged
 local stopAfterFlight = false
@@ -91,6 +93,7 @@ end
 
 -- Optional executor APIs. Capture once; never replace Roblox services or remotes.
 local debugLogLines = {}
+local pendingLogLines = {}
 local executorEnvironment = getfenv()
 if type(getgenv) == "function" then
 	local ok, environment = pcall(getgenv)
@@ -116,9 +119,24 @@ local function callExecutor(name, ...)
 	return pcall(fn, ...)
 end
 function executorTools.SaveLog()
-	local ok, result = callExecutor("writefile", executorLogPath, table.concat(debugLogLines, "\n"))
+	if #pendingLogLines == 0 then return true, executorLogPath end
+	local count = #pendingLogLines
+	local payload = table.concat(pendingLogLines, "\n", 1, count) .. "\n"
+	local ok, result = callExecutor("appendfile", executorLogPath, payload)
+	if not ok then
+		local readOK, previous = callExecutor("readfile", executorLogPath)
+		if readOK and type(previous) == "string" then
+			ok, result = callExecutor("writefile", executorLogPath, previous .. (previous:sub(-1) == "\n" and "" or "\n") .. payload)
+		else
+			local existsOK, exists = callExecutor("isfile", executorLogPath)
+			if existsOK and exists == false then ok, result = callExecutor("writefile", executorLogPath, payload)
+			else return false, "Impossible de lire le log existant : ecrasement refuse" end
+		end
+	end
+	if ok then for _ = 1, count do table.remove(pendingLogLines, 1) end end
 	return ok, ok and executorLogPath or tostring(result)
 end
+
 function executorTools.ReadLog()
 	return callExecutor("readfile", executorLogPath)
 end
@@ -134,7 +152,8 @@ end
 shared.__AutoSAEExecutorTools = executorTools
 
 local function log(stage, message, ...)
-	if not CONFIG.Debug and stage ~= "ERROR" and stage ~= "CLAIM_CONFIRMED" then
+	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, WALL_INVENTORY_SELL=true, INVENTORY_SELL_REQUEST=true}
+	if not allowed[stage] then
 		return
 	end
 	sequence += 1
@@ -145,21 +164,13 @@ local function log(stage, message, ...)
 	local line = string.format("[Auto_SAE][%04d][%.3f][%s][%s] %s",
 		sequence, os.clock(), stage, currentCycle and currentCycle.uid or "-", text)
 	table.insert(debugLogLines, line)
+	table.insert(pendingLogLines, line)
 	if #debugLogLines > 1000 then table.remove(debugLogLines, 1) end
 	print(line)
 end
 
-local function measureAction(name, action, ...)
-	if not timingEnabled then return action(...) end
-	local started = os.clock()
-	local character = player.Character
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	local beforeSpeed = humanoid and humanoid.WalkSpeed
-	local result = table.pack(pcall(action, ...))
-	log("TIMING_ACTION", "Action=%s DureeMs=%.1f ExecutionOK=%s Resultat=%s Detail=%s WalkSpeedAvant=%s WalkSpeedApres=%s",
-		name, (os.clock() - started) * 1000, tostring(result[1]), tostring(result[2]), tostring(result[3]), tostring(beforeSpeed), tostring(humanoid and humanoid.WalkSpeed))
-	if not result[1] then error(result[2], 0) end
-	return table.unpack(result, 2, result.n)
+local function measureAction(_, action, ...)
+	return action(...)
 end
 
 local settingsPath = "AutoSAE_settings.json"
@@ -193,7 +204,7 @@ local function loadSettings()
 	if type(settings.IncludeMissingIndex) == "boolean" then autoIncludeMissingIndex = settings.IncludeMissingIndex end
 	if type(settings.AutoOpenEgg) == "boolean" then autoOpenEgg = settings.AutoOpenEgg end
 	if type(settings.AutoEquipBest) == "boolean" then autoEquipBest = settings.AutoEquipBest end
-	if type(settings.TimingEnabled) == "boolean" then timingEnabled = settings.TimingEnabled end
+	-- Detailed telemetry disabled.
 	if type(settings.AutoKeepBest100) == "boolean" then autoKeepBest100 = settings.AutoKeepBest100 end
 	local minimum = settings.MinimumBillions
 	if type(minimum) == "number" and minimum == minimum and minimum >= MINIMUM_BILLIONS and minimum <= MAXIMUM_BILLIONS then
@@ -478,6 +489,16 @@ end
 local function getAnimalName(record)
 	local config = getAssetConfig(record)
 	return config and config.DisplayName or record.AssetCategory or "Inconnu"
+end
+
+local function recordFlightResult(ctx, succeeded)
+	if ctx.resultLogged then return end
+	ctx.resultLogged = true
+	local text = string.format('Vol de "%s" %s', getAnimalName(ctx.record or {}), succeeded and "Reussi" or "Echoue")
+	table.insert(flightHistory, {Text=text, Success=succeeded})
+	if #flightHistory > 200 then table.remove(flightHistory, 1) end
+	log("FLIGHT_RESULT", "%s", text)
+	if refreshFlightLog then refreshFlightLog() end
 end
 
 local function getRatePerSecond(record)
@@ -1243,6 +1264,7 @@ end
 
 local function cleanupCycle(ctx)
 	if currentCycle ~= ctx then return end
+	recordFlightResult(ctx, false)
 	if timingEnabled then
 		local now = os.clock()
 		log("TIMING_CYCLE", "TotalMs=%.1f DernierePhase=%s PhaseMs=%.1f", (now - (ctx.startedAt or now)) * 1000, tostring(ctx.phase), (now - (ctx.phaseStartedAt or now)) * 1000)
@@ -1357,6 +1379,7 @@ local function runCycle(record, rate, recovering, findNext)
 		end
 		return false, "annule"
 	end, debug.traceback)
+	recordFlightResult(ctx, cycleOK and completed == true)
 	cleanupCycle(ctx)
 	if not cycleOK then return false, tostring(completed) end
 	return completed, failure
@@ -2106,6 +2129,7 @@ end
 
 toggleManualRecording = function()
 	if manualSession then
+		if manualSession.uid then recordFlightResult(manualSession, manualSession.claimed == true) end
 		log("MANUAL_END", "DureeMs=%.1f | enregistrement termine, collecte reste en pause", (os.clock() - manualSession.startedAt) * 1000)
 		manualSession = nil
 		executorTools.SaveLog()
@@ -2182,6 +2206,7 @@ connect(RunService.Heartbeat, function()
 		local confirmed, source = claimEvidence(session)
 		if confirmed then
 			session.claimed = true
+			recordFlightResult(session, true)
 			log("MANUAL_CLAIM_CONFIRMED", "UID=%s Source=%s DepuisDebutMs=%.1f DepuisPriseMs=%s", session.uid, tostring(source), (now-session.startedAt)*1000, session.pickupAt and tostring((now-session.pickupAt)*1000) or "?")
 			setPhase(session, "CLAIM_CONFIRMED", "Test manuel : attribution confirmee")
 		end
@@ -2244,9 +2269,13 @@ local function createInterface()
 	eggsTab.Name = "InventoryEggsTab"
 	eggsTab.Title.Text = "Eggs"
 	eggsTab.Parent = tabs
-	mapTab.LayoutOrder, queueTab.LayoutOrder, eggsTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3, 4
-	tabs.Size = UDim2.new(tabs.Size.X.Scale * 0.75, tabs.Size.X.Offset * 0.75, tabs.Size.Y.Scale, tabs.Size.Y.Offset)
-	for _, tabButton in ipairs({mapTab, queueTab, eggsTab, paramsTab}) do
+	local logTab = mapTab:Clone()
+	logTab.Name = "LogTab"
+	logTab.Title.Text = "Log"
+	logTab.Parent = tabs
+	mapTab.LayoutOrder, queueTab.LayoutOrder, eggsTab.LayoutOrder, logTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3, 4, 5
+	tabs.Size = UDim2.new(tabs.Size.X.Scale * 0.6, tabs.Size.X.Offset * 0.6, tabs.Size.Y.Scale, tabs.Size.Y.Offset)
+	for _, tabButton in ipairs({mapTab, queueTab, eggsTab, logTab, paramsTab}) do
 		tabButton.Size = UDim2.fromScale(1, 0)
 		local aspect = tabButton:FindFirstChildOfClass("UIAspectRatioConstraint")
 		if not aspect then aspect = Instance.new("UIAspectRatioConstraint", tabButton) end
@@ -2547,6 +2576,43 @@ local function createInterface()
 	paramsPanel.Size = scroll.Size
 	paramsPanel.Visible = false
 	paramsPanel.Parent = frame
+	local logPanel = Instance.new("ScrollingFrame")
+	logPanel.Name = "FlightLog"
+	logPanel.BackgroundTransparency = 1
+	logPanel.BorderSizePixel = 0
+	logPanel.Position = scroll.Position
+	logPanel.Size = scroll.Size
+	logPanel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	logPanel.CanvasSize = UDim2.new()
+	logPanel.ScrollBarThickness = 6
+	logPanel.Visible = false
+	logPanel.Parent = frame
+	local logLayout = Instance.new("UIListLayout", logPanel)
+	logLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	logLayout.Padding = UDim.new(0, 6)
+	local renderedLatest, renderedCount
+	refreshFlightLog = function()
+		if destroyed then return end
+		if renderedLatest == flightHistory[#flightHistory] and renderedCount == #flightHistory then return end
+		renderedLatest, renderedCount = flightHistory[#flightHistory], #flightHistory
+		for _, child in ipairs(logPanel:GetChildren()) do if child:IsA("TextLabel") then child:Destroy() end end
+		for index = #flightHistory, 1, -1 do
+			local entry = flightHistory[index]
+			local label = Instance.new("TextLabel")
+			label.Name = "FlightResult"
+			label.BackgroundTransparency = 1
+			label.Size = UDim2.new(1,-10,0,42)
+			label.LayoutOrder = #flightHistory-index
+			label.Text = entry.Text
+			label.TextColor3 = entry.Success and Color3.fromRGB(110,255,110) or Color3.fromRGB(255,110,110)
+			label.Font = Enum.Font.GothamBold
+			label.TextSize = 18
+			label.TextWrapped = true
+			label.TextXAlignment = Enum.TextXAlignment.Left
+			label.Parent = logPanel
+		end
+	end
+	refreshFlightLog()
 	local worldModeLabel = thresholdTitle:Clone()
 	worldModeLabel.Name = "DetectedWorldMode"
 	worldModeLabel.LayoutOrder = 0
@@ -2596,12 +2662,6 @@ local function createInterface()
 		autoKeepBest100 = not autoKeepBest100
 		caption(keep100Button, autoKeepBest100 and "Garder 100 + Divine : ON" or "Garder 100 + Divine : OFF")
 		log("PARAM_CHANGED", "AutoKeepBest100=%s", tostring(autoKeepBest100))
-		executorTools.SaveSettings()
-	end)
-	local timingButton
-	timingButton = paramButton("TimingEnabled", 70, timingEnabled and "Timing / latence : ON" or "Timing / latence : OFF", function()
-		timingEnabled = not timingEnabled
-		caption(timingButton, timingEnabled and "Timing / latence : ON" or "Timing / latence : OFF")
 		executorTools.SaveSettings()
 	end)
 	local manualButton
@@ -2657,9 +2717,12 @@ local function createInterface()
 		activeTab = name
 		selectedEggs = name == "Queue" and queueSelection or (name == "Eggs" and inventorySelection or mapSelection)
 		saleConfirmation = nil
-		scroll.Visible = name ~= "Params"
+		scroll.Visible = name ~= "Params" and name ~= "Log"
+		logPanel.Visible = name == "Log"
+		if name == "Log" and refreshFlightLog then refreshFlightLog() end
 		paramsPanel.Visible = name == "Params"
-		sort.Visible = name ~= "Params"
+		sort.Visible = name ~= "Params" and name ~= "Log"
+		logTab.Title.TextColor3 = name == "Log" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		eggsTab.Title.TextColor3 = name == "Eggs" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		paramsTab.Title.TextColor3 = name == "Params" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		mapTab.Title.TextColor3 = name == "Map" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
@@ -2672,6 +2735,7 @@ local function createInterface()
 	connect(queueTab.Activated, function() switchTab("Queue") end)
 	connect(paramsTab.Activated, function() switchTab("Params") end)
 	connect(eggsTab.Activated, function() switchTab("Eggs") end)
+	connect(logTab.Activated, function() switchTab("Log") end)
 	switchTab("Map")
 	local cards = {}
 	local function countSelected()
@@ -2695,7 +2759,7 @@ local function createInterface()
 		sort.Clear.Active = true
 		sort.SelectAll.Active = true
 		toggleButton.Title.Text = activeTab == "Eggs" and (salePending and "Vente..." or (saleConfirmation and "Confirmer vente" or "Vendre")) or (activeTab == "Queue" and "Remove" or "Add")
-		toggleButton.Visible = activeTab ~= "Params"
+		toggleButton.Visible = activeTab ~= "Params" and activeTab ~= "Log"
 		sort.SelectAll.Visible = activeTab ~= "Params"
 		sort.Clear.Visible = activeTab ~= "Params"
 		missingButton.Visible = activeTab == "Map"
@@ -2711,6 +2775,7 @@ local function createInterface()
 		end
 	end
 	refreshEggInterface = function()
+		if activeTab == "Log" then if refreshFlightLog then refreshFlightLog() end; updateSelection(); return end
 		if destroyed or not ready then updateSelection(); return end
 		local available = {}
 		if activeTab == "Eggs" then
@@ -2844,7 +2909,7 @@ local function createInterface()
 		updateSelection()
 	end)
 	connect(toggleButton.Activated, function()
-		if activeTab == "Params" then return end
+		if activeTab == "Params" or activeTab == "Log" then return end
 		refreshEggInterface()
 		if activeTab == "Eggs" then
 			if salePending or inventorySaleBusy then return end
@@ -2961,27 +3026,21 @@ end)
 
 -- Explicit, bounded black-box probes; never start automatically.
 
-local lastTimingSample
-connect(RunService.Heartbeat, function()
-	if destroyed or not ready or not timingEnabled or not currentCycle then lastTimingSample = nil; return end
-	local ctx = currentCycle
-	local _, humanoid, root = getCharacterParts()
-	if not humanoid or not root then return end
-	local now = os.clock()
-	if lastTimingSample and lastTimingSample.Cycle == ctx and now - lastTimingSample.Time < 0.5 then return end
-	local measured = 0
-	if lastTimingSample and lastTimingSample.Cycle == ctx then
-		measured = distanceXZ(root.Position, lastTimingSample.Position) / math.max(now - lastTimingSample.Time, 0.001)
-	end
-	local velocity = root.AssemblyLinearVelocity
-	log("TIMING_SPEED", "Mode=AUTO Phase=%s WalkSpeed=%.2f PhysiqueXZ=%.2f DeplacementXZ=%.2f Pos=%s Safe=%s",
-		tostring(ctx.phase), humanoid.WalkSpeed, Vector2.new(velocity.X, velocity.Z).Magnitude,
-		measured, formatPosition(root.Position), tostring(isSafe(root.Position)))
-	lastTimingSample = {Cycle = ctx, Time = now, Position = root.Position}
-end)
 
+local historyOK, previousLog = executorTools.ReadLog()
+if historyOK and type(previousLog) == "string" then
+	for line in previousLog:gmatch("[^\r\n]+") do
+		if line:find("[FLIGHT_RESULT]", 1, true) then
+			local name, result = line:match('Vol de "(.-)" (.+)$')
+			if name and (result == "Reussi" or result == "Echoue") then
+				table.insert(flightHistory, {Text='Vol de "'..name..'" '..result, Success=result=="Reussi"})
+				if #flightHistory > 200 then table.remove(flightHistory,1) end
+			end
+		end
+	end
+end
+log("SESSION", "Nouveau lancement %s", os.date("%Y-%m-%d %H:%M:%S"))
 loadSettings()
-log("EXECUTOR_CAPABILITIES", "%s", HttpService:JSONEncode(executorTools.Capabilities()))
 local gui = createInterface()
 setStatus("Chargement des modules du jeu...")
 connect(player.CharacterRemoving, function()
