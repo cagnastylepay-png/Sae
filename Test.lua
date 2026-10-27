@@ -21,8 +21,8 @@ local CONFIG = {
 	ScanInterval = 0.25,
 	ReturnDistance = 3,
 	RequestTimeout = 10,
-	MaxCarryAttempts = 3,
-	CarryRetryDelay = 0.35,
+	MaxCarryAttempts = 5,
+	CarryRetryDelay = 0.15,
 	EnableArrivalBrake = true,
 	ArrivalBrakeDuration = 0.03,
 	ObserveRigSync = true,
@@ -72,6 +72,9 @@ local queuePaused = false
 local syncQueue, wakeQueue, refreshQueueInterface, startAutomation
 local stopAutomation
 local rigPause = {Character = nil, Until = 0, Reason = nil}
+local syncPauseUntil, lastRelocateAt, lastPhysicalBrakeAt = 0, -math.huge, -math.huge
+local movementRevision = 0
+local movementResumePending = false
 local PlotState, TreadmillRemotes, AssetRoster
 local PlacedEggRenderer, EggGrowthPolicy
 local hatchInProgress = false
@@ -152,7 +155,7 @@ end
 shared.__AutoSAEExecutorTools = executorTools
 
 local function log(stage, message, ...)
-	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, WALL_INVENTORY_SELL=true, INVENTORY_SELL_REQUEST=true}
+	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, WALL_INVENTORY_SELL=true, INVENTORY_SELL_REQUEST=true, SYNC_DIAG=true, CARRY_DIAG=true}
 	if not allowed[stage] then
 		return
 	end
@@ -268,6 +271,11 @@ local function move(destination, options)
 	if not character or not humanoid or not root then return false, "personnage absent" end
 	local stopping = options.Stop == true
 	local arrived = false
+	if not stopping and os.clock() < syncPauseUntil then return false, "synchronisation en cours" end
+	if not stopping and movementResumePending then
+		movementResumePending = false
+		log("SYNC_DIAG", "Reprise du deplacement depuis la position actuelle apres correction")
+	end
 	if not stopping then
 		if typeof(destination) ~= "Vector3" then return false, "destination invalide" end
 		local arrivalPosition = options.ArrivalPosition or destination
@@ -280,7 +288,7 @@ local function move(destination, options)
 	humanoid:MoveTo(stopping and root.Position or destination)
 	if stopping then
 		local hardBrake = options.HardBrake == true or arrived
-		if hardBrake and character and humanoid.Health > 0 and not humanoid.PlatformStand and not humanoid.Sit
+		if hardBrake and os.clock() >= syncPauseUntil and character and humanoid.Health > 0 and not humanoid.PlatformStand and not humanoid.Sit
 			and character:GetAttribute("IsTrapped") ~= true
 			and not (rigPause.Character == character and os.clock() < rigPause.Until) then
 			local endsAt = player:GetAttribute("RagdollEndTime")
@@ -292,6 +300,7 @@ local function move(destination, options)
 				humanoid.Jump = false
 				local velocity = root.AssemblyLinearVelocity
 				root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+				lastPhysicalBrakeAt = os.clock()
 			end
 		end
 	end
@@ -363,6 +372,7 @@ end
 
 -- Observe server movement effects; never cancel ragdoll, impulses, or server corrections.
 local function motionBlockReason(ctx)
+	if os.clock() < syncPauseUntil then return "correction de position en cours" end
 	local _, humanoid = getCharacterParts()
 	if not humanoid then return "personnage absent" end
 	if ctx.character:GetAttribute("IsTrapped") == true then return "IsTrapped" end
@@ -398,6 +408,16 @@ local function observeRigRefresh(payload)
 		rigPause.Until = math.max(rigPause.Until, os.clock() + math.clamp(duration, 0.1, 10))
 	else
 		rigPause.Until = os.clock() + CONFIG.RigSettleTime
+	end
+	if action == "Relocate" then
+		lastRelocateAt = os.clock()
+		movementResumePending = true
+		movementRevision += 1
+		if autoEnabled then syncPauseUntil = math.max(syncPauseUntil, os.clock()+0.5) end
+		if autoEnabled or currentCycle then
+			log("SYNC_DIAG", "Source=RigSync.Relocate Revision=%d Phase=%s | repositionnement demande par le serveur ; commandes suspendues",
+				movementRevision, currentCycle and currentCycle.phase or autoActivity)
+		end
 	end
 	log("RIG_OBSERVED", "Action=%s PauseRestante=%.2fs | observation seule", action, rigPause.Until - os.clock())
 end
@@ -727,7 +747,7 @@ end
 local function requestCarry(ctx)
 	if inFlightRequest and not inFlightRequest.done then return end
 	if ctx.attempts >= CONFIG.MaxCarryAttempts then return end
-	local request = {uid = ctx.uid, started = os.clock(), done = false, retryable = false}
+	local request = {uid = ctx.uid, started = os.clock(), done = false, retryable = false, movementRevision = movementRevision}
 	inFlightRequest = request
 	shared.__AutoSAERemoteLock = request
 	ctx.attempts += 1
@@ -774,7 +794,18 @@ local function requestCarry(ctx)
 			tostring(player:GetAttribute("InHalloweenDimension")), tostring(slotKey))
 		local ok, accepted, reason = pcall(EggState.CarryFieldEgg, ctx.uid, slotKey)
 		if ok and accepted ~= true and type(reason) == "string" and reason:find("Enter the gameplay area first", 1, true) then
-			ctx.gameplayEntryRejected = true
+			ctx.gameplayEntryRejected = ctx.attempts >= CONFIG.MaxCarryAttempts
+			ctx.preciseRadius = 1.5
+		end
+		if not ok or accepted ~= true then
+			log("CARRY_DIAG", "Refus=%s PosLocale=%s DistanceLocale=%s CoteLigne=%s RevisionAvant=%d RevisionApres=%d DernierFreinMs=%.0f RegionAntiTpActive=%s",
+				tostring(ok and reason or accepted), root and formatPosition(root.Position) or "?",
+				tostring(distance), tostring(depth), request.movementRevision, movementRevision,
+				(os.clock()-lastPhysicalBrakeAt)*1000,
+				tostring(Workspace:GetAttribute("AnticheatSuspendedRegion") ~= nil or Workspace:FindFirstChild("MonsterEventMap") ~= nil))
+		end
+		if ok and accepted ~= true and type(reason) == "string" and reason:lower():find("closer", 1, true) then
+			ctx.preciseRadius = 1.5
 		end
 		request.done = true
 		request.callOK, request.retryable = ok, ok and accepted ~= true and not ctx.gameplayEntryRejected
@@ -886,6 +917,7 @@ local function approachEgg(ctx, destination)
 			elseif pausedAt then
 				log("MOVE_RESUME", "Phase=APPROACH Attente=%.2fs", os.clock() - pausedAt)
 				pausedAt, lastCommand, lastMoved = nil, -math.huge, os.clock()
+				previousApproachPosition = root.Position
 			end
 			local latest, readOK = readField(ctx.uid)
 			local eggPosition = getRecordPosition(latest)
@@ -905,7 +937,7 @@ local function approachEgg(ctx, destination)
 			if distanceXZ(lastPosition, root.Position) >= 0.5 then
 				lastMoved, lastPosition = now, root.Position
 			end
-			local preciseRadius = CONFIG.PreciseArrivalRadius
+			local preciseRadius = ctx.preciseRadius or CONFIG.PreciseArrivalRadius
 			local currentPosition = root.Position
 			local segment = Vector3.new(currentPosition.X - previousApproachPosition.X, 0, currentPosition.Z - previousApproachPosition.Z)
 			local offset = Vector3.new(eggPosition.X - previousApproachPosition.X, 0, eggPosition.Z - previousApproachPosition.Z)
@@ -935,7 +967,7 @@ local function approachEgg(ctx, destination)
 				lastCommand, retryRequested = now, false
 				log(firstCommand and "MOVE_COMMAND" or "MOVE_RENEW", "Destination=%s DistanceXZ=%.2f Temps=%.2fs | sans arret ni changement de vitesse",
 					formatPosition(destination), distance, now - started)
-				move(destination, {Radius = CONFIG.PreciseArrivalRadius, Flat = true, ArrivalPosition = eggPosition})
+				move(destination, {Radius = ctx.preciseRadius or CONFIG.PreciseArrivalRadius, Flat = true, ArrivalPosition = eggPosition})
 			end
 			if now - lastLog >= CONFIG.ProgressInterval then
 				lastLog = now
@@ -968,7 +1000,7 @@ local function approachEgg(ctx, destination)
 	if not validCycle(ctx) then return false, "annule" end
 	-- Cancel momentum immediately; no fixed settling wait before the direct request.
 	stopMovement(true)
-	local braked = distanceXZ(root.Position, ctx.eggPosition) <= CONFIG.PreciseArrivalRadius
+	local braked = distanceXZ(root.Position, ctx.eggPosition) <= (ctx.preciseRadius or CONFIG.PreciseArrivalRadius)
 		and (root.Position - ctx.eggPosition).Magnitude <= CONFIG.ApproachDistance
 	local brakeReason = "derive apres arrivee"
 	if not braked then return false, brakeReason end
@@ -3026,6 +3058,38 @@ end)
 
 -- Explicit, bounded black-box probes; never start automatically.
 
+
+local correctionSample
+local lastCorrectionNotice = -math.huge
+connect(RunService.Heartbeat, function()
+	if destroyed or not ready or not autoEnabled or manualSession then correctionSample = nil; return end
+	local character, humanoid, root = getCharacterParts()
+	if not root or not humanoid then correctionSample = nil; return end
+	local now = os.clock()
+	if correctionSample and correctionSample.Character == character then
+		local delta = now-correctionSample.Time
+		local distance = distanceXZ(root.Position, correctionSample.Position)
+		local allowance = math.max(40, math.max(humanoid.WalkSpeed, correctionSample.WalkSpeed)*delta*2.5+15)
+		if delta > 0 and delta < 0.5 and distance > allowance and now-lastCorrectionNotice > 1 then
+			lastCorrectionNotice = now
+			movementResumePending = true
+			movementRevision += 1
+			syncPauseUntil = math.max(syncPauseUntil, now+0.5)
+			if currentCycle then
+				currentCycle.syncCorrectionCount = (currentCycle.syncCorrectionCount or 0)+1
+				if currentCycle.syncCorrectionCount > 5 then
+					log("SYNC_DIAG", "Corrections repetees : collecte suspendue apres 5 reprises")
+					stopAutomation("Corrections de position repetees : voir le log")
+				end
+			end
+			stopMovement() -- Cancel walking without cancelling the incoming physical correction.
+			log("SYNC_DIAG", "Source=%s Revision=%d SautObserve=%.1f Seuil=%.1f Phase=%s DernierFreinMs=%.0f | cause non deduite de la seule position",
+				now-lastRelocateAt < 1 and "Relocate_recent" or "deplacement_discontinu_origine_inconnue",
+				movementRevision, distance, allowance, currentCycle and currentCycle.phase or autoActivity, (now-lastPhysicalBrakeAt)*1000)
+		end
+	end
+	correctionSample = {Character=character, Time=now, Position=root.Position, WalkSpeed=humanoid.WalkSpeed}
+end)
 
 local historyOK, previousLog = executorTools.ReadLog()
 if historyOK and type(previousLog) == "string" then
