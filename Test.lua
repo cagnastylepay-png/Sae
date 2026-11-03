@@ -71,6 +71,7 @@ local inventoryEggRecords
 local inventoryPlacementBusy = false
 local placementRequest
 local FusionModules = {}
+FusionModules.Helpers = {}
 FusionModules.Busy = false
 FusionModules.Request = shared.__AutoSAEFusionRequest
 function FusionModules.Pending()
@@ -286,7 +287,7 @@ local function connect(signal, callback)
 	return connection
 end
 
-local function formatPosition(position)
+function FusionModules.Helpers.formatPosition(position)
 	return string.format("(%.1f, %.1f, %.1f)", position.X, position.Y, position.Z)
 end
 
@@ -300,7 +301,7 @@ local function formatNumber(value)
 end
 
 
-local function parseIncomeRate(text)
+function FusionModules.Helpers.parseIncomeRate(text)
 	if type(text) ~= "string" then return nil end
 	local normalized = text:lower():gsub("%s+", ""):gsub(",", "."):gsub("/s$", "")
 	local number, unit = normalized:match("^(%d*%.?%d+)(%a*)$")
@@ -799,7 +800,7 @@ local function getRecordPosition(record)
 	return nil
 end
 
-local function mutationLabel(record)
+function FusionModules.Helpers.mutationLabel(record)
 	if type(record) ~= "table"
 		or type(record.Mutations) ~= "table"
 		or #record.Mutations == 0 then
@@ -809,16 +810,16 @@ local function mutationLabel(record)
 	return table.concat(record.Mutations, ", ")
 end
 
-local function versionKey(record)
+function FusionModules.Helpers.versionKey(record)
 	return tostring(record and record.Version or 0)
 end
 
-local function logEgg(record)
+function FusionModules.Helpers.logEgg(record)
 	if type(record) ~= "table" or type(record.Uid) ~= "string" then
 		return
 	end
 
-	local currentVersion = versionKey(record)
+	local currentVersion = FusionModules.Helpers.versionKey(record)
 	if loggedVersions[record.Uid] == currentVersion then
 		return
 	end
@@ -836,13 +837,13 @@ local function logEgg(record)
 		tostring(record.AreaId or "Inconnu"),
 		weight and string.format("%.2f", weight) or "Inconnu",
 		rate and formatNumber(rate) or "Inconnu",
-		mutationLabel(record),
-		position and formatPosition(position) or "Inconnue"
+		FusionModules.Helpers.mutationLabel(record),
+		position and FusionModules.Helpers.formatPosition(position) or "Inconnue"
 		))
 end
 
 
-local function ownerSnapshot()
+function FusionModules.Helpers.ownerSnapshot()
 	local ok, inventory = pcall(EggState.ReadOwnerEggs, player.UserId)
 	local merged = ok and type(inventory) == "table" and inventory or {}
 	if Save then
@@ -859,7 +860,7 @@ local function claimEvidence(ctx)
 	if owned then return true, source end
 	local carry = readCarry()
 	if ctx.claimFeedback and (ctx.sawCarry or ctx.remoteAccepted) and carry and not carry.IsCarrying then
-		for uid, record in pairs(ownerSnapshot()) do
+		for uid, record in pairs(FusionModules.Helpers.ownerSnapshot()) do
 			if not ctx.ownerBefore[uid] and type(record) == "table"
 				and record.AssetCategory == ctx.record.AssetCategory then
 				return true, "FieldClaimed + nouvel UID inventaire " .. tostring(uid)
@@ -950,7 +951,7 @@ local function requestCarry(ctx)
 		local line = areas and areas:FindFirstChild("SeparationLine")
 		local depth = root and line and line:IsA("BasePart") and line.CFrame.LookVector:Dot(root.Position - line.Position)
 		log("CARRY_CONTEXT", "Pos=%s Distance3D=%s ProfondeurLigne=%s Halloween=%s SlotKey=%s",
-			root and formatPosition(root.Position) or "absent", tostring(distance), tostring(depth),
+			root and FusionModules.Helpers.formatPosition(root.Position) or "absent", tostring(distance), tostring(depth),
 			tostring(player:GetAttribute("InHalloweenDimension")), tostring(slotKey))
 		local ok, accepted, reason = pcall(EggState.CarryFieldEgg, ctx.uid, slotKey)
 		if ok and accepted ~= true and type(reason) == "string" and reason:find("Enter the gameplay area first", 1, true) then
@@ -959,7 +960,7 @@ local function requestCarry(ctx)
 		end
 		if not ok or accepted ~= true then
 			log("CARRY_DIAG", "Refus=%s PosLocale=%s DistanceLocale=%s CoteLigne=%s RevisionAvant=%d RevisionApres=%d DernierFreinMs=%.0f RegionAntiTpActive=%s",
-				tostring(ok and reason or accepted), root and formatPosition(root.Position) or "?",
+				tostring(ok and reason or accepted), root and FusionModules.Helpers.formatPosition(root.Position) or "?",
 				tostring(distance), tostring(depth), request.movementRevision, movementRevision,
 				(os.clock()-lastPhysicalBrakeAt)*1000,
 				tostring(Workspace:GetAttribute("AnticheatSuspendedRegion") ~= nil or Workspace:FindFirstChild("MonsterEventMap") ~= nil))
@@ -1019,8 +1020,8 @@ local function traceMoveEnd(ctx, root, destination, reached)
 		Reached = reached, At = measuredAt,
 	}
 	log("MOVE_END_POSITIONS", "Reached=%s | Oeuf=%s | Player=%s | DestinationMoveTo=%s | DistanceXZ=%.2f studs | Distance3D=%.2f studs | Vitesse=%.2f studs/s | SourceOeuf=%s",
-		tostring(reached), formatPosition(eggPosition), formatPosition(playerPosition),
-		formatPosition(destination), distanceXZ(playerPosition, eggPosition),
+		tostring(reached), FusionModules.Helpers.formatPosition(eggPosition), FusionModules.Helpers.formatPosition(playerPosition),
+		FusionModules.Helpers.formatPosition(destination), distanceXZ(playerPosition, eggPosition),
 		(playerPosition - eggPosition).Magnitude, root.AssemblyLinearVelocity.Magnitude,
 		fromRecord and "EggState" or "memorisee")
 	for _, delaySeconds in ipairs({0.1, 0.25, 0.5}) do
@@ -1030,8 +1031,8 @@ local function traceMoveEnd(ctx, root, destination, reached)
 			if currentRoot ~= root then return end
 			local position = root.Position
 			log("MOVE_END_DRIFT", "ApresFin=%.3fs | Phase=%s | Oeuf=%s | Player=%s | DistanceXZ=%.2f studs | DeplacementDepuisFinXZ=%.2f studs | Vitesse=%.2f studs/s",
-				os.clock() - measuredAt, tostring(ctx.phase), formatPosition(eggPosition),
-				formatPosition(position), distanceXZ(position, eggPosition),
+				os.clock() - measuredAt, tostring(ctx.phase), FusionModules.Helpers.formatPosition(eggPosition),
+				FusionModules.Helpers.formatPosition(position), distanceXZ(position, eggPosition),
 				distanceXZ(position, playerPosition), root.AssemblyLinearVelocity.Magnitude)
 		end)
 	end
@@ -1097,7 +1098,7 @@ local function approachEgg(ctx, destination)
 	local pausedAt
 	local previousApproachPosition = root.Position
 	log("MOVE_APPROACH_START", "Destination=%s Pos=%s WalkSpeed=%.1f Renouvellement=%.1fs Maximum=%.1fs",
-		formatPosition(destination), formatPosition(root.Position), humanoid.WalkSpeed,
+		FusionModules.Helpers.formatPosition(destination), FusionModules.Helpers.formatPosition(root.Position), humanoid.WalkSpeed,
 		CONFIG.ApproachRefresh, timeout)
 	local finished, moveReason = awaitCycleOperation(ctx, timeout, function(finish)
 		local active = true
@@ -1174,13 +1175,13 @@ local function approachEgg(ctx, destination)
 				local firstCommand = lastCommand == -math.huge
 				lastCommand, retryRequested = now, false
 				log(firstCommand and "MOVE_COMMAND" or "MOVE_RENEW", "Destination=%s DistanceXZ=%.2f Temps=%.2fs | sans arret ni changement de vitesse",
-					formatPosition(destination), distance, now - started)
+					FusionModules.Helpers.formatPosition(destination), distance, now - started)
 				move(destination, {Radius = ctx.preciseRadius or CONFIG.PreciseArrivalRadius, Flat = true, ArrivalPosition = eggPosition})
 			end
 			if now - lastLog >= CONFIG.ProgressInterval then
 				lastLog = now
 				log("MOVE_PROGRESS", "Phase=APPROACH Pos=%s DistanceXZ=%.2f WalkSpeed=%.1f VitesseReelle=%.1f Temps=%.2fs",
-					formatPosition(root.Position), distance, humanoid.WalkSpeed,
+					FusionModules.Helpers.formatPosition(root.Position), distance, humanoid.WalkSpeed,
 					root.AssemblyLinearVelocity.Magnitude, now - started)
 			end
 		end
@@ -1213,7 +1214,7 @@ local function approachEgg(ctx, destination)
 	local brakeReason = "derive apres arrivee"
 	if not braked then return false, brakeReason end
 	log("MOVE_APPROACH_FINISHED", "NativeReached=%s Pos=%s DistanceRestanteXZ=%.2f | une tentative serveur apres verification",
-		tostring(nativeReached), formatPosition(root.Position), distanceXZ(root.Position, destination))
+		tostring(nativeReached), FusionModules.Helpers.formatPosition(root.Position), distanceXZ(root.Position, destination))
 	traceMoveEnd(ctx, root, destination, true)
 	return true
 end
@@ -1340,7 +1341,7 @@ local function waitForRecoverableEgg(ctx)
 		if latest and (latest.State == "Dropped" or latest.State == SLOT_STATE)
 			and typeof(latest.BottomCFrame) == "CFrame" and not trapped then
 			log("EGG_RECOVERABLE", "UID=%s Etat=%s PositionActuelle=%s Version=%s",
-				ctx.uid, latest.State, formatPosition(latest.BottomCFrame.Position), tostring(latest.Version))
+				ctx.uid, latest.State, FusionModules.Helpers.formatPosition(latest.BottomCFrame.Position), tostring(latest.Version))
 			return latest, "AVAILABLE"
 		end
 		local now = os.clock()
@@ -1363,7 +1364,7 @@ local function recoverSameEgg(ctx)
 	local recoveryStarted = os.clock()
 	ctx.recoveryCount = (ctx.recoveryCount or 0) + 1
 	log("RECOVERY_START", "UID=%s Reprise=%d HomeConservee=%s",
-		ctx.uid, ctx.recoveryCount, formatPosition(ctx.home))
+		ctx.uid, ctx.recoveryCount, FusionModules.Helpers.formatPosition(ctx.home))
 	while validCycle(ctx) do
 		if os.clock() - recoveryStarted > CONFIG.RecoveryStateTimeout then
 			return false, "recuperation abandonnee apres plusieurs echecs"
@@ -1480,7 +1481,7 @@ local function moveReturnLoop(ctx, destination)
 		if now - lastLog >= CONFIG.ProgressInterval then
 			lastLog = now
 			log("MOVE_PROGRESS", "Phase=RETURN Pos=%s DistanceXZ=%.2f WalkSpeed=%.1f VitesseReelle=%.1f Safe=%s",
-				formatPosition(root.Position), distance, humanoid.WalkSpeed,
+				FusionModules.Helpers.formatPosition(root.Position), distance, humanoid.WalkSpeed,
 				root.AssemblyLinearVelocity.Magnitude, tostring(isSafe(root.Position)))
 		end
 		RunService.Heartbeat:Wait()
@@ -1557,7 +1558,7 @@ local function runCycle(record, rate, recovering, findNext)
 		uid = record.Uid, record = record, generation = generation, character = character, findNext = findNext,
 		startedAt = os.clock(), phaseStartedAt = os.clock(),
 		home = safeHome, eggPosition = record.BottomCFrame and record.BottomCFrame.Position,
-		attempts = 0, lastRequest = -math.huge, phase = "SELECTED", ownerBefore = ownerSnapshot(),
+		attempts = 0, lastRequest = -math.huge, phase = "SELECTED", ownerBefore = FusionModules.Helpers.ownerSnapshot(),
 		remoteAccepted = recovering == true, sawCarry = recovering == true,
 		pickupVersion = record.Version, hadCarry = recovering == true,
 	}
@@ -1566,7 +1567,7 @@ local function runCycle(record, rate, recovering, findNext)
 	shared.__AutoSAEMovementLock = ctx.movementLock
 	currentCycle = ctx
 	log("TARGET", "Animal=%s Revenu=%s/s Home=%s Recovery=%s",
-		getAnimalName(record), formatNumber(rate or 0), formatPosition(ctx.home), tostring(recovering))
+		getAnimalName(record), formatNumber(rate or 0), FusionModules.Helpers.formatPosition(ctx.home), tostring(recovering))
 	local cycleOK, completed, failure = xpcall(function()
 		local grabbed, grabReason
 		if recovering then
@@ -1644,7 +1645,7 @@ local function ingest(record)
 		trackedEggs[record.Uid].Record=record
 		if record.CarrierUserId then trackedEggs[record.Uid].LastCarrier=record.CarrierUserId end
 	end
-	logEgg(record)
+	FusionModules.Helpers.logEgg(record)
 end
 
 local function snapshot(snapshotData)
@@ -1653,7 +1654,7 @@ local function snapshot(snapshotData)
 	for _, record in ipairs(snapshotData.Records) do
 		if type(record) == "table" and type(record.Uid) == "string" then
 			updated[record.Uid] = record
-			logEgg(record)
+			FusionModules.Helpers.logEgg(record)
 		end
 	end
 	records = updated
@@ -1674,7 +1675,7 @@ local function queueOrder()
 end
 
 -- Mirror the backpack: placed eggs are excluded from its virtual egg list.
-local function backpackEggCategories(profile)
+function FusionModules.Helpers.backpackEggCategories(profile)
 	local categories = {}
 	for _, egg in pairs(type(profile) == "table" and profile.EggInventory or {}) do
 		if type(egg) == "table" and egg.Placement == nil and type(egg.AssetCategory) == "string" then
@@ -1684,7 +1685,7 @@ local function backpackEggCategories(profile)
 	return categories
 end
 
-local function plotAnimalCategories()
+function FusionModules.Helpers.plotAnimalCategories()
 	local categories = {}
 	if AssetRoster then
 		local ok, pen = pcall(AssetRoster.ReadOwnerPen, player.UserId)
@@ -1713,7 +1714,7 @@ local function enqueueEgg(record, source)
 		return false
 	end
 	if record.IsHalloweenObservation then return reject("EXCLU : Halloween en observation") end
-	if source == "INDEX" and plotAnimalCategories()[record.AssetCategory] then return reject("EXCLU : espece deja presente dans ton plot") end
+	if source == "INDEX" and FusionModules.Helpers.plotAnimalCategories()[record.AssetCategory] then return reject("EXCLU : espece deja presente dans ton plot") end
 	if (source == "AUTO" or source == "INDEX") and removedFromAuto[record.Uid] then return reject("EXCLU : retire manuellement de la file") end
 	if source == "MANUEL" then removedFromAuto[record.Uid] = nil end
 	if source == "INDEX" then
@@ -1739,7 +1740,7 @@ end
 syncQueue = function()
 	if not ready or destroyed then return end
 	refreshHalloweenRecords()
-	local plotCategories = plotAnimalCategories()
+	local plotCategories = FusionModules.Helpers.plotAnimalCategories()
 	for uid, entry in pairs(queuedEggs) do
 		if not currentCycle or currentCycle.uid ~= uid then
 			local record = readField(uid)
@@ -1754,7 +1755,7 @@ syncQueue = function()
 	if automaticMode then
 		local ok, profile = pcall(Save.Peek)
 		local index = ok and type(profile) == "table" and profile.Index
-		local backpackCategories = backpackEggCategories(ok and profile or nil)
+		local backpackCategories = FusionModules.Helpers.backpackEggCategories(ok and profile or nil)
 		local candidates = {}
 		for uid, record in pairs(records) do
 			do
@@ -1982,7 +1983,7 @@ local function plotEggCapacity(eggs)
 	return math.max(0, math.floor(limit)-count), count
 end
 
-local function inventoryPlacementOrder(eggs, selection)
+function FusionModules.Helpers.inventoryPlacementOrder(eggs, selection)
 	local ids = {}
 	for uid, egg in pairs(eggs) do
 		local rate=getRatePerSecond(egg)
@@ -2063,7 +2064,7 @@ local function placeInventoryEggs(selection, token, opened)
 	local placed, summary, reserved = 0, "Aucun oeuf a placer", {}
 	local ok, failure = xpcall(function()
 		local eggs = inventoryEggRecords()
-		local ids = inventoryPlacementOrder(eggs,selection)
+		local ids = FusionModules.Helpers.inventoryPlacementOrder(eggs,selection)
 		if #ids==0 then return end
 		local free = plotEggCapacity(eggs)
 		if free==nil then summary="Limite d'oeufs places indisponible"; return end
@@ -2145,7 +2146,7 @@ local function placeInventoryEggs(selection, token, opened)
 end
 
 
-local function inventoryEggsBelowMinimum(eggs)
+function FusionModules.Helpers.inventoryEggsBelowMinimum(eggs)
 	local ids={}
 	for uid,egg in pairs(eggs) do
 		local rate=getRatePerSecond(egg)
@@ -2164,14 +2165,14 @@ local function sellInventoryEggsBelowMinimum(token)
 		or queuePaused or stopAfterFlight then return end
 	local _,_,root=getCharacterParts()
 	if not root or isSafe(root.Position)~=true then return end
-	local ids=inventoryEggsBelowMinimum(inventoryEggRecords())
+	local ids=FusionModules.Helpers.inventoryEggsBelowMinimum(inventoryEggRecords())
 	if #ids==0 then return end
 	inventoryPlacementBusy=true -- Serialize all inventory actions with placement.
 	local ok,failure=pcall(function()
 		for offset=1,#ids,512 do
 			if destroyed or not automaticMode or not autoEnabled or generation~=token or queuePaused or stopAfterFlight then break end
 			local allowed={}
-			for _,uid in ipairs(inventoryEggsBelowMinimum(inventoryEggRecords())) do allowed[uid]=true end
+			for _,uid in ipairs(FusionModules.Helpers.inventoryEggsBelowMinimum(inventoryEggRecords())) do allowed[uid]=true end
 			local batch={}
 			for i=offset,math.min(offset+511,#ids) do
 				if allowed[ids[i]] then table.insert(batch,ids[i]) end
@@ -2613,7 +2614,7 @@ local function worker(token)
 				if not destination then stopAutomation(destinationReason); return end
 				autoActivity = "TO_FARM"
 				setStatus("Trajet vers le centre de StartArea...")
-				log("START_AREA_MOVETO", "Trajet direct vers %s", formatPosition(destination))
+				log("START_AREA_MOVETO", "Trajet direct vers %s", FusionModules.Helpers.formatPosition(destination))
 				local eggPosition = getRecordPosition(records[selected.Uid] or selected)
 				local nextDestination = eggPosition and Vector3.new(eggPosition.X, destination.Y, eggPosition.Z)
 				local reached, reason = measureAction("TRAJET_STARTAREA", moveActivity, destination, token, false, nextDestination)
@@ -2725,7 +2726,7 @@ startAutomation = function(billions)
 	snapshot(EggState.ReadFieldEggs())
 	if renderControls then renderControls() end
 	log("START", "Minimum=%s/s SafeHome=%s Session=%d",
-		formatNumber(minimumRatePerSecond), formatPosition(safeHome), token)
+		formatNumber(minimumRatePerSecond), FusionModules.Helpers.formatPosition(safeHome), token)
 	task.spawn(function()
 		local ok, failure = xpcall(function() worker(token) end, debug.traceback)
 		if not ok then
@@ -2899,7 +2900,7 @@ local function initialize()
 	connect(EggState.FieldClaimed, function(payload)
 		local ctx = currentCycle
 		log("FIELD_CLAIMED", "Animal=%s Rarity=%s Pos=%s | payload sans UID",
-			tostring(payload.AssetCategory), tostring(payload.Rarity), formatPosition(payload.Position))
+			tostring(payload.AssetCategory), tostring(payload.Rarity), FusionModules.Helpers.formatPosition(payload.Position))
 		if ctx and payload.AssetCategory == ctx.record.AssetCategory
 			and (ctx.sawCarry or ctx.remoteAccepted) then
 			ctx.claimFeedback = true
@@ -2940,7 +2941,7 @@ inventoryEggRecords = function()
 	return result
 end
 
-local function filterPublicServers(data, currentJobId)
+function FusionModules.Helpers.filterPublicServers(data, currentJobId)
 	syncVisitedServerCycle(false)
 	local result, seen = {}, {}
 	for _, server in ipairs(type(data) == "table" and data or {}) do
@@ -2958,7 +2959,7 @@ local function filterPublicServers(data, currentJobId)
 	return result
 end
 
-local function fetchPublicServers()
+function FusionModules.Helpers.fetchPublicServers()
 	local all, cursor = {}, nil
 	for page = 1, 3 do
 		if destroyed then return {} end
@@ -2982,12 +2983,12 @@ local function fetchPublicServers()
 		if not cursor or cursor == "" then break end
 		task.wait(0.2)
 	end
-	return filterPublicServers(all, game.JobId)
+	return FusionModules.Helpers.filterPublicServers(all, game.JobId)
 end
 
 
 
-local function holdSearchForReset()
+function FusionModules.Helpers.holdSearchForReset()
 	if searchWaitForEgg then return true end
 	if not AreaEggCycle or not ServerClock then return false end
 	local ok, remaining = pcall(function()
@@ -3005,7 +3006,7 @@ local function holdSearchForReset()
 end
 
 -- Server search starts only after a confirmed successful collection.
-local function prepareServerContinuation()
+function FusionModules.Helpers.prepareServerContinuation()
 	if continuationPrepared then return true end
 	local queue = executorFunction("queue_on_teleport") or executorFunction("queueonteleport")
 	if not queue then
@@ -3026,13 +3027,13 @@ requestRandomServerHop = function(token, reason)
 	if not automaticMode or not autoEnabled or generation ~= token
 		or destroyed or currentCycle or FusionModules.Pending() or inventoryPlacementBusy or placementRequest or hatchInProgress or stopAfterFlight or queuePaused
 		or os.clock() < nextServerHopAt then return false end
-	if holdSearchForReset() then return false end
+	if FusionModules.Helpers.holdSearchForReset() then return false end
 	local carry = readCarry()
 	if not carry or carry.IsCarrying or (inFlightRequest and not inFlightRequest.done) then return false end
 	nextServerHopAt = os.clock()+30
 	serverSearchState = "Recherche de serveur..."
 	setStatus(serverSearchState)
-	local ok, servers = pcall(fetchPublicServers)
+	local ok, servers = pcall(FusionModules.Helpers.fetchPublicServers)
 	-- An OFF click during HTTP must cancel this departure.
 	if destroyed or not automaticMode or not autoEnabled
 		or generation ~= token or queuePaused or stopAfterFlight then return false end
@@ -3045,14 +3046,14 @@ requestRandomServerHop = function(token, reason)
 		syncQueue()
 		if os.clock() < serverSearchReadyAt or selectBest() then return false end
 	end
-	if holdSearchForReset() then return false end
+	if FusionModules.Helpers.holdSearchForReset() then return false end
 	local saved, saveReason = executorTools.SaveSettings()
 	if not saved then
 		serverSearchState = "Recherche bloquee : sauvegarde indisponible"
 		log("SERVER_CHANGE", "%s", tostring(saveReason))
 		return false
 	end
-	local queued, queueReason = prepareServerContinuation()
+	local queued, queueReason = FusionModules.Helpers.prepareServerContinuation()
 	if not queued then
 		serverSearchState = "Recherche bloquee : relancement indisponible"
 		log("SERVER_CHANGE", "%s", tostring(queueReason))
@@ -3273,7 +3274,7 @@ local function createInterface()
 	local thresholdCorner = Instance.new("UICorner", minimumInput)
 	thresholdCorner.CornerRadius = UDim.new(0, 8)
 	local function readThreshold()
-		local rate = parseIncomeRate(minimumInput.Text)
+		local rate = FusionModules.Helpers.parseIncomeRate(minimumInput.Text)
 		local value = rate and rate / 1e9
 		if not value or value ~= value or math.abs(value) == math.huge then
 			setStatus("Seuil invalide : entre 0.1 et 999 B/s", Color3.fromRGB(255, 130, 110))
@@ -3518,7 +3519,7 @@ local function createInterface()
 		input.Text = formatNumber(initial).."/s"
 		input.Parent = paramsPanel
 		connect(input.FocusLost,function()
-			local rate = parseIncomeRate(input.Text)
+			local rate = FusionModules.Helpers.parseIncomeRate(input.Text)
 			if not rate then setStatus("Revenu invalide : exemple 2B/s ou 500M/s"); input.Text = formatNumber(initial).."/s"; return end
 			initial = rate
 			input.Text = formatNumber(rate).."/s"
@@ -3743,8 +3744,8 @@ local function createInterface()
 		end
 		refreshEggInterface()
 		table.clear(mapSelection)
-		local backpackCategories = backpackEggCategories(profile)
-		local plotCategories = plotAnimalCategories()
+		local backpackCategories = FusionModules.Helpers.backpackEggCategories(profile)
+		local plotCategories = FusionModules.Helpers.plotAnimalCategories()
 		local count = 0
 		local bestByCategory = {}
 		for uid in pairs(cards) do
