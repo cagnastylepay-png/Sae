@@ -1938,6 +1938,24 @@ local function leaveTreadmill(token)
 	return true
 end
 
+
+-- World eggs always take precedence over optional inventory maintenance.
+FusionModules.SpawnPriorityUntil=0
+function FusionModules.YieldToSpawnedEggs()
+ if destroyed or not ready or not automaticMode or not autoEnabled then return false end
+ if os.clock()<FusionModules.SpawnPriorityUntil then
+  wallMaintenancePending=true
+  return true
+ end
+ syncQueue()
+ local candidate=selectBest()
+ if candidate then
+  wallMaintenancePending=true
+  return true
+ end
+ return false
+end
+
 local function hatchReadyEggsOnWallClose(token)
 	if hatchInProgress or not PlacedEggRenderer or not EggGrowthPolicy then return end
 	local ok, eggs = pcall(EggState.ReadOwnerEggs, player.UserId)
@@ -1953,7 +1971,7 @@ local function hatchReadyEggsOnWallClose(token)
 	end
 	table.sort(readyUids)
 	for _, uid in ipairs(readyUids) do
-		if destroyed or not autoEnabled or generation ~= token or not automaticMode or queuePaused then break end
+		if destroyed or not autoEnabled or generation ~= token or not automaticMode or queuePaused or FusionModules.YieldToSpawnedEggs() then break end
 		local readOK, latest = pcall(EggState.ReadOwnedEgg, player.UserId, uid)
 		local readyOK, grown = false, false
 		if readOK and type(latest) == "table" and latest.Placement ~= nil then
@@ -2058,7 +2076,7 @@ local function placeInventoryEggs(selection, token, opened)
 	local function valid()
 		return not destroyed and generation==placementGeneration and player.Character==character
 			and not currentCycle and not serverHopPending and humanoid.Health>0
-			and (token==nil or (autoEnabled and automaticMode and generation==token and not queuePaused and not stopAfterFlight))
+			and (token==nil or (autoEnabled and automaticMode and generation==token and not queuePaused and not stopAfterFlight and not FusionModules.YieldToSpawnedEggs()))
 	end
 	if not valid() then return 0, "Placement annule" end
 	inventoryPlacementBusy = true
@@ -2171,7 +2189,7 @@ local function sellInventoryEggsBelowMinimum(token)
 	inventoryPlacementBusy=true -- Serialize all inventory actions with placement.
 	local ok,failure=pcall(function()
 		for offset=1,#ids,512 do
-			if destroyed or not automaticMode or not autoEnabled or generation~=token or queuePaused or stopAfterFlight then break end
+			if destroyed or not automaticMode or not autoEnabled or generation~=token or queuePaused or stopAfterFlight or FusionModules.YieldToSpawnedEggs() then break end
 			local allowed={}
 			for _,uid in ipairs(FusionModules.Helpers.inventoryEggsBelowMinimum(inventoryEggRecords())) do allowed[uid]=true end
 			local batch={}
@@ -2254,7 +2272,7 @@ FusionModules.Run = function(token)
 	if FusionModules.Pending() or inventoryPlacementBusy or placementRequest or currentCycle or serverHopPending
 		or not FusionModules.Remotes or not FusionModules.Kernel or not FusionModules.Items or not FusionModules.Signals or not FusionModules.Types then return end
 	local function valid()
-		return not destroyed and automaticMode and autoEnabled and generation==token and not queuePaused and not stopAfterFlight
+		return not destroyed and automaticMode and autoEnabled and generation==token and not queuePaused and not stopAfterFlight and not FusionModules.YieldToSpawnedEggs()
 	end
 	if not valid() then return end
 	if not GameplayBalance or GameplayBalance.Fusion.INPUT_COUNT~=3 then return end
@@ -2277,7 +2295,7 @@ FusionModules.Run = function(token)
 		autoActivity="TO_FUSION"
 		setStatus("Trajet vers la machine de fusion...")
 		local target=machine.Position+machine.CFrame.LookVector*7
-		local reached,why=moveActivity(Vector3.new(target.X,root.Position.Y,target.Z),token,false)
+		local reached,why=moveActivity(Vector3.new(target.X,root.Position.Y,target.Z),token,true)
 		if not reached then error("Trajet fusion : "..tostring(why)) end
 		autoActivity="FUSION"
 		while valid() and player.Character==character do
@@ -2418,17 +2436,18 @@ end
 
 local function serviceWallMaintenance(token)
 	if destroyed or not automaticMode or not autoEnabled or generation ~= token or currentCycle or FusionModules.Pending() or inventoryPlacementBusy or placementRequest then return end
+    if FusionModules.YieldToSpawnedEggs() then return end
 	if not wallMaintenancePending and os.clock()-lastMaintenanceAt < 15 then return end
 	local _, _, root = getCharacterParts()
 	if not root or isSafe(root.Position) ~= true then return end
 	wallMaintenancePending = false
 	lastMaintenanceAt = os.clock()
 	local opened = hatchReadyEggsOnWallClose(token)
-	if destroyed or not autoEnabled or generation ~= token or queuePaused then return end
+	if destroyed or not autoEnabled or generation ~= token or queuePaused or FusionModules.YieldToSpawnedEggs() then return end
 	sellInventoryEggsBelowMinimum(token)
-	if destroyed or not autoEnabled or generation~=token or queuePaused then return end
+	if destroyed or not autoEnabled or generation~=token or queuePaused or FusionModules.YieldToSpawnedEggs() then return end
 	placeInventoryEggs(nil,token,opened)
-	if destroyed or not autoEnabled or generation ~= token or queuePaused or placementRequest then return end
+	if destroyed or not autoEnabled or generation ~= token or queuePaused or placementRequest or FusionModules.YieldToSpawnedEggs() then return end
 	if HaulRemotes and os.clock() - lastEquipBestAt >= 5 then
 		lastEquipBestAt = os.clock()
 		setStatus("Mur ferme : Equip Best...")
@@ -2592,6 +2611,7 @@ end
 local function worker(token)
 	local directNext = false
 	while autoEnabled and generation == token and not destroyed do
+        syncQueue()
 		serviceWallMaintenance(token)
 		if activityRecheckPending then
 			activityRecheckPending = false
@@ -2874,10 +2894,11 @@ local function initialize()
         end
 		if sealed == true and not destroyed and automaticMode then
 			wallMaintenancePending = true
+            FusionModules.SpawnPriorityUntil=os.clock()+15
 			serverSearchReadyAt = os.clock()+15
 			activityRecheckPending = true
 			log("EGG_RESET", "Reevaluation de la file et du tapis apres le vol actif.")
-			log("WALL_CLOSED", "Ouverture des oeufs prets puis Equip Best; differe si un vol est en cours.")
+			log("WALL_CLOSED", "Priorite aux oeufs spawnes ; entretien differe tant qu une cible est disponible.")
 		end
 	end)
 	connect(TreadmillRemotes.AssignedBeltShifted.OnClientEvent, function(id)
