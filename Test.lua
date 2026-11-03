@@ -662,7 +662,7 @@ end
 
 function FusionModules.Helpers.IsAlwaysEligibleRarity(record)
  local rarity=getRarityName(record)
- return rarity=="Divine" or rarity=="Eternal"
+ return rarity=="Divine"
 end
 
 local function getAnimalName(record)
@@ -698,6 +698,11 @@ local function getRatePerSecond(record)
 	end
 
 	return rate
+end
+
+function FusionModules.Helpers.IsEternalBelowMinimum(record)
+ return getRarityName(record)=="Eternal"
+  and (getRatePerSecond(record)==nil or getRatePerSecond(record)<minimumRatePerSecond)
 end
 
 local function getWeightKg(record)
@@ -1641,6 +1646,7 @@ local function enqueueEgg(record, source)
 		if source == "AUTO" or source == "RARITY" then logQueueDecision(record.Uid, reason) end
 		return false
 	end
+	if FusionModules.Helpers.IsEternalBelowMinimum(record) then return reject("EXCLU : Eternal sous le minimum de revenu") end
 	if source == "INDEX" and FusionModules.Helpers.plotAnimalCategories()[record.AssetCategory] then return reject("EXCLU : espece deja presente dans ton plot") end
 	if (source == "AUTO" or source == "INDEX") and removedFromAuto[record.Uid] then return reject("EXCLU : retire manuellement de la file") end
 	if source == "MANUEL" then removedFromAuto[record.Uid] = nil end
@@ -1671,6 +1677,7 @@ syncQueue = function()
 		if not currentCycle or currentCycle.uid ~= uid then
 			local record = readField(uid)
 			if not record or ownsEgg(uid) or not isTrackedFieldState(record)
+                or FusionModules.Helpers.IsEternalBelowMinimum(record)
 				or (entry.Source == "INDEX" and plotCategories[record.AssetCategory]) then
 				queuedEggs[uid],trackedEggs[uid] = nil,nil
 			else
@@ -1687,6 +1694,11 @@ syncQueue = function()
 			do
 				local calculatedRate = getRatePerSecond(record)
 				local rate = calculatedRate or 0
+                if getRarityName(record)=="Eternal" and rate<minimumRatePerSecond
+                    and isTrackedFieldState(record) and not ownsEgg(uid) and not searchingServer then
+                    searchingServer=true
+                    log("SERVER_CHANGE","Eternal sous le seuil detecte : recherche activee sans collecte")
+                end
 				local missing = autoIncludeMissingIndex and type(index) == "table"
 					and type(record.AssetCategory) == "string" and Assets.Directory[record.AssetCategory] ~= nil
 					and index[record.AssetCategory] ~= true
