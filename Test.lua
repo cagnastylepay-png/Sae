@@ -3106,7 +3106,8 @@ requestRandomServerHop = function(token, reason)
 		log("SERVER_CHANGE", "%s", tostring(queueReason))
 		return false
 	end
-	local destination = servers[Random.new():NextInteger(1,#servers)].id
+	-- Candidates are sorted by population ascending; choose the least populated.
+	local destination = servers[1].id
 	-- Reserve before departure, including failed attempts, and carry history across servers.
 	visitedServers[destination]=true
 	local historySaved,historyError=executorTools.SaveSettings()
@@ -3119,7 +3120,7 @@ requestRandomServerHop = function(token, reason)
 	serverHopPending = true
 	serverSearchState = "Changement de serveur..."
 	stopMovement(true)
-	log("SERVER_CHANGE", "%s | Destination=%s Recherche=%s", reason, destination, tostring(searchingServer))
+	log("SERVER_CHANGE", "%s | Destination=%s Joueurs=%d/%d Recherche=%s", reason, destination, servers[1].playing, servers[1].maxPlayers, tostring(searchingServer))
 	executorTools.SaveLog()
 	local function resumeAfterFailure(message)
 		if not serverHopPending or destroyed then return end
