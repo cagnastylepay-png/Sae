@@ -70,6 +70,7 @@ local lastMaintenanceAt = -math.huge
 local inventoryEggRecords
 local inventoryPlacementBusy = false
 local placementRequest
+local EggSaleRemote
 local GameplayBalance
 local timingEnabled = false
 local flightHistory = {}
@@ -165,7 +166,7 @@ end
 shared.__AutoSAEExecutorTools = executorTools
 
 local function log(stage, message, ...)
-	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, PLOT_PLACE=true, EGG_TRACK=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
+	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, PLOT_PLACE=true, INVENTORY_SELL_REQUEST=true, EGG_TRACK=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
 	if not allowed[stage] then
 		return
 	end
@@ -1978,7 +1979,9 @@ end
 local function inventoryPlacementOrder(eggs, selection)
 	local ids = {}
 	for uid, egg in pairs(eggs) do
-		if not egg.InventoryPlaced and egg.Placement == nil and (not selection or selection[uid]) then
+		local rate=getRatePerSecond(egg)
+		if not egg.InventoryPlaced and egg.Placement == nil and type(rate)=="number" and rate==rate
+			and rate>=minimumRatePerSecond and rate<math.huge and (not selection or selection[uid]) then
 			table.insert(ids, uid)
 		end
 	end
@@ -2083,7 +2086,9 @@ local function placeInventoryEggs(selection, token, opened)
 			free=plotEggCapacity(eggs)
 			if not free or free<=0 then summary="Enclos plein"; break end
 			local egg=eggs[uid]
-			if egg and not egg.InventoryPlaced and egg.Placement==nil then
+			local rate=egg and getRatePerSecond(egg)
+			if egg and not egg.InventoryPlaced and egg.Placement==nil and type(rate)=="number"
+				and rate==rate and rate>=minimumRatePerSecond and rate<math.huge then
 				local localFrame, point=findPlotEggSpot(plot,eggs,reserved)
 				if not localFrame then summary="Aucun emplacement libre detecte"; break end
 				local request={done=false}
@@ -2133,6 +2138,49 @@ local function placeInventoryEggs(selection, token, opened)
 	return placed,summary
 end
 
+
+local function inventoryEggsBelowMinimum(eggs)
+	local ids={}
+	for uid,egg in pairs(eggs) do
+		local rate=getRatePerSecond(egg)
+		if not egg.InventoryPlaced and egg.Placement==nil and type(rate)=="number"
+			and rate==rate and rate>=0 and rate<minimumRatePerSecond then
+			table.insert(ids,uid)
+		end
+	end
+	table.sort(ids)
+	return ids
+end
+
+local function sellInventoryEggsBelowMinimum(token)
+	if not EggSaleRemote or inventoryPlacementBusy or placementRequest or currentCycle
+		or destroyed or not automaticMode or not autoEnabled or generation~=token
+		or queuePaused or stopAfterFlight then return end
+	local _,_,root=getCharacterParts()
+	if not root or isSafe(root.Position)~=true then return end
+	local ids=inventoryEggsBelowMinimum(inventoryEggRecords())
+	if #ids==0 then return end
+	inventoryPlacementBusy=true -- Serialize all inventory actions with placement.
+	local ok,failure=pcall(function()
+		for offset=1,#ids,512 do
+			if destroyed or not automaticMode or not autoEnabled or generation~=token or queuePaused or stopAfterFlight then break end
+			local allowed={}
+			for _,uid in ipairs(inventoryEggsBelowMinimum(inventoryEggRecords())) do allowed[uid]=true end
+			local batch={}
+			for i=offset,math.min(offset+511,#ids) do
+				if allowed[ids[i]] then table.insert(batch,ids[i]) end
+			end
+			if #batch>0 then
+				EggSaleRemote:FireServer({Assets={},Eggs=batch})
+				log("INVENTORY_SELL_REQUEST","Oeufs=%d Revenu < %s/s | confirmation via inventaire",#batch,formatNumber(minimumRatePerSecond))
+			end
+			if offset+512<=#ids then task.wait() end
+		end
+	end)
+	inventoryPlacementBusy=false
+	if not ok then log("ERROR","Vente sous seuil : %s",tostring(failure)) end
+end
+
 local function serviceWallMaintenance(token)
 	if destroyed or not automaticMode or not autoEnabled or generation ~= token or currentCycle or inventoryPlacementBusy or placementRequest then return end
 	if not wallMaintenancePending and os.clock()-lastMaintenanceAt < 15 then return end
@@ -2142,6 +2190,8 @@ local function serviceWallMaintenance(token)
 	lastMaintenanceAt = os.clock()
 	local opened = hatchReadyEggsOnWallClose(token)
 	if destroyed or not autoEnabled or generation ~= token or queuePaused then return end
+	sellInventoryEggsBelowMinimum(token)
+	if destroyed or not autoEnabled or generation~=token or queuePaused then return end
 	placeInventoryEggs(nil,token,opened)
 	if destroyed or not autoEnabled or generation ~= token or queuePaused or placementRequest then return end
 	if HaulRemotes and os.clock() - lastEquipBestAt >= 5 then
@@ -2424,6 +2474,7 @@ local function initialize()
 	local remotes = loadModule("Shared.Remotes")
 	TreadmillRemotes = remotes.Treadmill
 	HaulRemotes = remotes.Haul
+	EggSaleRemote = remotes.PetSatchel.SellSelection
 	GameplayBalance = loadModule("Shared.Flags.GameplayBalance")
 	-- Optional event support must not prevent the egg interface from starting.
 	local function updateWorldMode()
