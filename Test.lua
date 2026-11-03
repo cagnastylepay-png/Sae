@@ -1,3 +1,4 @@
+print("[Auto_SAE] Build register-fix-2")
 -- Auto_SAE v2.8. SellPrompt selection UI. Verified client contracts; no character/anticheat replacement.
 -- The live game must provide ReplicatedStorage.Client/Data/Shared.
 -- Refresh outbound MoveTo before its native timeout; verify distance before carry.
@@ -3885,6 +3886,8 @@ connect(RunService.Heartbeat, function()
 	correctionSample = {Character=character, Time=now, Position=root.Position, WalkSpeed=humanoid.WalkSpeed}
 end)
 
+-- History decoding has its own register scope.
+(function()
 local historyOK, previousLog = executorTools.ReadLog()
 if historyOK and type(previousLog) == "string" then
 	for line in previousLog:gmatch("[^\r\n]+") do
@@ -3897,6 +3900,8 @@ if historyOK and type(previousLog) == "string" then
 		end
 	end
 end
+end)()
+
 log("SESSION", "Nouveau lancement %s", os.date("%Y-%m-%d %H:%M:%S"))
 loadSettings()
 if game.JobId~="" then visitedServers[game.JobId]=true end
