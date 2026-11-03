@@ -177,6 +177,8 @@ local function log(stage, message, ...)
 	table.insert(pendingLogLines, line)
 	if #debugLogLines > 1000 then table.remove(debugLogLines, 1) end
 	print(line)
+	local saved, failure = executorTools.SaveLog()
+	if not saved and executorFunction("writefile") then warn("[Auto_SAE] Sauvegarde log : "..tostring(failure)) end
 end
 
 local function measureAction(_, action, ...)
@@ -2730,13 +2732,9 @@ local function createInterface()
 	eggsTab.Name = "InventoryEggsTab"
 	eggsTab.Title.Text = "Eggs"
 	eggsTab.Parent = tabs
-	local serverTab = mapTab:Clone()
-	serverTab.Name = "ServerTab"
-	serverTab.Title.Text = "Serveur"
-	serverTab.Parent = tabs
-	mapTab.LayoutOrder, queueTab.LayoutOrder, eggsTab.LayoutOrder, serverTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3, 4, 5
+	mapTab.LayoutOrder, queueTab.LayoutOrder, eggsTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3, 4
 	tabs.Size = UDim2.new(tabs.Size.X.Scale * 0.5, tabs.Size.X.Offset * 0.5, tabs.Size.Y.Scale, tabs.Size.Y.Offset)
-	for _, tabButton in ipairs({mapTab, queueTab, eggsTab, serverTab, paramsTab}) do
+	for _, tabButton in ipairs({mapTab, queueTab, eggsTab, paramsTab}) do
 		tabButton.Size = UDim2.fromScale(1, 0)
 		local aspect = tabButton:FindFirstChildOfClass("UIAspectRatioConstraint")
 		if not aspect then aspect = Instance.new("UIAspectRatioConstraint", tabButton) end
@@ -3037,99 +3035,6 @@ local function createInterface()
 	paramsPanel.Size = scroll.Size
 	paramsPanel.Visible = false
 	paramsPanel.Parent = frame
-	local serverPanel = Instance.new("ScrollingFrame")
-	serverPanel.Name = "Servers"
-	serverPanel.Position, serverPanel.Size = scroll.Position, scroll.Size
-	serverPanel.BackgroundTransparency = 1
-	serverPanel.BorderSizePixel = 0
-	serverPanel.AutomaticCanvasSize = Enum.AutomaticSize.Y
-	serverPanel.CanvasSize = UDim2.new()
-	serverPanel.ScrollBarThickness = 6
-	serverPanel.Visible = false
-	serverPanel.Parent = frame
-	local serverLayout = Instance.new("UIListLayout", serverPanel)
-	serverLayout.SortOrder = Enum.SortOrder.LayoutOrder
-	serverLayout.Padding = UDim.new(0,8)
-	local servers, serverButtons = {}, {}
-	local selectedServer, scanning, joining
-	local lastScanAt = -math.huge
-	local teleportService = game:GetService("TeleportService")
-	local function serverButton(name, text, order, callback)
-		local button = autoButton:Clone()
-		button.Name = name
-		button.Size = UDim2.new(0.95,0,0,48)
-		button.LayoutOrder = order
-		button.Parent = serverPanel
-		caption(button, text)
-		connect(button.Activated, callback)
-		return button
-	end
-	local function serverCaption(server)
-		return (selectedServer == server.id and "> " or "") .. tostring(server.playing) .. "/" .. tostring(server.maxPlayers) .. " joueurs - " .. server.id:sub(1,8)
-	end
-	local function updateServerSelection()
-		for _, server in ipairs(servers) do
-			local button = serverButtons[server.id]
-			if button then caption(button,serverCaption(server)) end
-		end
-	end
-	local scanButton
-	scanButton = serverButton("ScanServers","Rechercher des serveurs",0,function()
-		if scanning or joining or serverHopPending then return end
-		if os.clock()-lastScanAt < 10 then setStatus("Patiente quelques secondes avant une nouvelle recherche."); return end
-		scanning, lastScanAt = true, os.clock()
-		caption(scanButton,"Recherche...")
-		task.spawn(function()
-			local ok,result = pcall(fetchPublicServers)
-			scanning = false
-			if destroyed then return end
-			caption(scanButton,"Rechercher des serveurs")
-			if not ok then
-				setStatus("Recherche impossible : " .. tostring(result))
-				log("SERVER_CHANGE","Recherche echouee : %s",tostring(result))
-				return
-			end
-			for _,button in pairs(serverButtons) do button:Destroy() end
-			serverButtons,servers,selectedServer = {},result,nil
-			for index,server in ipairs(servers) do
-				serverButtons[server.id] = serverButton("Server_"..server.id,serverCaption(server),index+10,function()
-					if joining then return end
-					selectedServer = server.id
-					updateServerSelection()
-					setStatus("Serveur selectionne : "..server.id:sub(1,8))
-				end)
-			end
-			setStatus(#servers>0 and (#servers.." serveur(s) disponibles. Selectionne puis Rejoindre.") or "Aucun autre serveur disponible.")
-		end)
-	end)
-	serverButton("JoinServer","Rejoindre le serveur selectionne",1,function()
-		if joining or scanning or serverHopPending then return end
-		if not selectedServer then setStatus("Selectionne un serveur dans la liste."); return end
-		if currentCycle or inventoryPlacementBusy or placementRequest or (inFlightRequest and not inFlightRequest.done) then
-			setStatus("Termine le vol ou le placement avant de changer de serveur.")
-			return
-		end
-		joining = true
-		stopAutomation("Changement de serveur")
-		executorTools.SaveSettings()
-		log("SERVER_CHANGE","Connexion demandee : %s",selectedServer)
-		executorTools.SaveLog()
-		setStatus("Connexion au serveur...")
-		local ok,reason = pcall(function()
-			teleportService:TeleportToPlaceInstance(game.PlaceId,selectedServer,player)
-		end)
-		if not ok then
-			joining = false
-			setStatus("Connexion impossible : "..tostring(reason))
-			log("SERVER_CHANGE","Connexion echouee : %s",tostring(reason))
-		end
-	end)
-	connect(teleportService.TeleportInitFailed,function(failedPlayer,result,message)
-		if failedPlayer ~= player or not joining then return end
-		joining = false
-		setStatus("Teleportation serveur echouee : "..tostring(message))
-		log("SERVER_CHANGE","Echec=%s Message=%s",tostring(result),tostring(message))
-	end)
 	local worldModeLabel = thresholdTitle:Clone()
 	worldModeLabel.Name = "DetectedWorldMode"
 	worldModeLabel.LayoutOrder = 0
@@ -3184,15 +3089,6 @@ local function createInterface()
 		return input
 	end
 	rateInput("OpenBelowRate", 52, "Ouvrir les oeufs prets sous ce revenu", openBelowRate, function(rate) openBelowRate = rate end)
-	local searchStateLabel = thresholdTitle:Clone()
-	searchStateLabel.Name, searchStateLabel.LayoutOrder = "ServerSearchState", 62
-	searchStateLabel.Size = UDim2.new(0.95,0,0,54)
-	searchStateLabel.TextWrapped = true
-	searchStateLabel.Parent = paramsPanel
-	paramButton("SaveLogs", 100, "Sauvegarder les logs", function()
-		local ok, message = executorTools.SaveLog()
-		setStatus((ok and "Logs : " or "Echec logs : ") .. tostring(message))
-	end)
 	thresholdTitle.Parent = paramsPanel
 	minimumInput.Parent = paramsPanel
 	autoButton.Size = UDim2.fromScale(0.65, 0.16)
@@ -3236,11 +3132,9 @@ local function createInterface()
 	local function switchTab(name)
 		activeTab = name
 		selectedEggs = name == "Queue" and queueSelection or (name == "Eggs" and inventorySelection or mapSelection)
-		scroll.Visible = name ~= "Params" and name ~= "Serveur"
-		serverPanel.Visible = name == "Serveur"
+		scroll.Visible = name ~= "Params"
 		paramsPanel.Visible = name == "Params"
-		sort.Visible = name ~= "Params" and name ~= "Serveur"
-		serverTab.Title.TextColor3 = name == "Serveur" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
+		sort.Visible = name ~= "Params"
 		eggsTab.Title.TextColor3 = name == "Eggs" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		paramsTab.Title.TextColor3 = name == "Params" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		mapTab.Title.TextColor3 = name == "Map" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
@@ -3253,7 +3147,6 @@ local function createInterface()
 	connect(queueTab.Activated, function() switchTab("Queue") end)
 	connect(paramsTab.Activated, function() switchTab("Params") end)
 	connect(eggsTab.Activated, function() switchTab("Eggs") end)
-	connect(serverTab.Activated, function() switchTab("Serveur") end)
 	switchTab("Map")
 	local cards = {}
 	local function countSelected()
@@ -3262,7 +3155,6 @@ local function createInterface()
 		return n
 	end
 	local function updateSelection()
-		searchStateLabel.Text = "Recherche serveur : " .. (automaticMode and (searchingServer and ("OUI - "..serverSearchState) or "NON - attente du premier vol reussi") or "OFF")
 		worldModeLabel.Text = "Mode : " .. detectedMode .. (detectedMode == "Halloween" and " (observation)" or "")
 		for _, name in ipairs({"Title", "Title2Stroke"}) do
 			local title = header:FindFirstChild(name)
@@ -3276,7 +3168,7 @@ local function createInterface()
 		thresholdTitle.Visible = true
 		minimumInput.Visible = true
 		toggleButton.Title.Text = activeTab == "Eggs" and (inventoryPlacementBusy and "Placement..." or "Placer") or (activeTab == "Queue" and "Remove" or "Add")
-		toggleButton.Visible = activeTab ~= "Params" and activeTab ~= "Serveur"
+		toggleButton.Visible = activeTab ~= "Params"
 		missingButton.Visible = activeTab == "Map"
 		pauseButton.Visible = activeTab ~= "Eggs" and not queuePaused
 		pausedButton.Visible = activeTab ~= "Eggs" and queuePaused
@@ -3290,7 +3182,6 @@ local function createInterface()
 		end
 	end
 	refreshEggInterface = function()
-		if activeTab == "Serveur" then updateSelection(); return end
 		if destroyed or not ready then updateSelection(); return end
 		local available = {}
 		if activeTab == "Eggs" then
@@ -3427,7 +3318,7 @@ local function createInterface()
 		setStatus(tostring(count) .. " oeuf(s) d'animaux manquants selectionne(s). Clique Add.")
 	end)
 	connect(toggleButton.Activated, function()
-		if activeTab == "Params" or activeTab == "Serveur" then return end
+		if activeTab == "Params" then return end
 		refreshEggInterface()
 		if activeTab == "Eggs" then
 			if inventoryPlacementBusy or placementRequest then setStatus("Placement deja en cours"); return end
