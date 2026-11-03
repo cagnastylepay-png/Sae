@@ -2407,7 +2407,13 @@ local function serviceWallMaintenance(token)
 		setStatus("Mur ferme : Equip Best...")
 		local ok, accepted, reason = pcall(function() return HaulRemotes.WearBest:InvokeServer() end)
 		log("WALL_EQUIP_BEST", "Accepte=%s Raison=%s", tostring(ok and accepted == true), tostring(ok and reason or accepted))
-		if ok and accepted==true then FusionModules.Run(token) end
+		if ok and accepted==true and FusionModules.Ready then
+            local fusionOK=FusionModules.Protect("FUSION_ACTION",FusionModules.Run,token)
+            if not fusionOK then
+                if FusionModules.Pending() then stopAutomation("Fusion interrompue : verification requise dans le log")
+                else FusionModules.Ready=false end
+            end
+        end
 	end
 end
 
@@ -2461,6 +2467,40 @@ function FusionModules.Butterflies.Idle(token)
  autoActivity="IDLE"
  activityRecheckPending=true
  return true
+end
+
+
+-- Recent optional features fail independently and retain their traceback in the log.
+function FusionModules.Protect(label,callback,...)
+ local args=table.pack(...)
+ local result=table.pack(xpcall(function()
+  assert(type(callback)=="function",label.." : fonction indisponible")
+  return callback(table.unpack(args,1,args.n))
+ end,function(err) return debug.traceback(tostring(err),2) end))
+ if not result[1] then
+  log("ERROR","%s : %s",label,tostring(result[2]))
+  warn("[Auto_SAE]["..label.."] "..tostring(result[2]))
+ end
+ return table.unpack(result,1,result.n)
+end
+
+do
+ local available=FusionModules.Butterflies.Available
+ FusionModules.Butterflies.Available=function()
+  local ok,bounds,tool=FusionModules.Protect("BUTTERFLY_DETECTION",available)
+  if ok then return bounds,tool end
+  FusionModules.Butterflies.RetryAt=os.clock()+10
+  return false
+ end
+ local idle=FusionModules.Butterflies.Idle
+ FusionModules.Butterflies.Idle=function(token)
+  local ok,result=FusionModules.Protect("BUTTERFLY_ACTION",idle,token)
+  if ok then return result end
+  FusionModules.Butterflies.RetryAt=os.clock()+10
+  pcall(stopMovement,true)
+  autoActivity="IDLE"
+  return false
+ end
 end
 
 local function idleOnTreadmill(token)
@@ -2739,32 +2779,42 @@ local function initialize()
 
  -- Subscribe before fetching so a late snapshot cannot overwrite a newer event.
  do
+  FusionModules.Protect("BUTTERFLY_INIT",function()
   local b=FusionModules.Butterflies
+  assert(type(remotes.LiveEvents)=="table","LiveEvents indisponible")
   connect(remotes.LiveEvents.Began.OnClientEvent,function(name,duration)
+   FusionModules.Protect("BUTTERFLY_BEGAN",function()
    if name=="ButterflyBloom" and type(duration)=="number" then
     b.Revision+=1; b.Until=Workspace:GetServerTimeNow()+math.max(0,duration)
    end
+   end)
   end)
   connect(remotes.LiveEvents.Ended.OnClientEvent,function(name)
-   if name=="ButterflyBloom" then b.Revision+=1; b.Until=0 end
+   FusionModules.Protect("BUTTERFLY_ENDED",function()
+    if name=="ButterflyBloom" then b.Revision+=1; b.Until=0 end
+   end)
   end)
   local revision=b.Revision
   task.spawn(function()
-   local ok,running=pcall(function() return remotes.LiveEvents.FetchRunning:InvokeServer() end)
+   local ok,running=FusionModules.Protect("BUTTERFLY_FETCH",function() return remotes.LiveEvents.FetchRunning:InvokeServer() end)
    if not destroyed and ok and type(running)=="table" and b.Revision==revision then
     local expiry=running.ButterflyBloom
     if type(expiry)=="number" then b.Until=expiry end
    end
   end)
+  end)
  end
 
 	TreadmillRemotes = remotes.Treadmill
 	HaulRemotes = remotes.Haul
+	FusionModules.Ready=FusionModules.Protect("FUSION_INIT",function()
 	FusionModules.Remotes = remotes.Fusery
 	FusionModules.Kernel = loadModule("Shared.Util.FuseKernel")
 	FusionModules.Items = loadModule("Shared.Util.AssetItems")
 	FusionModules.Signals = loadModule("Client.FuseMachineSignals")
 	FusionModules.Types = loadModule("Shared.Types.FuseMachine")
+        assert(type(FusionModules.Remotes)=="table","Fusery indisponible")
+    end)
 	EggSaleRemote = remotes.PetSatchel.SellSelection
 	GameplayBalance = loadModule("Shared.Flags.GameplayBalance")
 	-- Optional event support must not prevent the egg interface from starting.
