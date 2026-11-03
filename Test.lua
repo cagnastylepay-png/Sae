@@ -56,13 +56,12 @@ local autoIncludeMissingIndex = true
 local autoOpenEgg = true
 local autoEquipBest = true
 local autoKeepBest100 = true
+local immobilizeGuards = false
 local inventoryEggRecords
 local inventorySaleBusy = false
 local timingEnabled = false
 local flightHistory = {}
 local refreshFlightLog
-local manualSession
-local toggleManualRecording, manualCarryChanged
 local stopAfterFlight = false
 local queuedEggs = {}
 local removedFromAuto = {}
@@ -155,7 +154,7 @@ end
 shared.__AutoSAEExecutorTools = executorTools
 
 local function log(stage, message, ...)
-	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, WALL_INVENTORY_SELL=true, INVENTORY_SELL_REQUEST=true, SYNC_DIAG=true, CARRY_DIAG=true}
+	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, WALL_INVENTORY_SELL=true, INVENTORY_SELL_REQUEST=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
 	if not allowed[stage] then
 		return
 	end
@@ -184,6 +183,7 @@ function executorTools.SaveSettings()
 		IncludeMissingIndex = autoIncludeMissingIndex,
 		AutoOpenEgg = autoOpenEgg, AutoEquipBest = autoEquipBest,
 		AutoKeepBest100 = autoKeepBest100,
+		ImmobilizeGuards = immobilizeGuards,
 		TimingEnabled = timingEnabled,
 		MinimumBillions = minimumRatePerSecond / 1e9,
 	})
@@ -209,6 +209,7 @@ local function loadSettings()
 	if type(settings.AutoEquipBest) == "boolean" then autoEquipBest = settings.AutoEquipBest end
 	-- Detailed telemetry disabled.
 	if type(settings.AutoKeepBest100) == "boolean" then autoKeepBest100 = settings.AutoKeepBest100 end
+	if type(settings.ImmobilizeGuards) == "boolean" then immobilizeGuards = settings.ImmobilizeGuards end
 	local minimum = settings.MinimumBillions
 	if type(minimum) == "number" and minimum == minimum and minimum >= MINIMUM_BILLIONS and minimum <= MAXIMUM_BILLIONS then
 		minimumRatePerSecond = minimum * 1e9
@@ -1976,7 +1977,6 @@ local function worker(token)
 end
 
 startAutomation = function(billions)
-	if manualSession then setStatus("Arrete le test manuel avant de relancer AUTO."); return false end
 	if detectedMode ~= "Normal" then setStatus("Mode Halloween : observation uniquement."); return false end
 	if destroyed or not ready then
 		setStatus("Les modules du jeu sont indisponibles", Color3.fromRGB(255, 130, 110))
@@ -2019,7 +2019,6 @@ startAutomation = function(billions)
 end
 
 wakeQueue = function()
-	if manualSession then return end
 	if detectedMode ~= "Normal" or destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
 	if inFlightRequest and not inFlightRequest.done then return end
 	startAutomation(minimumRatePerSecond / 1e9)
@@ -2122,7 +2121,6 @@ local function initialize()
 		log("FIELD_GONE", "UID=%s | ne prouve pas la possession", tostring(uid))
 	end)
 	connect(EggState.CarryChanged, function(state)
-		manualCarryChanged(state)
 		local ctx = currentCycle
 		log("CARRY_CHANGED", "Carrying=%s UID=%s Area=%s SpeedMultiplier=%s",
 			tostring(state.IsCarrying), tostring(state.Uid), tostring(state.AreaId), tostring(state.SpeedMultiplier))
@@ -2134,7 +2132,6 @@ local function initialize()
 		end
 	end)
 	connect(EggState.FieldClaimed, function(payload)
-		if manualSession and manualSession.sawCarry and payload.AssetCategory == manualSession.record.AssetCategory then manualSession.claimFeedback = true end
 		local ctx = currentCycle
 		log("FIELD_CLAIMED", "Animal=%s Rarity=%s Pos=%s | payload sans UID",
 			tostring(payload.AssetCategory), tostring(payload.Rarity), formatPosition(payload.Position))
@@ -2159,92 +2156,6 @@ local function initialize()
 	log("READY", "Build=2.4 | MoveTo renouvele / freinage horizontal / distance 3D <= 8 / %d essais en serie / retour / inventaire / reprise meme UID", CONFIG.MaxCarryAttempts)
 end
 
-toggleManualRecording = function()
-	if manualSession then
-		if manualSession.uid then recordFlightResult(manualSession, manualSession.claimed == true) end
-		log("MANUAL_END", "DureeMs=%.1f | enregistrement termine, collecte reste en pause", (os.clock() - manualSession.startedAt) * 1000)
-		manualSession = nil
-		executorTools.SaveLog()
-		setStatus("Test manuel termine : logs sauvegardes, collecte en pause.")
-		return false, "Enregistrer un vol manuel"
-	end
-	if not ready then setStatus("Attends le chargement du script."); return false, "Enregistrer un vol manuel" end
-	if currentCycle or (inFlightRequest and not inFlightRequest.done) then
-		setStatus("Termine le vol actif avant de lancer le test manuel.")
-		return false, "Enregistrer un vol manuel"
-	end
-	stopAutomation("Enregistrement manuel : collecte en pause")
-	autoActivity = "IDLE"
-	local _, humanoid, root = getCharacterParts()
-	if not humanoid or not root then return false, "Enregistrer un vol manuel" end
-	local now = os.clock()
-	manualSession = {
-		startedAt = now, phaseStartedAt = now, phase = "MANUAL_READY",
-		ownerBefore = ownerSnapshot(), record = {}, character = player.Character,
-		lastPosition = root.Position, lastSampleAt = now, lastSafe = isSafe(root.Position),
-	}
-	log("MANUAL_BEGIN", "Mode=MANUAL WalkSpeed=%.2f Pos=%s | commandes manette laissees au joueur ; aucune requete de prise envoyee par le test", humanoid.WalkSpeed, formatPosition(root.Position))
-	setStatus("Test manuel ON : joue a la manette, puis arrete l'enregistrement.")
-	return true, "Arreter le test manuel"
-end
-
-manualCarryChanged = function(state)
-	local session = manualSession
-	if not session then return end
-	local now = os.clock()
-	log("MANUAL_CARRY", "Carrying=%s UID=%s DepuisDebutMs=%.1f", tostring(state.IsCarrying), tostring(state.Uid), (now - session.startedAt) * 1000)
-	if state.IsCarrying and state.Uid then
-		session.uid = state.Uid
-		session.record = readField(state.Uid) or {AssetCategory = state.AssetCategory}
-		session.sawCarry, session.claimed, session.claimFeedback = true, false, false
-		session.pickupAt = now
-		setPhase(session, "RETURN", "Test manuel : oeuf porte, retour observe")
-	else
-		session.releasedAt = now
-		setPhase(session, "CONFIRM_CLAIM", "Test manuel : transport termine, attribution a verifier")
-	end
-end
-
-local nextManualSample = 0
-connect(RunService.Heartbeat, function()
-	local session = manualSession
-	if not session or not ready or destroyed or os.clock() < nextManualSample then return end
-	local now = os.clock()
-	nextManualSample = now + 0.5
-	local character, humanoid, root = getCharacterParts()
-	if not root or not humanoid or character ~= session.character then
-		log("MANUAL_INTERRUPTED", "Personnage change ou absent")
-		toggleManualRecording()
-		return
-	end
-	local safe = isSafe(root.Position)
-	if safe ~= session.lastSafe then
-		session.lastSafe = safe
-		log("MANUAL_SAFE_CHANGED", "Safe=%s DepuisDebutMs=%.1f DepuisPriseMs=%s", tostring(safe), (now - session.startedAt)*1000, session.pickupAt and tostring((now-session.pickupAt)*1000) or "sans prise")
-		if safe ~= true and not session.sawCarry then setPhase(session, "APPROACH", "Test manuel : sortie de zone sure") end
-	end
-	local measured = distanceXZ(root.Position, session.lastPosition) / math.max(now - session.lastSampleAt, 0.001)
-	local velocity = root.AssemblyLinearVelocity
-	local moving = Vector2.new(velocity.X, velocity.Z).Magnitude > 1
-	if moving ~= session.moving then
-		log("MANUAL_MOVEMENT", "Action=%s DepuisDebutMs=%.1f WalkSpeed=%.2f", moving and "MARCHE" or "ARRET", (now-session.startedAt)*1000, humanoid.WalkSpeed)
-		session.moving = moving
-	end
-	log("TIMING_SPEED", "Mode=MANUAL Phase=%s WalkSpeed=%.2f PhysiqueXZ=%.2f DeplacementXZ=%.2f Pos=%s Safe=%s Input=%s",
-		session.phase, humanoid.WalkSpeed, Vector2.new(velocity.X,velocity.Z).Magnitude, measured,
-		formatPosition(root.Position), tostring(safe), tostring(UserInputService:GetLastInputType()))
-	session.lastPosition, session.lastSampleAt = root.Position, now
-	if session.uid and not session.claimed then
-		local confirmed, source = claimEvidence(session)
-		if confirmed then
-			session.claimed = true
-			recordFlightResult(session, true)
-			log("MANUAL_CLAIM_CONFIRMED", "UID=%s Source=%s DepuisDebutMs=%.1f DepuisPriseMs=%s", session.uid, tostring(source), (now-session.startedAt)*1000, session.pickupAt and tostring((now-session.pickupAt)*1000) or "?")
-			setPhase(session, "CLAIM_CONFIRMED", "Test manuel : attribution confirmee")
-		end
-	end
-end)
-
 inventoryEggRecords = function()
 	local result = {}
 	local ok, profile = pcall(Save.Peek)
@@ -2261,6 +2172,81 @@ inventoryEggRecords = function()
 	end
 	return result
 end
+
+local function filterPublicServers(data, currentJobId)
+	local result, seen = {}, {}
+	for _, server in ipairs(type(data) == "table" and data or {}) do
+		if type(server) == "table" and type(server.id) == "string" and server.id ~= currentJobId and not seen[server.id]
+			and type(server.playing) == "number" and type(server.maxPlayers) == "number"
+			and server.playing >= 0 and server.playing < server.maxPlayers then
+			seen[server.id] = true
+			table.insert(result, server)
+		end
+	end
+	table.sort(result, function(a,b)
+		if a.playing ~= b.playing then return a.playing < b.playing end
+		return a.id < b.id
+	end)
+	return result
+end
+
+local function fetchPublicServers()
+	local all, cursor = {}, nil
+	for page = 1, 3 do
+		if destroyed then return {} end
+		local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId) .. "/servers/Public?sortOrder=Asc&limit=100"
+		if cursor then url ..= "&cursor=" .. HttpService:UrlEncode(cursor) end
+		local request = executorFunction("request") or executorFunction("http_request")
+		local body
+		if request then
+			local response = request({Url=url, Method="GET"})
+			if type(response) ~= "table" or tonumber(response.StatusCode) ~= 200 then
+				error("Recherche serveurs refusee : HTTP " .. tostring(type(response)=="table" and response.StatusCode or "?"))
+			end
+			body = response.Body
+		else
+			body = game:HttpGet(url)
+		end
+		local decoded = HttpService:JSONDecode(body)
+		if type(decoded) ~= "table" or type(decoded.data) ~= "table" then error("Reponse serveurs invalide") end
+		for _, server in ipairs(decoded.data) do table.insert(all, server) end
+		cursor = type(decoded.nextPageCursor) == "string" and decoded.nextPageCursor or nil
+		if not cursor or cursor == "" then break end
+		task.wait(0.2)
+	end
+	return filterPublicServers(all, game.JobId)
+end
+
+local guardControlElapsed, previousGuardCount = 0, -1
+connect(RunService.Heartbeat, function(delta)
+	guardControlElapsed += delta
+	if destroyed or not ready or not immobilizeGuards or guardControlElapsed < 0.2 then return end
+	guardControlElapsed = 0
+	local _, _, playerRoot = getCharacterParts()
+	if not playerRoot then return end
+	local world = Workspace:FindFirstChild("World")
+	local areas = world and world:FindFirstChild("Areas")
+	local folder = areas and areas:FindFirstChild("GuardAreas")
+	local count = 0
+	for _, model in ipairs(folder and folder:GetChildren() or {}) do
+		local guard = model:FindFirstChild("Guard")
+		local humanoid = guard and guard:FindFirstChildWhichIsA("Humanoid")
+		local root = guard and (guard:FindFirstChild("HumanoidRootPart") or guard.PrimaryPart)
+		if humanoid and root and root:IsA("BasePart") and distanceXZ(playerRoot.Position,root.Position) <= 200 then
+			local ok = pcall(function()
+				local velocity = root.AssemblyLinearVelocity
+				root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+				humanoid:Move(Vector3.zero)
+				humanoid:MoveTo(root.Position)
+			end)
+			if ok then count += 1 end
+		end
+	end
+	if count ~= previousGuardCount then
+		previousGuardCount = count
+		log("GUARD_CONTROL", "Immobilisation locale demandee pour %d gardien(s) proche(s), effet serveur non confirme", count)
+	end
+end)
 
 local function createInterface()
 	local playerGui = player:WaitForChild("PlayerGui")
@@ -2305,9 +2291,13 @@ local function createInterface()
 	logTab.Name = "LogTab"
 	logTab.Title.Text = "Log"
 	logTab.Parent = tabs
-	mapTab.LayoutOrder, queueTab.LayoutOrder, eggsTab.LayoutOrder, logTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3, 4, 5
-	tabs.Size = UDim2.new(tabs.Size.X.Scale * 0.6, tabs.Size.X.Offset * 0.6, tabs.Size.Y.Scale, tabs.Size.Y.Offset)
-	for _, tabButton in ipairs({mapTab, queueTab, eggsTab, logTab, paramsTab}) do
+	local serverTab = mapTab:Clone()
+	serverTab.Name = "ServerTab"
+	serverTab.Title.Text = "Serveur"
+	serverTab.Parent = tabs
+	mapTab.LayoutOrder, queueTab.LayoutOrder, eggsTab.LayoutOrder, logTab.LayoutOrder, serverTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3, 4, 5, 6
+	tabs.Size = UDim2.new(tabs.Size.X.Scale * 0.5, tabs.Size.X.Offset * 0.5, tabs.Size.Y.Scale, tabs.Size.Y.Offset)
+	for _, tabButton in ipairs({mapTab, queueTab, eggsTab, logTab, serverTab, paramsTab}) do
 		tabButton.Size = UDim2.fromScale(1, 0)
 		local aspect = tabButton:FindFirstChildOfClass("UIAspectRatioConstraint")
 		if not aspect then aspect = Instance.new("UIAspectRatioConstraint", tabButton) end
@@ -2645,6 +2635,100 @@ local function createInterface()
 		end
 	end
 	refreshFlightLog()
+
+	local serverPanel = Instance.new("ScrollingFrame")
+	serverPanel.Name = "Servers"
+	serverPanel.Position, serverPanel.Size = scroll.Position, scroll.Size
+	serverPanel.BackgroundTransparency = 1
+	serverPanel.BorderSizePixel = 0
+	serverPanel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	serverPanel.CanvasSize = UDim2.new()
+	serverPanel.ScrollBarThickness = 6
+	serverPanel.Visible = false
+	serverPanel.Parent = frame
+	local serverLayout = Instance.new("UIListLayout", serverPanel)
+	serverLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	serverLayout.Padding = UDim.new(0,8)
+	local servers, serverButtons = {}, {}
+	local selectedServer, scanning, joining
+	local lastScanAt = -math.huge
+	local teleportService = game:GetService("TeleportService")
+	local function serverButton(name, text, order, callback)
+		local button = autoButton:Clone()
+		button.Name = name
+		button.Size = UDim2.new(0.95,0,0,48)
+		button.LayoutOrder = order
+		button.Parent = serverPanel
+		caption(button, text)
+		connect(button.Activated, callback)
+		return button
+	end
+	local function serverCaption(server)
+		return (selectedServer == server.id and "> " or "") .. tostring(server.playing) .. "/" .. tostring(server.maxPlayers) .. " joueurs - " .. server.id:sub(1,8)
+	end
+	local function updateServerSelection()
+		for _, server in ipairs(servers) do
+			local button = serverButtons[server.id]
+			if button then caption(button,serverCaption(server)) end
+		end
+	end
+	local scanButton
+	scanButton = serverButton("ScanServers","Rechercher des serveurs",0,function()
+		if scanning or joining then return end
+		if os.clock()-lastScanAt < 10 then setStatus("Patiente quelques secondes avant une nouvelle recherche."); return end
+		scanning, lastScanAt = true, os.clock()
+		caption(scanButton,"Recherche...")
+		task.spawn(function()
+			local ok,result = pcall(fetchPublicServers)
+			scanning = false
+			if destroyed then return end
+			caption(scanButton,"Rechercher des serveurs")
+			if not ok then
+				setStatus("Recherche impossible : " .. tostring(result))
+				log("SERVER_CHANGE","Recherche echouee : %s",tostring(result))
+				return
+			end
+			for _,button in pairs(serverButtons) do button:Destroy() end
+			serverButtons,servers,selectedServer = {},result,nil
+			for index,server in ipairs(servers) do
+				serverButtons[server.id] = serverButton("Server_"..server.id,serverCaption(server),index+10,function()
+					if joining then return end
+					selectedServer = server.id
+					updateServerSelection()
+					setStatus("Serveur selectionne : "..server.id:sub(1,8))
+				end)
+			end
+			setStatus(#servers>0 and (#servers.." serveur(s) disponibles. Selectionne puis Rejoindre.") or "Aucun autre serveur disponible.")
+		end)
+	end)
+	serverButton("JoinServer","Rejoindre le serveur selectionne",1,function()
+		if joining or scanning then return end
+		if not selectedServer then setStatus("Selectionne un serveur dans la liste."); return end
+		if currentCycle or (inFlightRequest and not inFlightRequest.done) then
+			setStatus("Termine le vol en cours avant de changer de serveur.")
+			return
+		end
+		joining = true
+		stopAutomation("Changement de serveur")
+		executorTools.SaveSettings()
+		log("SERVER_CHANGE","Connexion demandee : %s",selectedServer)
+		executorTools.SaveLog()
+		setStatus("Connexion au serveur...")
+		local ok,reason = pcall(function()
+			teleportService:TeleportToPlaceInstance(game.PlaceId,selectedServer,player)
+		end)
+		if not ok then
+			joining = false
+			setStatus("Connexion impossible : "..tostring(reason))
+			log("SERVER_CHANGE","Connexion echouee : %s",tostring(reason))
+		end
+	end)
+	connect(teleportService.TeleportInitFailed,function(failedPlayer,result,message)
+		if failedPlayer ~= player or not joining then return end
+		joining = false
+		setStatus("Teleportation serveur echouee : "..tostring(message))
+		log("SERVER_CHANGE","Echec=%s Message=%s",tostring(result),tostring(message))
+	end)
 	local worldModeLabel = thresholdTitle:Clone()
 	worldModeLabel.Name = "DetectedWorldMode"
 	worldModeLabel.LayoutOrder = 0
@@ -2696,10 +2780,13 @@ local function createInterface()
 		log("PARAM_CHANGED", "AutoKeepBest100=%s", tostring(autoKeepBest100))
 		executorTools.SaveSettings()
 	end)
-	local manualButton
-	manualButton = paramButton("RecordManual", 80, "Enregistrer un vol manuel", function()
-		local _, title = toggleManualRecording()
-		caption(manualButton, title)
+	local guardButton
+	guardButton = paramButton("ImmobilizeGuards", 70, immobilizeGuards and "Gardiens (local) : ON" or "Gardiens (local) : OFF", function()
+		immobilizeGuards = not immobilizeGuards
+		previousGuardCount = -1
+		caption(guardButton, immobilizeGuards and "Gardiens (local) : ON" or "Gardiens (local) : OFF")
+		log("GUARD_CONTROL", "Option locale=%s", tostring(immobilizeGuards))
+		executorTools.SaveSettings()
 	end)
 	paramButton("SaveLogs", 100, "Sauvegarder les logs", function()
 		local ok, message = executorTools.SaveLog()
@@ -2749,11 +2836,13 @@ local function createInterface()
 		activeTab = name
 		selectedEggs = name == "Queue" and queueSelection or (name == "Eggs" and inventorySelection or mapSelection)
 		saleConfirmation = nil
-		scroll.Visible = name ~= "Params" and name ~= "Log"
+		scroll.Visible = name ~= "Params" and name ~= "Log" and name ~= "Serveur"
+		serverPanel.Visible = name == "Serveur"
 		logPanel.Visible = name == "Log"
 		if name == "Log" and refreshFlightLog then refreshFlightLog() end
 		paramsPanel.Visible = name == "Params"
-		sort.Visible = name ~= "Params" and name ~= "Log"
+		sort.Visible = name ~= "Params" and name ~= "Log" and name ~= "Serveur"
+		serverTab.Title.TextColor3 = name == "Serveur" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		logTab.Title.TextColor3 = name == "Log" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		eggsTab.Title.TextColor3 = name == "Eggs" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		paramsTab.Title.TextColor3 = name == "Params" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
@@ -2768,6 +2857,7 @@ local function createInterface()
 	connect(paramsTab.Activated, function() switchTab("Params") end)
 	connect(eggsTab.Activated, function() switchTab("Eggs") end)
 	connect(logTab.Activated, function() switchTab("Log") end)
+	connect(serverTab.Activated, function() switchTab("Serveur") end)
 	switchTab("Map")
 	local cards = {}
 	local function countSelected()
@@ -2788,12 +2878,8 @@ local function createInterface()
 		minimumInput.TextEditable = true
 		thresholdTitle.Visible = true
 		minimumInput.Visible = true
-		sort.Clear.Active = true
-		sort.SelectAll.Active = true
 		toggleButton.Title.Text = activeTab == "Eggs" and (salePending and "Vente..." or (saleConfirmation and "Confirmer vente" or "Vendre")) or (activeTab == "Queue" and "Remove" or "Add")
-		toggleButton.Visible = activeTab ~= "Params" and activeTab ~= "Log"
-		sort.SelectAll.Visible = activeTab ~= "Params"
-		sort.Clear.Visible = activeTab ~= "Params"
+		toggleButton.Visible = activeTab ~= "Params" and activeTab ~= "Log" and activeTab ~= "Serveur"
 		missingButton.Visible = activeTab == "Map"
 		pauseButton.Visible = activeTab ~= "Eggs" and not queuePaused
 		pausedButton.Visible = activeTab ~= "Eggs" and queuePaused
@@ -2807,6 +2893,7 @@ local function createInterface()
 		end
 	end
 	refreshEggInterface = function()
+		if activeTab == "Serveur" then updateSelection(); return end
 		if activeTab == "Log" then if refreshFlightLog then refreshFlightLog() end; updateSelection(); return end
 		if destroyed or not ready then updateSelection(); return end
 		local available = {}
@@ -2926,22 +3013,8 @@ local function createInterface()
 		updateSelection()
 		setStatus(tostring(count) .. " oeuf(s) d'animaux manquants selectionne(s). Clique Add.")
 	end)
-	connect(sort.Clear.Activated, function()
-		if salePending then return end
-		saleConfirmation = nil
-		table.clear(selectedEggs)
-		updateSelection()
-	end)
-	connect(sort.SelectAll.Activated, function()
-		if salePending then return end
-		saleConfirmation = nil
-		for uid in pairs(cards) do
-			if activeTab ~= "Eggs" or (inventoryRecords[uid] and not inventoryRecords[uid].InventoryPlaced) then selectedEggs[uid] = true end
-		end
-		updateSelection()
-	end)
 	connect(toggleButton.Activated, function()
-		if activeTab == "Params" or activeTab == "Log" then return end
+		if activeTab == "Params" or activeTab == "Log" or activeTab == "Serveur" then return end
 		refreshEggInterface()
 		if activeTab == "Eggs" then
 			if salePending or inventorySaleBusy then return end
@@ -3032,6 +3105,8 @@ local function createInterface()
 			end
 		end
 	end)
+	sort.SelectAll:Destroy()
+	sort.Clear:Destroy()
 	show(true)
 	log("UI_READY", "Interface autonome creee avec carte meilleur oeuf deplacable.")
 	return gui
@@ -3062,7 +3137,7 @@ end)
 local correctionSample
 local lastCorrectionNotice = -math.huge
 connect(RunService.Heartbeat, function()
-	if destroyed or not ready or not autoEnabled or manualSession then correctionSample = nil; return end
+	if destroyed or not ready or not autoEnabled then correctionSample = nil; return end
 	local character, humanoid, root = getCharacterParts()
 	if not root or not humanoid then correctionSample = nil; return end
 	local now = os.clock()
