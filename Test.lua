@@ -55,7 +55,6 @@ local automaticMode = true
 local autoIncludeMissingIndex = true
 local openBelowRate = 20e9
 local sellBelowRate = 2e9
-local serverSearchEnabled = false
 local searchingServer = false
 local searchWaitForEgg = false
 local AreaEggCycle, ServerClock
@@ -65,7 +64,6 @@ local serverSearchReadyAt = math.huge
 local nextServerHopAt = 0
 local requestRandomServerHop
 local lastMaintenanceAt = -math.huge
-local immobilizeGuards = false
 local inventoryEggRecords
 local inventorySaleBusy = false
 local timingEnabled = false
@@ -191,8 +189,7 @@ function executorTools.SaveSettings()
 		Version = 1, AutomaticMode = automaticMode,
 		IncludeMissingIndex = autoIncludeMissingIndex,
 		OpenBelowRate = openBelowRate, SellBelowRate = sellBelowRate,
-		ServerSearchEnabled = serverSearchEnabled, SearchActive = searchingServer and serverSearchEnabled,
-		ImmobilizeGuards = immobilizeGuards,
+		SearchActive = searchingServer and automaticMode,
 		TimingEnabled = timingEnabled,
 		MinimumBillions = minimumRatePerSecond / 1e9,
 	})
@@ -220,11 +217,9 @@ local function loadSettings()
 			if key == "OpenBelowRate" then openBelowRate = value else sellBelowRate = value end
 		end
 	end
-	if type(settings.ServerSearchEnabled) == "boolean" then serverSearchEnabled = settings.ServerSearchEnabled end
-	searchingServer = serverSearchEnabled and settings.SearchActive == true
+	searchingServer = automaticMode and settings.SearchActive == true
 	-- Detailed telemetry disabled.
 
-	if type(settings.ImmobilizeGuards) == "boolean" then immobilizeGuards = settings.ImmobilizeGuards end
 	local minimum = settings.MinimumBillions
 	if type(minimum) == "number" and minimum == minimum and minimum >= MINIMUM_BILLIONS and minimum <= MAXIMUM_BILLIONS then
 		minimumRatePerSecond = minimum * 1e9
@@ -1871,7 +1866,7 @@ local function idleOnTreadmill(token)
 	if destroyed or not autoEnabled or generation ~= token then return true end
 	setStatus("TREADMILL : entrainement, attente d'un oeuf...")
 	while autoEnabled and generation == token and automaticMode and not queuePaused
-		and next(queuedEggs) == nil and not (serverSearchEnabled and searchingServer and not searchWaitForEgg) and not activityRecheckPending and not destroyed do
+		and next(queuedEggs) == nil and not (automaticMode and searchingServer and not searchWaitForEgg) and not activityRecheckPending and not destroyed do
 		serviceWallMaintenance(token)
 		syncQueue()
 		task.wait(CONFIG.ScanInterval)
@@ -1936,7 +1931,7 @@ local function worker(token)
 		end
 		if selected then
 			searchWaitForEgg = false
-			serverSearchState = serverSearchEnabled and "Oeuf eligible : collecte" or "OFF"
+			serverSearchState = automaticMode and "Oeuf eligible : collecte" or "OFF"
 			local exited, exitReason = measureAction("SORTIE_TAPIS", leaveTreadmill, token)
 			if not exited then stopAutomation("Sortie tapis : " .. tostring(exitReason)); return end
 			if not autoEnabled or generation ~= token then return end
@@ -1963,7 +1958,7 @@ local function worker(token)
 				queuedEggs[selected.Uid] = nil
 				if refreshQueueInterface then refreshQueueInterface() end
 				if renderControls then renderControls() end
-				if serverSearchEnabled and automaticMode and not stopAfterFlight then
+				if automaticMode and not stopAfterFlight then
 					searchingServer = true
 					serviceWallMaintenance(token)
 					if requestRandomServerHop and requestRandomServerHop(token, "Oeuf attribue") then return end
@@ -1997,7 +1992,7 @@ local function worker(token)
 			end
 		else
 			directNext = false
-			if automaticMode and serverSearchEnabled and searchingServer then
+			if automaticMode and searchingServer then
 				if searchWaitForEgg then
 					serverSearchState = "Suspendue : attente d'un oeuf eligible"
 					local ok, reason = idleOnTreadmill(token)
@@ -2305,7 +2300,7 @@ end
 
 requestRandomServerHop = function(token, reason)
 	if serverHopPending then return true end
-	if not serverSearchEnabled or not automaticMode or not autoEnabled or generation ~= token
+	if not automaticMode or not autoEnabled or generation ~= token
 		or destroyed or currentCycle or inventorySaleBusy or hatchInProgress or stopAfterFlight or queuePaused
 		or os.clock() < nextServerHopAt then return false end
 	if holdSearchForReset() then return false end
@@ -2316,7 +2311,7 @@ requestRandomServerHop = function(token, reason)
 	setStatus(serverSearchState)
 	local ok, servers = pcall(fetchPublicServers)
 	-- An OFF click during HTTP must cancel this departure.
-	if destroyed or not serverSearchEnabled or not automaticMode or not autoEnabled
+	if destroyed or not automaticMode or not autoEnabled
 		or generation ~= token or queuePaused or stopAfterFlight then return false end
 	if not ok or #servers == 0 then
 		serverSearchState = "Recherche : nouvel essai dans 30 s"
@@ -2354,7 +2349,7 @@ requestRandomServerHop = function(token, reason)
 		serverSearchState = "Echec connexion : nouvel essai dans 30 s"
 		nextServerHopAt = os.clock()+30
 		log("SERVER_CHANGE", "%s", tostring(message))
-		if serverSearchEnabled and automaticMode and not queuePaused then wakeQueue() end
+		if automaticMode and not queuePaused then wakeQueue() end
 	end
 	local failureConnection
 	failureConnection = connect(game:GetService("TeleportService").TeleportInitFailed,function(failedPlayer, result, message)
@@ -2373,35 +2368,32 @@ requestRandomServerHop = function(token, reason)
 	return true
 end
 
-local guardControlElapsed, previousGuardCount = 0, -1
-connect(RunService.Heartbeat, function(delta)
-	guardControlElapsed += delta
-	if destroyed or not ready or not immobilizeGuards or guardControlElapsed < 0.2 then return end
-	guardControlElapsed = 0
-	local _, _, playerRoot = getCharacterParts()
-	if not playerRoot then return end
-	local world = Workspace:FindFirstChild("World")
-	local areas = world and world:FindFirstChild("Areas")
-	local folder = areas and areas:FindFirstChild("GuardAreas")
-	local count = 0
-	for _, model in ipairs(folder and folder:GetChildren() or {}) do
-		local guard = model:FindFirstChild("Guard")
-		local humanoid = guard and guard:FindFirstChildWhichIsA("Humanoid")
-		local root = guard and (guard:FindFirstChild("HumanoidRootPart") or guard.PrimaryPart)
-		if humanoid and root and root:IsA("BasePart") and distanceXZ(playerRoot.Position,root.Position) <= 200 then
-			local ok = pcall(function()
-				local velocity = root.AssemblyLinearVelocity
-				root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
-				humanoid:Move(Vector3.zero)
-				humanoid:MoveTo(root.Position)
-			end)
-			if ok then count += 1 end
+-- FOXIN reference logic: direct Workspace models, matching names, zero Velocity,
+-- MoveTo at the current root position, every 0.2 seconds. Always active.
+local function immobilizeReferenceGuards()
+	for _, model in ipairs(Workspace:GetChildren()) do
+		if model:IsA("Model") then
+			local nameL = model.Name:lower()
+			if string.find(nameL, "guard") or string.find(nameL, "boss")
+				or string.find(nameL, "jefe") or string.find(nameL, "enemy") then
+				local npcHumanoid = model:FindFirstChildOfClass("Humanoid")
+				local hrp = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+				if npcHumanoid and hrp then
+					hrp.Velocity = Vector3.zero
+					npcHumanoid:MoveTo(hrp.Position)
+				end
+			end
 		end
 	end
-	if count ~= previousGuardCount then
-		previousGuardCount = count
-		log("GUARD_CONTROL", "Immobilisation locale demandee pour %d gardien(s) proche(s), effet serveur non confirme", count)
-	end
+end
+local guardControlElapsed = 0
+connect(RunService.Heartbeat, function(delta)
+	if destroyed then return end
+	guardControlElapsed += delta
+	if guardControlElapsed < 0.2 then return end
+	guardControlElapsed = 0
+	local ok, reason = pcall(immobilizeReferenceGuards)
+	if not ok then log("GUARD_CONTROL", "Reference FOXIN : %s", tostring(reason)) end
 end)
 
 local function createInterface()
@@ -2896,33 +2888,13 @@ local function createInterface()
 		end)
 		return input
 	end
-	local equipInfo = paramButton("EquipBestMandatory", 50, "Equip Best : toujours actif", function() end)
-	equipInfo.Active = false
-	equipInfo.AutoButtonColor = false
 	rateInput("OpenBelowRate", 52, "Ouvrir les oeufs prets sous ce revenu", openBelowRate, function(rate) openBelowRate = rate end)
 	rateInput("SellBelowRate", 55, "Vendre les oeufs d'inventaire sous ce revenu", sellBelowRate, function(rate) sellBelowRate = rate end)
-	local serverSearchButton
-	serverSearchButton = paramButton("ServerSearch", 60, serverSearchEnabled and "Changement serveur : ON" or "Changement serveur : OFF", function()
-		serverSearchEnabled = not serverSearchEnabled
-		if not serverSearchEnabled then searchingServer = false; searchWaitForEgg = false end
-		caption(serverSearchButton, serverSearchEnabled and "Changement serveur : ON" or "Changement serveur : OFF")
-		executorTools.SaveSettings()
-		activityRecheckPending = true
-		if renderControls then renderControls() end
-	end)
 	local searchStateLabel = thresholdTitle:Clone()
 	searchStateLabel.Name, searchStateLabel.LayoutOrder = "ServerSearchState", 62
 	searchStateLabel.Size = UDim2.new(0.95,0,0,54)
 	searchStateLabel.TextWrapped = true
 	searchStateLabel.Parent = paramsPanel
-	local guardButton
-	guardButton = paramButton("ImmobilizeGuards", 70, immobilizeGuards and "Gardiens (local) : ON" or "Gardiens (local) : OFF", function()
-		immobilizeGuards = not immobilizeGuards
-		previousGuardCount = -1
-		caption(guardButton, immobilizeGuards and "Gardiens (local) : ON" or "Gardiens (local) : OFF")
-		log("GUARD_CONTROL", "Option locale=%s", tostring(immobilizeGuards))
-		executorTools.SaveSettings()
-	end)
 	paramButton("SaveLogs", 100, "Sauvegarder les logs", function()
 		local ok, message = executorTools.SaveLog()
 		setStatus((ok and "Logs : " or "Echec logs : ") .. tostring(message))
@@ -2996,7 +2968,7 @@ local function createInterface()
 		return n
 	end
 	local function updateSelection()
-		searchStateLabel.Text = "Recherche serveur : " .. (serverSearchEnabled and (searchingServer and ("OUI - "..serverSearchState) or "NON - attente du premier vol reussi") or "OFF")
+		searchStateLabel.Text = "Recherche serveur : " .. (automaticMode and (searchingServer and ("OUI - "..serverSearchState) or "NON - attente du premier vol reussi") or "OFF")
 		worldModeLabel.Text = "Mode : " .. detectedMode .. (detectedMode == "Halloween" and " (observation)" or "")
 		for _, name in ipairs({"Title", "Title2Stroke"}) do
 			local title = header:FindFirstChild(name)
@@ -3105,6 +3077,7 @@ local function createInterface()
 			safeHome = getStartAreaDestination()
 			setStatus("AUTO ON : MoveTo vers StartArea ou MoveTo vers le tapis selon la file.")
 		else
+			searchingServer, searchWaitForEgg = false, false
 			requestUserStop("AUTO OFF")
 		end
 		syncQueue()
