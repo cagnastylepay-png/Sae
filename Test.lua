@@ -43,6 +43,7 @@ local ready, destroyed, autoEnabled = false, false, false
 local generation = 0
 local minimumRatePerSecond = DEFAULT_BILLIONS * 1e9
 local records, loggedVersions, cooldowns = {}, {}, {}
+local trackedEggs = {}
 local lifetimeConnections = {}
 local currentCycle, safeHome
 local inFlightRequest = shared.__AutoSAERemoteLock
@@ -161,7 +162,7 @@ end
 shared.__AutoSAEExecutorTools = executorTools
 
 local function log(stage, message, ...)
-	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, PLOT_PLACE=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
+	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, PLOT_PLACE=true, EGG_TRACK=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
 	if not allowed[stage] then
 		return
 	end
@@ -363,11 +364,112 @@ local function ownsEgg(uid)
 	return false
 end
 
+
+local function isTrackedFieldState(record)
+	return record and (record.State == SLOT_STATE or record.State == "Dropped"
+		or record.State == "Carried" or record.State == "GuardCarried")
+end
+
+local function isHeldByOther(record)
+	return record and (record.State == "GuardCarried"
+		or (record.State == "Carried" and record.CarrierUserId ~= player.UserId))
+end
+
+local function findPhysicalEgg(uid)
+	local object=Workspace:FindFirstChild(uid)
+	if object and (object:IsA("Model") or object:IsA("BasePart")) then return object end
+	for _, other in ipairs(Players:GetPlayers()) do
+		local character=other.Character
+		local found=character and character:FindFirstChild(uid,true)
+		if found and (found:IsA("Model") or found:IsA("BasePart")) then return found end
+	end
+	return nil
+end
+
+local function physicalEggCarrier(object)
+	local carrier=object:GetAttribute("CarrierUserId")
+	if type(carrier)=="number" then return carrier,true end
+	for _,other in ipairs(Players:GetPlayers()) do
+		if other.Character and object:IsDescendantOf(other.Character) then return other.UserId,true end
+	end
+	for _,joint in ipairs(object:GetDescendants()) do
+		if joint:IsA("WeldConstraint") or joint:IsA("JointInstance") then
+			for _,part in pairs({joint.Part0,joint.Part1}) do
+				if part and not part:IsDescendantOf(object) and part~=object and part:IsDescendantOf(Workspace) then
+					for _,other in ipairs(Players:GetPlayers()) do
+						if other.Character and part:IsDescendantOf(other.Character) then return other.UserId,true end
+					end
+					return nil,true
+				end
+			end
+		end
+	end
+	return nil,false
+end
+
 local function readField(uid)
 	local ok, record = pcall(EggState.ReadFieldEgg, uid)
-	if ok then return record, true end
-	log("FIELD_READ_ERROR", "%s", tostring(record))
-	return nil, false
+	if not ok then log("FIELD_READ_ERROR","%s",tostring(record)); return nil,false end
+	local tracked=trackedEggs[uid]
+	if record then
+		if tracked then
+			tracked.Record=record
+			if record.CarrierUserId then tracked.LastCarrier=record.CarrierUserId end
+			tracked.MissingSince=nil
+		end
+		if queuedEggs[uid] then queuedEggs[uid].Record=record end
+		return record,true
+	end
+	if not tracked then return nil,true end
+	if tracked.Record.State=="Claimed" or ownsEgg(uid) then trackedEggs[uid]=nil; return nil,true end
+	if tracked.LastCarrier and os.clock()-(tracked.LastOwnerCheck or -math.huge)>=0.5 then
+		tracked.LastOwnerCheck=os.clock()
+		local ownedOK,owned=pcall(EggState.ReadOwnedEgg,tracked.LastCarrier,uid)
+		if ownedOK and owned then
+			log("EGG_TRACK","UID=%s Attribue au joueur=%s",uid,tostring(tracked.LastCarrier))
+			trackedEggs[uid]=nil
+			return nil,true
+		end
+	end
+	local object=findPhysicalEgg(uid)
+	if not object then
+		tracked.MissingSince=tracked.MissingSince or os.clock()
+		-- Briefly preserve a reparented/streamed object; absence is not a delivery verdict.
+		if os.clock()-tracked.MissingSince>10 then
+			log("EGG_TRACK","UID=%s Suivi termine : aucun objet ni etat observable depuis 10 s ; attribution inconnue",uid)
+			trackedEggs[uid]=nil
+			return nil,true
+		end
+		local waiting=table.clone(tracked.Record)
+		waiting.State,waiting.CarrierUserId,waiting.ObservationOnly="GuardCarried",nil,true
+		if queuedEggs[uid] then queuedEggs[uid].Record=waiting end
+		return waiting,true
+	end
+	tracked.MissingSince=nil
+	local position=object:IsA("Model") and object:GetPivot() or object.CFrame
+	local carrier,attached=physicalEggCarrier(object)
+	local observed=table.clone(tracked.Record)
+	observed.BottomCFrame,observed.ObservationOnly=position,true
+	if attached then
+		tracked.UnattachedSince=nil
+		observed.State=carrier and "Carried" or "GuardCarried"
+		observed.CarrierUserId=carrier
+		if carrier then tracked.LastCarrier=carrier end
+	else
+		tracked.UnattachedSince=tracked.UnattachedSince or os.clock()
+		-- Physical drop is provisional. CarryFieldEgg still validates the UID on the server.
+		observed.State=os.clock()-tracked.UnattachedSince>=0.3 and "Dropped" or "GuardCarried"
+		observed.CarrierUserId=nil
+	end
+	if os.clock()-(tracked.LastSync or -math.huge)>3 and not tracked.SyncBusy and type(EggState.SyncFieldEggs)=="function" then
+		tracked.LastSync,tracked.SyncBusy=os.clock(),true
+		task.spawn(function()
+			pcall(EggState.SyncFieldEggs)
+			tracked.SyncBusy=false
+		end)
+	end
+	if queuedEggs[uid] then queuedEggs[uid].Record=observed end
+	return observed,true
 end
 
 local function getSeparationLine()
@@ -901,6 +1003,54 @@ local function traceMoveEnd(ctx, root, destination, reached)
 	end
 end
 
+
+local function followTakenEgg(ctx)
+	local startedFollowing=false
+	while validCycle(ctx) do
+		if stopAfterFlight then stopMovement(true); return false,"arret du suivi demande" end
+		local record,ok=readField(ctx.uid)
+		if not ok or not record then stopMovement(true); return false,"TARGET_UNAVAILABLE" end
+		if record.State=="Claimed" then
+			trackedEggs[ctx.uid]=nil
+			stopMovement(true)
+			log("EGG_TRACK","UID=%s Etat serveur=Claimed : fin du suivi",ctx.uid)
+			return false,"TARGET_UNAVAILABLE"
+		end
+		ctx.record,ctx.eggPosition=record,getRecordPosition(record)
+		if not isHeldByOther(record) then
+			if startedFollowing then
+				stopMovement(true)
+				cooldowns[ctx.uid]=nil
+				log("EGG_TRACK","UID=%s Oeuf disponible a nouveau%s",ctx.uid,record.ObservationOnly and " (observation physique, serveur a confirmer)" or "")
+			end
+			return true
+		end
+		if not startedFollowing then
+			startedFollowing=true
+			setPhase(ctx,"FOLLOW","Suivi de "..getAnimalName(record).." porte par un autre joueur")
+			log("EGG_TRACK","UID=%s Debut suivi porteur=%s Observation=%s",ctx.uid,tostring(record.CarrierUserId),tostring(record.ObservationOnly==true))
+		end
+		if motionBlockReason(ctx) then
+			local resumed,why=waitForMotionReady(ctx)
+			if not resumed then return false,why end
+		else
+			local _,_,root=getCharacterParts()
+			local carrier=record.CarrierUserId and Players:GetPlayerByUserId(record.CarrierUserId)
+			local carrierRoot=carrier and carrier.Character and carrier.Character:FindFirstChild("HumanoidRootPart")
+			local position=carrierRoot and carrierRoot.Position or ctx.eggPosition
+			if root and position then
+				local delta=Vector3.new(root.Position.X-position.X,0,root.Position.Z-position.Z)
+				if delta.Magnitude>10 then
+					local target=position+delta.Unit*7
+					move(Vector3.new(target.X,root.Position.Y,target.Z),{Radius=2})
+				else stopMovement(true) end
+			else stopMovement() end
+		end
+		task.wait(0.1)
+	end
+	return false,"annule"
+end
+
 local function approachEgg(ctx, destination)
 	local _, humanoid, root = getCharacterParts()
 	if not humanoid or not root then return false, "personnage absent" end
@@ -950,7 +1100,7 @@ local function approachEgg(ctx, destination)
 				return
 			end
 			if latest.State ~= SLOT_STATE and latest.State ~= "Dropped" then
-				complete(false, "oeuf non disponible pendant l'approche")
+				complete(false, isHeldByOther(latest) and "TARGET_HELD_OTHER" or "oeuf non disponible pendant l'approche")
 				return
 			end
 			local updatedDestination = Vector3.new(eggPosition.X, ctx.home.Y, eggPosition.Z)
@@ -1065,7 +1215,14 @@ local function moveThenCarry(ctx, destination)
 		if updateCarryEvidence(ctx) then return true end
 		local movable, moveReason = waitForMotionReady(ctx)
 		if not movable then return false, moveReason end
-		local arrived, approachReason = approachEgg(ctx, destination)
+		local arrived, approachReason
+		repeat
+			local followed, why=followTakenEgg(ctx)
+			if not followed then return false,why end
+			if updateCarryEvidence(ctx) then return true end
+			if ctx.eggPosition then destination=Vector3.new(ctx.eggPosition.X,ctx.home.Y,ctx.eggPosition.Z) end
+			arrived,approachReason=approachEgg(ctx,destination)
+		until approachReason~="TARGET_HELD_OTHER"
 		if validCycle(ctx) and updateCarryEvidence(ctx) then return true end
 		local retryable = false
 		if arrived then
@@ -1228,6 +1385,11 @@ local function moveReturnLoop(ctx, destination)
 				return false, "TARGET_CARRIED"
 			end
 			local latest, readOK = readField(ctx.uid)
+			if readOK and isHeldByOther(latest) then
+				local followed,why=followTakenEgg(ctx)
+				if not followed then return false,why end
+				latest,readOK=readField(ctx.uid)
+			end
 			if readOK and latest and (latest.State == SLOT_STATE or latest.State == "Dropped")
 				and latest.CarrierUserId == nil and getRecordPosition(latest) and not ownsEgg(ctx.uid) then
 				ctx.record, ctx.eggPosition = latest, getRecordPosition(latest)
@@ -1444,6 +1606,10 @@ end
 local function ingest(record)
 	if type(record) ~= "table" or type(record.Uid) ~= "string" then return end
 	records[record.Uid] = record
+	if trackedEggs[record.Uid] then
+		trackedEggs[record.Uid].Record=record
+		if record.CarrierUserId then trackedEggs[record.Uid].LastCarrier=record.CarrierUserId end
+	end
 	logEgg(record)
 end
 
@@ -1526,9 +1692,11 @@ local function enqueueEgg(record, source)
 		if source == "AUTO" or source == "DIVINE" then logQueueDecision(record.Uid, "EN FILE | Auto=" .. tostring(autoEnabled) .. " Pause=" .. tostring(queuePaused) .. " Activite=" .. autoActivity .. " Cooldown=" .. tostring((cooldowns[record.Uid] or 0) > os.clock())) end
 		return false
 	end
-	if record.State ~= SLOT_STATE and record.State ~= "Dropped" then return reject("EXCLU : etat=" .. tostring(record.State)) end
-	if record.CarrierUserId ~= nil then return reject("EXCLU : porte par " .. tostring(record.CarrierUserId)) end
+	if not isTrackedFieldState(record) then return reject("EXCLU : etat=" .. tostring(record.State)) end
 	if ownsEgg(record.Uid) then return reject("EXCLU : oeuf deja possede") end
+	trackedEggs[record.Uid] = trackedEggs[record.Uid] or {Record=record}
+	trackedEggs[record.Uid].Record=record
+	if record.CarrierUserId then trackedEggs[record.Uid].LastCarrier=record.CarrierUserId end
 	queuedEggs[record.Uid] = {Record = record, Rate = getRatePerSecond(record) or 0, Source = source}
 	logQueueDecision(record.Uid, "AJOUT " .. source .. " | revenu=" .. tostring(queuedEggs[record.Uid].Rate) .. " seuil=" .. tostring(minimumRatePerSecond))
 	return true
@@ -1540,12 +1708,10 @@ syncQueue = function()
 	local plotCategories = plotAnimalCategories()
 	for uid, entry in pairs(queuedEggs) do
 		if not currentCycle or currentCycle.uid ~= uid then
-			local record = records[uid]
-			local carriedByMe = record and record.State == "Carried" and record.CarrierUserId == player.UserId
-			if not record or ownsEgg(uid) or (entry.Source == "INDEX" and plotCategories[record.AssetCategory])
-				or (not carriedByMe and record.State ~= SLOT_STATE and record.State ~= "Dropped")
-				or (record.CarrierUserId ~= nil and not carriedByMe) then
-				queuedEggs[uid] = nil
+			local record = readField(uid)
+			if not record or ownsEgg(uid) or not isTrackedFieldState(record)
+				or (entry.Source == "INDEX" and plotCategories[record.AssetCategory]) then
+				queuedEggs[uid],trackedEggs[uid] = nil,nil
 			else
 				entry.Record = record
 			end
@@ -1581,7 +1747,7 @@ syncQueue = function()
 		end
 		-- Rebuild pending Index entries to keep the most profitable available egg.
 		for uid, entry in pairs(queuedEggs) do
-			if entry.Source == "INDEX" and (not currentCycle or currentCycle.uid ~= uid) then
+			if entry.Source == "INDEX" and not isHeldByOther(entry.Record) and (not currentCycle or currentCycle.uid ~= uid) then
 				queuedEggs[uid] = nil
 			end
 		end
@@ -1612,10 +1778,10 @@ local function selectBest()
 	local _, _, root = getCharacterParts()
 	for uid, entry in pairs(queuedEggs) do
 		local cached = records[uid] or entry.Record
-		if queuedEggs[uid] and (cached.State == SLOT_STATE or cached.State == "Dropped") and (cooldowns[uid] or 0) <= os.clock() then
+		if queuedEggs[uid] and isTrackedFieldState(cached) and (cooldowns[uid] or 0) <= os.clock() then
 			local latest, ok = readField(uid)
-			if ok and latest and (latest.State == SLOT_STATE or latest.State == "Dropped") and latest.CarrierUserId == nil and not ownsEgg(uid) then
-				records[uid] = latest
+			if ok and isTrackedFieldState(latest) and not ownsEgg(uid) then
+				if not latest.ObservationOnly then records[uid] = latest end
 				local rate = getRatePerSecond(latest)
 				if rate == nil and getRarityName(latest) == "Divine" then rate = 0 end
 				if rate then
@@ -2083,7 +2249,7 @@ local function worker(token)
 			if success then
 				wallMaintenancePending = true
 				selectedEggs[selected.Uid] = nil
-				queuedEggs[selected.Uid] = nil
+				queuedEggs[selected.Uid],trackedEggs[selected.Uid] = nil,nil
 				if refreshQueueInterface then refreshQueueInterface() end
 				if renderControls then renderControls() end
 				if automaticMode and not stopAfterFlight then
@@ -2292,6 +2458,7 @@ local function initialize()
 	connect(EggState.FieldShifted, ingest)
 	connect(EggState.FieldGone, function(uid)
 		records[uid], loggedVersions[uid] = nil, nil
+		if trackedEggs[uid] then log("EGG_TRACK","UID=%s Retire du snapshot : suivi physique conserve",uid) end
 		log("FIELD_GONE", "UID=%s | ne prouve pas la possession", tostring(uid))
 	end)
 	connect(EggState.CarryChanged, function(state)
@@ -3035,7 +3202,7 @@ local function createInterface()
 		local entries = queueOrder()
 		local visibleCount = 0
 		for _, entry in ipairs(entries) do
-			if isEggInCurrentWorld(records[entry.Uid] or entry.Record) then visibleCount += 1 end
+			if isEggInCurrentWorld(entry.Record or records[entry.Uid]) then visibleCount += 1 end
 		end
 		queueTab.Title.Text = "Queue (" .. visibleCount .. ")"
 		for uid in pairs(queueSelection) do
@@ -3132,16 +3299,26 @@ local function createInterface()
 			eggsTab.Title.Text = "Eggs (" .. #available .. ")"
 		elseif activeTab == "Queue" then
 			for _, entry in ipairs(queueOrder()) do
-				local record = records[entry.Uid] or entry.Record
+				local record = entry.Record or records[entry.Uid]
 				if isEggInCurrentWorld(record) then table.insert(available, record) end
 			end
 		else
-		for uid, record in pairs(detectedMode == "Halloween" and halloweenRecords or records) do
-			if (record.State == SLOT_STATE or record.State == "Dropped")
-				and record.CarrierUserId == nil and not ownsEgg(uid) then
-				table.insert(available, record)
+
+			local seenMap={}
+			for uid, record in pairs(detectedMode=="Halloween" and halloweenRecords or records) do
+				if (isTrackedFieldState(record) or record.IsHalloweenObservation) and not ownsEgg(uid) then
+					table.insert(available,record)
+					seenMap[uid]=true
+				end
 			end
-		end
+			if detectedMode=="Normal" then
+				for uid in pairs(trackedEggs) do
+					if not seenMap[uid] then
+						local observed=readField(uid)
+						if isTrackedFieldState(observed) and not ownsEgg(uid) then table.insert(available,observed) end
+					end
+				end
+			end
 		end
 		table.sort(available, function(a, b)
 			local ar, br = getRatePerSecond(a) or 0, getRatePerSecond(b) or 0
@@ -3177,7 +3354,11 @@ local function createInterface()
 			end
 			card.holder.LayoutOrder = index
 			paintEggCard(card.visual, record)
-			if record.InventoryPlaced then
+			if isHeldByOther(record) then
+				card.visual.Weight.Text = "Suivi : "..(record.CarrierUserId and tostring(record.CarrierUserId) or "transport")
+			elseif record.ObservationOnly then
+				card.visual.Weight.Text = "Oeuf retrouve - serveur a confirmer"
+			elseif record.InventoryPlaced then
 				card.visual.Weight.Text = "Place"
 				if activeTab == "Eggs" then inventorySelection[uid] = nil end
 			end
@@ -3263,7 +3444,7 @@ local function createInterface()
 			local removed = 0
 			for uid in pairs(queueSelection) do
 				if queuedEggs[uid] then
-					queuedEggs[uid] = nil
+					queuedEggs[uid],trackedEggs[uid] = nil,nil
 					removedFromAuto[uid] = true
 					removed += 1
 				end
