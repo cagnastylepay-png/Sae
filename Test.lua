@@ -56,6 +56,8 @@ local automaticMode = true
 local autoIncludeMissingIndex = true
 local openBelowRate = 20e9
 local searchingServer = false
+local visitedServers = {}
+local continuationPrepared = false
 local searchWaitForEgg = false
 local AreaEggCycle, ServerClock
 local serverSearchState = "OFF"
@@ -193,6 +195,7 @@ function executorTools.SaveSettings()
 		IncludeMissingIndex = autoIncludeMissingIndex,
 		OpenBelowRate = openBelowRate,
 		SearchActive = searchingServer and automaticMode,
+		VisitedPlaceId = game.PlaceId, VisitedServers = visitedServers,
 		TimingEnabled = timingEnabled,
 		MinimumBillions = minimumRatePerSecond / 1e9,
 	})
@@ -221,6 +224,11 @@ local function loadSettings()
 		end
 	end
 	searchingServer = automaticMode and settings.SearchActive == true
+	if settings.VisitedPlaceId == game.PlaceId and type(settings.VisitedServers)=="table" then
+		for id,visited in pairs(settings.VisitedServers) do
+			if type(id)=="string" and id~="" and visited==true then visitedServers[id]=true end
+		end
+	end
 	-- Detailed telemetry disabled.
 
 	local minimum = settings.MinimumBillions
@@ -2521,7 +2529,7 @@ end
 local function filterPublicServers(data, currentJobId)
 	local result, seen = {}, {}
 	for _, server in ipairs(type(data) == "table" and data or {}) do
-		if type(server) == "table" and type(server.id) == "string" and server.id ~= currentJobId and not seen[server.id]
+		if type(server) == "table" and type(server.id) == "string" and server.id ~= currentJobId and not visitedServers[server.id] and not seen[server.id]
 			and type(server.playing) == "number" and type(server.maxPlayers) == "number"
 			and server.playing >= 0 and server.playing < server.maxPlayers then
 			seen[server.id] = true
@@ -2583,16 +2591,19 @@ end
 
 -- Server search starts only after a confirmed successful collection.
 local function prepareServerContinuation()
+	if continuationPrepared then return true end
 	local queue = executorFunction("queue_on_teleport") or executorFunction("queueonteleport")
 	if not queue then
 		local synApi = executorEnvironment.syn
 		if type(synApi) == "table" and type(synApi.queue_on_teleport) == "function" then queue = synApi.queue_on_teleport end
 	end
 	if not queue then return false, "Relancement automatique indisponible : queue_on_teleport absent" end
-	return pcall(queue, [[
+	local ok, reason = pcall(queue, [[
 		if not game:IsLoaded() then game.Loaded:Wait() end
 		loadstring(game:HttpGet("https://raw.githubusercontent.com/cagnastylepay-png/Sae/main/Test.lua"))()
 	]])
+	if ok then continuationPrepared=true end
+	return ok,reason
 end
 
 requestRandomServerHop = function(token, reason)
@@ -2612,7 +2623,7 @@ requestRandomServerHop = function(token, reason)
 		or generation ~= token or queuePaused or stopAfterFlight then return false end
 	if not ok or #servers == 0 then
 		serverSearchState = "Recherche : nouvel essai dans 30 s"
-		log("SERVER_CHANGE", "Recherche echouee : %s", ok and "aucun serveur disponible" or tostring(servers))
+		log("SERVER_CHANGE", "Recherche echouee : %s", ok and "aucun serveur libre non visite ; historique conserve" or tostring(servers))
 		return false
 	end
 	if reason == "Aucun oeuf eligible" then
@@ -2633,6 +2644,15 @@ requestRandomServerHop = function(token, reason)
 		return false
 	end
 	local destination = servers[Random.new():NextInteger(1,#servers)].id
+	-- Reserve before departure, including failed attempts, and carry history across servers.
+	visitedServers[destination]=true
+	local historySaved,historyError=executorTools.SaveSettings()
+	if not historySaved then
+		visitedServers[destination]=nil
+		serverSearchState="Recherche bloquee : historique non sauvegarde"
+		log("SERVER_CHANGE","Historique : %s",tostring(historyError))
+		return false
+	end
 	serverHopPending = true
 	serverSearchState = "Changement de serveur..."
 	stopMovement(true)
@@ -3287,6 +3307,8 @@ local function createInterface()
 		minimumRatePerSecond = value * 1e9
 		automaticMode = not automaticMode
 		if automaticMode then
+			table.clear(visitedServers)
+			if game.JobId~="" then visitedServers[game.JobId]=true end
 			stopAfterFlight = false
 			queuePaused = false
 			safeHome = getStartAreaDestination()
@@ -3463,6 +3485,7 @@ if historyOK and type(previousLog) == "string" then
 end
 log("SESSION", "Nouveau lancement %s", os.date("%Y-%m-%d %H:%M:%S"))
 loadSettings()
+if game.JobId~="" then visitedServers[game.JobId]=true end
 local gui = createInterface()
 setStatus("Chargement des modules du jeu...")
 connect(player.CharacterRemoving, function()
