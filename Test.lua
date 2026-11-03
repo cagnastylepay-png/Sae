@@ -3887,7 +3887,7 @@ connect(RunService.Heartbeat, function()
 end)
 
 -- History decoding has its own register scope.
-(function()
+;(function()
 local historyOK, previousLog = executorTools.ReadLog()
 if historyOK and type(previousLog) == "string" then
 	for line in previousLog:gmatch("[^\r\n]+") do
