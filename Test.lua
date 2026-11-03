@@ -54,7 +54,6 @@ local selectedEggs = {}
 local automaticMode = true
 local autoIncludeMissingIndex = true
 local openBelowRate = 20e9
-local sellBelowRate = 2e9
 local searchingServer = false
 local searchWaitForEgg = false
 local AreaEggCycle, ServerClock
@@ -65,7 +64,9 @@ local nextServerHopAt = 0
 local requestRandomServerHop
 local lastMaintenanceAt = -math.huge
 local inventoryEggRecords
-local inventorySaleBusy = false
+local inventoryPlacementBusy = false
+local placementRequest
+local GameplayBalance
 local timingEnabled = false
 local flightHistory = {}
 local refreshFlightLog
@@ -85,7 +86,6 @@ local PlotState, TreadmillRemotes, AssetRoster
 local PlacedEggRenderer, EggGrowthPolicy
 local hatchInProgress = false
 local wallMaintenancePending = false
-local EggSaleRemote
 local HaulRemotes
 local lastEquipBestAt = -math.huge
 local detectedMode = player:GetAttribute("InHalloweenDimension") == true and "Halloween" or "Normal"
@@ -161,7 +161,7 @@ end
 shared.__AutoSAEExecutorTools = executorTools
 
 local function log(stage, message, ...)
-	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, WALL_INVENTORY_SELL=true, INVENTORY_SELL_REQUEST=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
+	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, PLOT_PLACE=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
 	if not allowed[stage] then
 		return
 	end
@@ -188,7 +188,7 @@ function executorTools.SaveSettings()
 	local json = HttpService:JSONEncode({
 		Version = 1, AutomaticMode = automaticMode,
 		IncludeMissingIndex = autoIncludeMissingIndex,
-		OpenBelowRate = openBelowRate, SellBelowRate = sellBelowRate,
+		OpenBelowRate = openBelowRate,
 		SearchActive = searchingServer and automaticMode,
 		TimingEnabled = timingEnabled,
 		MinimumBillions = minimumRatePerSecond / 1e9,
@@ -211,10 +211,10 @@ local function loadSettings()
 	end
 	if type(settings.AutomaticMode) == "boolean" then automaticMode = settings.AutomaticMode end
 	if type(settings.IncludeMissingIndex) == "boolean" then autoIncludeMissingIndex = settings.IncludeMissingIndex end
-	for _, key in ipairs({"OpenBelowRate", "SellBelowRate"}) do
+	for _, key in ipairs({"OpenBelowRate"}) do
 		local value = settings[key]
 		if type(value) == "number" and value == value and value >= 0 and value < math.huge then
-			if key == "OpenBelowRate" then openBelowRate = value else sellBelowRate = value end
+			openBelowRate = value
 		end
 	end
 	searchingServer = automaticMode and settings.SearchActive == true
@@ -1741,6 +1741,7 @@ local function hatchReadyEggsOnWallClose(token)
 	local ok, eggs = pcall(EggState.ReadOwnerEggs, player.UserId)
 	if not ok or type(eggs) ~= "table" then log("HATCH_SCAN", "Lecture des oeufs indisponible"); return end
 	local readyUids = {}
+	local opened = 0
 	for uid, record in pairs(eggs) do
 		if type(uid) == "string" and type(record) == "table" and record.Placement ~= nil then
 			local valid, grown = pcall(EggGrowthPolicy.IsReady, record, 0)
@@ -1762,75 +1763,200 @@ local function hatchReadyEggsOnWallClose(token)
 			setStatus("Mur ferme : ouverture des oeufs prets...")
 			local activated, accepted, reason = pcall(PlacedEggRenderer.ActivateLocalEgg, uid)
 			hatchInProgress = false
+			if activated and accepted == true then opened += 1 end
 			log("WALL_HATCH", "UID=%s Accepte=%s Raison=%s", uid, tostring(activated and accepted == true), tostring(activated and reason or accepted))
 		end
 	end
+	return opened
 end
 
-local function planInventoryRetention(eggs)
-	local sell, total, protectedCount = {}, 0, 0
+
+-- Egg capacity is independent of the equipped-animal limit.
+local function plotEggCapacity(eggs)
+	local limit = GameplayBalance and GameplayBalance.EggInventory and GameplayBalance.EggInventory.MAX_PLACED_EGGS
+	if type(limit) ~= "number" or limit ~= limit or limit < 0 or limit == math.huge then return nil, 0 end
+	local count = 0
+	for _, egg in pairs(eggs) do
+		if egg.InventoryPlaced or egg.Placement ~= nil then count += 1 end
+	end
+	return math.max(0, math.floor(limit)-count), count
+end
+
+local function inventoryPlacementOrder(eggs, selection)
+	local ids = {}
 	for uid, egg in pairs(eggs) do
-		if not egg.InventoryPlaced then
-			total += 1
-			local rate = getRatePerSecond(egg)
-			if type(rate) == "number" and rate == rate and rate >= 0 and rate < sellBelowRate then
-				table.insert(sell, uid)
-			else
-				protectedCount += 1
-			end
+		if not egg.InventoryPlaced and egg.Placement == nil and (not selection or selection[uid]) then
+			table.insert(ids, uid)
 		end
 	end
-	table.sort(sell)
-	return sell, total, protectedCount
+	table.sort(ids, function(a,b)
+		local ar, br = getRatePerSecond(eggs[a]) or 0, getRatePerSecond(eggs[b]) or 0
+		if ar ~= br then return ar > br end
+		return a < b
+	end)
+	return ids
 end
 
-local function retainBestInventoryEggs(token)
-	if inventorySaleBusy or not EggSaleRemote or not inventoryEggRecords then return end
-	if destroyed or not autoEnabled or generation ~= token or queuePaused or currentCycle then return end
-	local _, _, root = getCharacterParts()
-	if not root or isSafe(root.Position) ~= true then return end
-	local ids, total, protected = planInventoryRetention(inventoryEggRecords())
-	log("INVENTORY_RETENTION", "InventaireNonPlace=%d Conserves=%d A_Vendre=%d Seuil=%s/s", total, protected, #ids, formatNumber(sellBelowRate))
-	if #ids == 0 then return end
-	inventorySaleBusy = true
-	local ok, reason = pcall(function()
-		for offset = 1, #ids, 512 do
-			if destroyed or not autoEnabled or generation ~= token or queuePaused then break end
-			-- Recheck placement and the current income threshold before each batch.
-			local freshPlan = planInventoryRetention(inventoryEggRecords())
-			local allowed = {}
-			for _, uid in ipairs(freshPlan) do allowed[uid] = true end
-			local batch = {}
-			for index = offset, math.min(offset+511,#ids) do
-				if allowed[ids[index]] then table.insert(batch, ids[index]) end
-			end
-			if #batch > 0 then
-				EggSaleRemote:FireServer({Assets = {}, Eggs = batch})
-				log("WALL_INVENTORY_SELL", "Oeufs=%d Seuil=%s/s | confirmation via inventaire", #batch, formatNumber(sellBelowRate))
-			end
-			if offset+512 <= #ids then task.wait() end
+local function findPlotEggSpot(plot, eggs, reserved)
+	local area = plot.PetArea
+	local targets = {area}
+	PlacedEggRenderer.AppendRaycastTargets(targets, player.UserId)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = targets
+	params.IgnoreWater = true
+	local occupied = {}
+	for _, egg in pairs(eggs) do
+		if egg.Placement and typeof(egg.Placement.LocalCFrame) == "CFrame" then
+			table.insert(occupied, (plot.CenterPoint.CFrame * egg.Placement.LocalCFrame).Position)
 		end
+	end
+	for _, point in ipairs(reserved) do table.insert(occupied, point) end
+	local halfX, halfZ = area.Size.X*0.5-2, area.Size.Z*0.5-2
+	if halfX < 0 or halfZ < 0 then return nil end
+	local points = {}
+	for x=-halfX,halfX,4 do
+		for z=-halfZ,halfZ,4 do
+			local point = area.CFrame:PointToWorldSpace(Vector3.new(x, area.Size.Y*0.5, z))
+			local clear = true
+			for _, other in ipairs(occupied) do
+				if distanceXZ(point,other) < 4 then clear = false; break end
+			end
+			if clear then table.insert(points,point) end
+		end
+	end
+	local _, _, root = getCharacterParts()
+	table.sort(points,function(a,b)
+		return root and distanceXZ(a,root.Position)<distanceXZ(b,root.Position) or (not root and a.X<b.X)
 	end)
-	inventorySaleBusy = false
-	if not ok then log("ERROR", "Vente inventaire : %s", tostring(reason)) end
+	for _, point in ipairs(points) do
+		local hit = Workspace:Raycast(point+area.CFrame.UpVector*256, -area.CFrame.UpVector*512,params)
+		if hit and hit.Instance == area then
+			return plot.CenterPoint.CFrame:ToObjectSpace(CFrame.new(hit.Position)), hit.Position
+		end
+	end
+	return nil
+end
+
+local function placeInventoryEggs(selection, token, opened)
+	if inventoryPlacementBusy or placementRequest or currentCycle or serverHopPending or hatchInProgress then return 0, "Placement indisponible : action en cours" end
+	if not ready or destroyed or not PlotState or not inventoryEggRecords then return 0, "Modules indisponibles" end
+	local carry = readCarry()
+	if not carry or carry.IsCarrying or (inFlightRequest and not inFlightRequest.done) then return 0, "Transport ou requete en cours" end
+	local plot = PlotState.ResolvePlot()
+	local _, humanoid, root = getCharacterParts()
+	if not plot or not root or not humanoid or humanoid.Health<=0 then return 0, "Plot ou personnage indisponible" end
+	if isSafe(root.Position)~=true then return 0, "Rejoins la zone sure pour placer les oeufs" end
+	if token == nil and (autoEnabled or treadmillAssigned or not PlotState.ContainsLocalPoint(root.Position)) then
+		return 0, "Rejoins ton enclos hors du tapis pour placer la selection"
+	end
+	local placementGeneration, character = generation, player.Character
+	local function valid()
+		return not destroyed and generation==placementGeneration and player.Character==character
+			and not currentCycle and not serverHopPending and humanoid.Health>0
+			and (token==nil or (autoEnabled and automaticMode and generation==token and not queuePaused and not stopAfterFlight))
+	end
+	if not valid() then return 0, "Placement annule" end
+	inventoryPlacementBusy = true
+	local placed, summary, reserved = 0, "Aucun oeuf a placer", {}
+	local ok, failure = xpcall(function()
+		local eggs = inventoryEggRecords()
+		local ids = inventoryPlacementOrder(eggs,selection)
+		if #ids==0 then return end
+		local free = plotEggCapacity(eggs)
+		if free==nil then summary="Limite d'oeufs places indisponible"; return end
+		-- Hatching is asynchronous: let its confirmed inventory update release capacity.
+		local untilAt = os.clock()+8
+		while free==0 and (opened or 0)>0 and valid() and os.clock()<untilAt do
+			task.wait(0.1)
+			eggs=inventoryEggRecords()
+			free=plotEggCapacity(eggs)
+			if free==nil then break end
+		end
+		if not free or free<=0 then summary="Enclos plein : limite des oeufs places atteinte"; return end
+		if token~=nil then
+			local exited, reason=leaveTreadmill(token)
+			if not exited then summary="Sortie tapis : "..tostring(reason); return end
+			autoActivity="TO_PLOT"
+			local target=plot.PetArea.Position+Vector3.new(0,humanoid.HipHeight+2,0)
+			local reached, reason=moveActivity(target,token,false)
+			if not reached then summary="Trajet enclos : "..tostring(reason); return end
+		end
+		for _,uid in ipairs(ids) do
+			if not valid() then summary="Placement interrompu"; break end
+			local currentPlot=PlotState.ResolvePlot()
+			if not currentPlot or currentPlot.PlotFolder~=plot.PlotFolder then summary="Plot modifie"; break end
+			eggs=inventoryEggRecords()
+			free=plotEggCapacity(eggs)
+			if not free or free<=0 then summary="Enclos plein"; break end
+			local egg=eggs[uid]
+			if egg and not egg.InventoryPlaced and egg.Placement==nil then
+				local localFrame, point=findPlotEggSpot(plot,eggs,reserved)
+				if not localFrame then summary="Aucun emplacement libre detecte"; break end
+				local request={done=false}
+				placementRequest=request
+				task.spawn(function()
+					request.ok,request.accepted,request.reason=pcall(function()
+						local equipped,why=EggState.WearEggTool(uid)
+						if equipped~=true then return false,why end
+						if not valid() then return false,"Placement annule" end
+						return EggState.PlantEgg(uid,localFrame)
+					end)
+					request.done=true
+					if placementRequest==request then placementRequest=nil end
+				end)
+				local deadline=os.clock()+CONFIG.RequestTimeout
+				while not request.done and valid() and os.clock()<deadline do task.wait(0.05) end
+				if not request.done then summary="Placement en attente du serveur : aucun nouvel envoi"; break end
+				if not request.ok or request.accepted~=true then
+					summary="Placement refuse : "..tostring(request.ok and request.reason or request.accepted)
+					log("PLOT_PLACE","UID=%s %s",uid,summary)
+					break
+				end
+				table.insert(reserved,point)
+				local confirmed=false
+				deadline=os.clock()+3
+				repeat
+					local latest=EggState.ReadOwnedEgg(player.UserId,uid)
+					confirmed=latest~=nil and latest.Placement~=nil
+					if confirmed or not valid() or os.clock()>=deadline then break end
+					task.wait(0.05)
+				until false
+				log("PLOT_PLACE","UID=%s Accepte=true Confirme=%s",uid,tostring(confirmed))
+				if not confirmed then summary="Placement accepte : confirmation inventaire en attente"; break end
+				placed+=1
+				if selection then selection[uid]=nil end
+				PlacedEggRenderer.Refresh()
+				summary=tostring(placed).." oeuf(s) place(s)"
+			end
+		end
+	end,debug.traceback)
+	inventoryPlacementBusy=false
+	if not ok then summary="Placement : "..tostring(failure); log("ERROR","%s",summary) end
+	if not destroyed then
+		setStatus(summary)
+		if refreshEggInterface then refreshEggInterface() end
+	end
+	return placed,summary
 end
 
 local function serviceWallMaintenance(token)
-	if destroyed or not autoEnabled or generation ~= token or currentCycle then return end
+	if destroyed or not automaticMode or not autoEnabled or generation ~= token or currentCycle or inventoryPlacementBusy or placementRequest then return end
 	if not wallMaintenancePending and os.clock()-lastMaintenanceAt < 15 then return end
 	local _, _, root = getCharacterParts()
 	if not root or isSafe(root.Position) ~= true then return end
 	wallMaintenancePending = false
 	lastMaintenanceAt = os.clock()
-	hatchReadyEggsOnWallClose(token)
+	local opened = hatchReadyEggsOnWallClose(token)
 	if destroyed or not autoEnabled or generation ~= token or queuePaused then return end
+	placeInventoryEggs(nil,token,opened)
+	if destroyed or not autoEnabled or generation ~= token or queuePaused or placementRequest then return end
 	if HaulRemotes and os.clock() - lastEquipBestAt >= 5 then
 		lastEquipBestAt = os.clock()
 		setStatus("Mur ferme : Equip Best...")
 		local ok, accepted, reason = pcall(function() return HaulRemotes.WearBest:InvokeServer() end)
 		log("WALL_EQUIP_BEST", "Accepte=%s Raison=%s", tostring(ok and accepted == true), tostring(ok and reason or accepted))
 	end
-	retainBestInventoryEggs(token)
 end
 
 local function idleOnTreadmill(token)
@@ -1868,6 +1994,7 @@ local function idleOnTreadmill(token)
 	while autoEnabled and generation == token and automaticMode and not queuePaused
 		and next(queuedEggs) == nil and not (automaticMode and searchingServer and not searchWaitForEgg) and not activityRecheckPending and not destroyed do
 		serviceWallMaintenance(token)
+		if not treadmillAssigned and autoActivity ~= "TREADMILL" then return true end
 		syncQueue()
 		task.wait(CONFIG.ScanInterval)
 	end
@@ -1901,6 +2028,7 @@ local function worker(token)
 			local nextMode = next(queuedEggs) ~= nil and "FARM" or "TREADMILL"
 			log("RESET_MODE_CHECK", "Reinitialisation/session : mode choisi=%s", nextMode)
 		end
+		if placementRequest then stopAutomation("Placement serveur en attente : reprise apres sa reponse"); return end
 		if inFlightRequest and not inFlightRequest.done then
 			stopAutomation("Requete serveur en cours : attendre sa reponse")
 			return
@@ -2062,7 +2190,7 @@ startAutomation = function(billions)
 end
 
 wakeQueue = function()
-	if serverHopPending or detectedMode ~= "Normal" or destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
+	if inventoryPlacementBusy or placementRequest or serverHopPending or detectedMode ~= "Normal" or destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
 	if inFlightRequest and not inFlightRequest.done then return end
 	startAutomation(minimumRatePerSecond / 1e9)
 end
@@ -2102,7 +2230,7 @@ local function initialize()
 	local remotes = loadModule("Shared.Remotes")
 	TreadmillRemotes = remotes.Treadmill
 	HaulRemotes = remotes.Haul
-	EggSaleRemote = remotes.PetSatchel.SellSelection
+	GameplayBalance = loadModule("Shared.Flags.GameplayBalance")
 	-- Optional event support must not prevent the egg interface from starting.
 	local function updateWorldMode()
 		local nextMode = player:GetAttribute("InHalloweenDimension") == true and "Halloween" or "Normal"
@@ -2301,7 +2429,7 @@ end
 requestRandomServerHop = function(token, reason)
 	if serverHopPending then return true end
 	if not automaticMode or not autoEnabled or generation ~= token
-		or destroyed or currentCycle or inventorySaleBusy or hatchInProgress or stopAfterFlight or queuePaused
+		or destroyed or currentCycle or inventoryPlacementBusy or placementRequest or hatchInProgress or stopAfterFlight or queuePaused
 		or os.clock() < nextServerHopAt then return false end
 	if holdSearchForReset() then return false end
 	local carry = readCarry()
@@ -2810,8 +2938,8 @@ local function createInterface()
 	serverButton("JoinServer","Rejoindre le serveur selectionne",1,function()
 		if joining or scanning or serverHopPending then return end
 		if not selectedServer then setStatus("Selectionne un serveur dans la liste."); return end
-		if currentCycle or (inFlightRequest and not inFlightRequest.done) then
-			setStatus("Termine le vol en cours avant de changer de serveur.")
+		if currentCycle or inventoryPlacementBusy or placementRequest or (inFlightRequest and not inFlightRequest.done) then
+			setStatus("Termine le vol ou le placement avant de changer de serveur.")
 			return
 		end
 		joining = true
@@ -2889,7 +3017,6 @@ local function createInterface()
 		return input
 	end
 	rateInput("OpenBelowRate", 52, "Ouvrir les oeufs prets sous ce revenu", openBelowRate, function(rate) openBelowRate = rate end)
-	rateInput("SellBelowRate", 55, "Vendre les oeufs d'inventaire sous ce revenu", sellBelowRate, function(rate) sellBelowRate = rate end)
 	local searchStateLabel = thresholdTitle:Clone()
 	searchStateLabel.Name, searchStateLabel.LayoutOrder = "ServerSearchState", 62
 	searchStateLabel.Size = UDim2.new(0.95,0,0,54)
@@ -2981,8 +3108,8 @@ local function createInterface()
 		minimumInput.TextEditable = true
 		thresholdTitle.Visible = true
 		minimumInput.Visible = true
-		toggleButton.Title.Text = activeTab == "Queue" and "Remove" or "Add"
-		toggleButton.Visible = activeTab ~= "Eggs" and activeTab ~= "Params" and activeTab ~= "Serveur"
+		toggleButton.Title.Text = activeTab == "Eggs" and (inventoryPlacementBusy and "Placement..." or "Placer") or (activeTab == "Queue" and "Remove" or "Add")
+		toggleButton.Visible = activeTab ~= "Params" and activeTab ~= "Serveur"
 		missingButton.Visible = activeTab == "Map"
 		pauseButton.Visible = activeTab ~= "Eggs" and not queuePaused
 		pausedButton.Visible = activeTab ~= "Eggs" and queuePaused
@@ -2992,7 +3119,7 @@ local function createInterface()
 			local checked = selectedEggs[uid] == true
 			card.holder.SelectedOverlay.Visible = checked
 			card.holder.SelectedIcon.Visible = checked
-			card.button.Active = activeTab ~= "Eggs"
+			card.button.Active = not inventoryPlacementBusy and not (activeTab == "Eggs" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced)
 		end
 	end
 	refreshEggInterface = function()
@@ -3042,15 +3169,18 @@ local function createInterface()
 				card = {holder = holder, visual = visual, button = click}
 				cards[uid] = card
 				card.connection = click.Activated:Connect(function()
-					if activeTab == "Eggs" then return end
-								selectedEggs[uid] = not selectedEggs[uid] or nil
+					if inventoryPlacementBusy or (activeTab == "Eggs" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced) then return end
+					selectedEggs[uid] = not selectedEggs[uid] or nil
 					updateSelection()
 				end)
 				holder.Parent = scroll
 			end
 			card.holder.LayoutOrder = index
 			paintEggCard(card.visual, record)
-			if record.InventoryPlaced then card.visual.Weight.Text = "Place" end
+			if record.InventoryPlaced then
+				card.visual.Weight.Text = "Place"
+				if activeTab == "Eggs" then inventorySelection[uid] = nil end
+			end
 		end
 		for uid, card in pairs(cards) do
 			if not seen[uid] then
@@ -3118,7 +3248,17 @@ local function createInterface()
 	connect(toggleButton.Activated, function()
 		if activeTab == "Params" or activeTab == "Serveur" then return end
 		refreshEggInterface()
-		if activeTab == "Eggs" then return end
+		if activeTab == "Eggs" then
+			if inventoryPlacementBusy or placementRequest then setStatus("Placement deja en cours"); return end
+			if countSelected()==0 then setStatus("Coche les oeufs a placer."); return end
+			if autoEnabled then
+				wallMaintenancePending=true
+				setStatus("AUTO : ouverture puis placement de tous les oeufs au prochain passage en zone sure.")
+			else
+				task.spawn(function() placeInventoryEggs(inventorySelection,nil,0) end)
+			end
+			return
+		end
 		if activeTab == "Queue" then
 			local removed = 0
 			for uid in pairs(queueSelection) do
