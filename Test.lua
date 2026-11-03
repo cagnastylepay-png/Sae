@@ -660,6 +660,11 @@ local function getRarityName(record)
 	return "Inconnue"
 end
 
+function FusionModules.Helpers.IsAlwaysEligibleRarity(record)
+ local rarity=getRarityName(record)
+ return rarity=="Divine" or rarity=="Eternal"
+end
+
 local function getAnimalName(record)
 	local config = getAssetConfig(record)
 	return config and config.DisplayName or record.AssetCategory or "Inconnu"
@@ -1633,7 +1638,7 @@ end
 local function enqueueEgg(record, source)
 	if type(record) ~= "table" or type(record.Uid) ~= "string" then return false end
 	local function reject(reason)
-		if source == "AUTO" or source == "DIVINE" then logQueueDecision(record.Uid, reason) end
+		if source == "AUTO" or source == "RARITY" then logQueueDecision(record.Uid, reason) end
 		return false
 	end
 	if source == "INDEX" and FusionModules.Helpers.plotAnimalCategories()[record.AssetCategory] then return reject("EXCLU : espece deja presente dans ton plot") end
@@ -1646,7 +1651,7 @@ local function enqueueEgg(record, source)
 		end
 	end
 	if queuedEggs[record.Uid] then
-		if source == "AUTO" or source == "DIVINE" then logQueueDecision(record.Uid, "EN FILE | Auto=" .. tostring(autoEnabled) .. " Pause=" .. tostring(queuePaused) .. " Activite=" .. autoActivity .. " Cooldown=" .. tostring((cooldowns[record.Uid] or 0) > os.clock())) end
+		if source == "AUTO" or source == "RARITY" then logQueueDecision(record.Uid, "EN FILE | Auto=" .. tostring(autoEnabled) .. " Pause=" .. tostring(queuePaused) .. " Activite=" .. autoActivity .. " Cooldown=" .. tostring((cooldowns[record.Uid] or 0) > os.clock())) end
 		return false
 	end
 	if not isTrackedFieldState(record) then return reject("EXCLU : etat=" .. tostring(record.State)) end
@@ -1686,10 +1691,10 @@ syncQueue = function()
 					and type(record.AssetCategory) == "string" and Assets.Directory[record.AssetCategory] ~= nil
 					and index[record.AssetCategory] ~= true
 					and not backpackCategories[record.AssetCategory]
-				if getRarityName(record) == "Divine" then
+				if FusionModules.Helpers.IsAlwaysEligibleRarity(record) then
 					local existing = queuedEggs[uid]
-					if existing then existing.Source = "DIVINE" end
-					enqueueEgg(record, "DIVINE")
+					if existing then existing.Source = "RARITY" end
+					enqueueEgg(record, "RARITY")
 				elseif rate >= minimumRatePerSecond then
 					local existing = queuedEggs[uid]
 					if existing and existing.Source == "INDEX" then existing.Source = "AUTO" end
@@ -1739,7 +1744,7 @@ local function selectBest()
 			if ok and isTrackedFieldState(latest) and not ownsEgg(uid) then
 				if not latest.ObservationOnly then records[uid] = latest end
 				local rate = getRatePerSecond(latest)
-				if rate == nil and getRarityName(latest) == "Divine" then rate = 0 end
+				if rate == nil and FusionModules.Helpers.IsAlwaysEligibleRarity(latest) then rate = 0 end
 				if rate then
 					if rate > bestRate or (rate == bestRate and root and best
 						and distanceXZ(latest.BottomCFrame.Position, root.Position)
