@@ -2349,6 +2349,7 @@ FusionModules.Run = function(token)
 			local deadline=os.clock()+20
 			local awarded
 			repeat
+                FusionModules.AcknowledgeReward(reward)
 				latest=fusionProfile()
 				if latest and latest.FusionEggReward==false and not latest.FusionLocked then
 					local consumed=true
@@ -2390,6 +2391,30 @@ FusionModules.Run = function(token)
 end
 
 end -- fusion helpers
+
+
+function FusionModules.AcknowledgeReward(reward)
+ local config=Assets and Assets.Directory and Assets.Directory[reward.AssetCategory]
+ if not config or not config.Egg or type(config.Egg.DisplayName)~="string" then return false end
+ local gui=require(ReplicatedStorage.Client.GUI).Message()
+ if not gui or not gui.Enabled then return false end
+ local frame=gui:FindFirstChild("Frame")
+ local contents=frame and frame:FindFirstChild("Contents")
+ local acknowledge=contents and contents:FindFirstChild("Acknowledge")
+ local accept=contents and contents:FindFirstChild("Accept")
+ if not acknowledge or not acknowledge.Visible or not accept or accept.Visible then return false end
+ local expected="You fused "..config.Egg.DisplayName
+ local matched=false
+ for _,name in ipairs({"IllustratedBody","Body"}) do
+  local label=contents:FindFirstChild(name)
+  if label and label.Visible and label.Text:gsub("<[^>]->","")==expected then matched=true end
+ end
+ if not matched then return false end
+ -- Message.awaitVerdict listens to Enabled=false and resumes the official controller.
+ gui.Enabled=false
+ log("FUSION","Notification du resultat fermee : %s",config.Egg.DisplayName)
+ return true
+end
 
 local function serviceWallMaintenance(token)
 	if destroyed or not automaticMode or not autoEnabled or generation ~= token or currentCycle or FusionModules.Pending() or inventoryPlacementBusy or placementRequest then return end
