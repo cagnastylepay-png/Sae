@@ -2729,12 +2729,16 @@ local function createInterface()
 	paramsTab.Title.Text = "Params"
 	paramsTab.Parent = tabs
 	local eggsTab = mapTab:Clone()
-	eggsTab.Name = "InventoryEggsTab"
-	eggsTab.Title.Text = "Eggs"
+	eggsTab.Name = "BackpackTab"
+	eggsTab.Title.Text = "Backpack"
 	eggsTab.Parent = tabs
-	mapTab.LayoutOrder, queueTab.LayoutOrder, eggsTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3, 4
+	local plotTab = eggsTab:Clone()
+	plotTab.Name = "PlotEggsTab"
+	plotTab.Title.Text = "Plot"
+	plotTab.Parent = tabs
+	mapTab.LayoutOrder, queueTab.LayoutOrder, eggsTab.LayoutOrder, plotTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3, 4, 5
 	tabs.Size = UDim2.new(tabs.Size.X.Scale * 0.5, tabs.Size.X.Offset * 0.5, tabs.Size.Y.Scale, tabs.Size.Y.Offset)
-	for _, tabButton in ipairs({mapTab, queueTab, eggsTab, paramsTab}) do
+	for _, tabButton in ipairs({mapTab, queueTab, eggsTab, plotTab, paramsTab}) do
 		tabButton.Size = UDim2.fromScale(1, 0)
 		local aspect = tabButton:FindFirstChildOfClass("UIAspectRatioConstraint")
 		if not aspect then aspect = Instance.new("UIAspectRatioConstraint", tabButton) end
@@ -2746,6 +2750,7 @@ local function createInterface()
 	local mapSelection = selectedEggs
 	local queueSelection = {}
 	local inventorySelection = {}
+	local plotSelection = {}
 	local inventoryRecords = {}
 	local sort = frame:WaitForChild("SortByHolder")
 	for _, name in ipairs({"Weight", "Value", "PaddingTop", "PaddingSelect"}) do
@@ -3131,22 +3136,24 @@ local function createInterface()
 
 	local function switchTab(name)
 		activeTab = name
-		selectedEggs = name == "Queue" and queueSelection or (name == "Eggs" and inventorySelection or mapSelection)
+		selectedEggs = name == "Queue" and queueSelection or (name == "Backpack" and inventorySelection or (name == "Plot" and plotSelection or mapSelection))
 		scroll.Visible = name ~= "Params"
 		paramsPanel.Visible = name == "Params"
 		sort.Visible = name ~= "Params"
-		eggsTab.Title.TextColor3 = name == "Eggs" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
+		plotTab.Title.TextColor3 = name == "Plot" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
+		eggsTab.Title.TextColor3 = name == "Backpack" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		paramsTab.Title.TextColor3 = name == "Params" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		mapTab.Title.TextColor3 = name == "Map" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
 		queueTab.Title.TextColor3 = name == "Queue" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
 		if name == "Queue" and refreshQueueInterface then refreshQueueInterface() end
-		if (name == "Map" or name == "Eggs") and refreshEggInterface then refreshEggInterface() end
+		if (name == "Map" or name == "Backpack" or name == "Plot") and refreshEggInterface then refreshEggInterface() end
 		if renderControls then renderControls() end
 	end
 	connect(mapTab.Activated, function() switchTab("Map") end)
 	connect(queueTab.Activated, function() switchTab("Queue") end)
 	connect(paramsTab.Activated, function() switchTab("Params") end)
-	connect(eggsTab.Activated, function() switchTab("Eggs") end)
+	connect(eggsTab.Activated, function() switchTab("Backpack") end)
+	connect(plotTab.Activated, function() switchTab("Plot") end)
 	switchTab("Map")
 	local cards = {}
 	local function countSelected()
@@ -3167,27 +3174,33 @@ local function createInterface()
 		minimumInput.TextEditable = true
 		thresholdTitle.Visible = true
 		minimumInput.Visible = true
-		toggleButton.Title.Text = activeTab == "Eggs" and (inventoryPlacementBusy and "Placement..." or "Placer") or (activeTab == "Queue" and "Remove" or "Add")
-		toggleButton.Visible = activeTab ~= "Params"
+		toggleButton.Title.Text = activeTab == "Backpack" and (inventoryPlacementBusy and "Placement..." or "Placer") or (activeTab == "Queue" and "Remove" or "Add")
+		toggleButton.Visible = activeTab ~= "Plot" and activeTab ~= "Params"
 		missingButton.Visible = activeTab == "Map"
-		pauseButton.Visible = activeTab ~= "Eggs" and not queuePaused
-		pausedButton.Visible = activeTab ~= "Eggs" and queuePaused
-		sort.Title.Visible = activeTab ~= "Eggs"
-		collectionSpacer.Visible = activeTab ~= "Eggs"
+		pauseButton.Visible = activeTab ~= "Backpack" and activeTab ~= "Plot" and not queuePaused
+		pausedButton.Visible = activeTab ~= "Backpack" and activeTab ~= "Plot" and queuePaused
+		sort.Title.Visible = activeTab ~= "Backpack" and activeTab ~= "Plot"
+		collectionSpacer.Visible = activeTab ~= "Backpack" and activeTab ~= "Plot"
 		for uid, card in pairs(cards) do
 			local checked = selectedEggs[uid] == true
 			card.holder.SelectedOverlay.Visible = checked
 			card.holder.SelectedIcon.Visible = checked
-			card.button.Active = not inventoryPlacementBusy and not (activeTab == "Eggs" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced)
+			card.button.Active = activeTab ~= "Plot" and not inventoryPlacementBusy and not (activeTab == "Backpack" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced)
 		end
 	end
 	refreshEggInterface = function()
 		if destroyed or not ready then updateSelection(); return end
 		local available = {}
-		if activeTab == "Eggs" then
+		if activeTab == "Backpack" or activeTab == "Plot" then
 			inventoryRecords = inventoryEggRecords()
-			for _, record in pairs(inventoryRecords) do table.insert(available, record) end
-			eggsTab.Title.Text = "Eggs (" .. #available .. ")"
+			local backpackCount, plotCount = 0, 0
+			for _, record in pairs(inventoryRecords) do
+				local placed = record.InventoryPlaced == true or record.Placement ~= nil
+				if placed then plotCount += 1 else backpackCount += 1 end
+				if (activeTab == "Plot") == placed then table.insert(available, record) end
+			end
+			eggsTab.Title.Text = "Backpack (" .. backpackCount .. ")"
+			plotTab.Title.Text = "Plot (" .. plotCount .. ")"
 		elseif activeTab == "Queue" then
 			for _, entry in ipairs(queueOrder()) do
 				local record = entry.Record or records[entry.Uid]
@@ -3237,7 +3250,7 @@ local function createInterface()
 				card = {holder = holder, visual = visual, button = click}
 				cards[uid] = card
 				card.connection = click.Activated:Connect(function()
-					if inventoryPlacementBusy or (activeTab == "Eggs" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced) then return end
+					if activeTab == "Plot" or inventoryPlacementBusy or (activeTab == "Backpack" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced) then return end
 					selectedEggs[uid] = not selectedEggs[uid] or nil
 					updateSelection()
 				end)
@@ -3251,7 +3264,7 @@ local function createInterface()
 				card.visual.Weight.Text = "Oeuf retrouve - serveur a confirmer"
 			elseif record.InventoryPlaced then
 				card.visual.Weight.Text = "Place"
-				if activeTab == "Eggs" then inventorySelection[uid] = nil end
+				if activeTab == "Backpack" then inventorySelection[uid] = nil end
 			end
 		end
 		for uid, card in pairs(cards) do
@@ -3318,9 +3331,9 @@ local function createInterface()
 		setStatus(tostring(count) .. " oeuf(s) d'animaux manquants selectionne(s). Clique Add.")
 	end)
 	connect(toggleButton.Activated, function()
-		if activeTab == "Params" then return end
+		if activeTab == "Params" or activeTab == "Plot" then return end
 		refreshEggInterface()
-		if activeTab == "Eggs" then
+		if activeTab == "Backpack" then
 			if inventoryPlacementBusy or placementRequest then setStatus("Placement deja en cours"); return end
 			if countSelected()==0 then setStatus("Coche les oeufs a placer."); return end
 			if autoEnabled then
