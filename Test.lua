@@ -8,7 +8,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
-local CollectionService = game:GetService("CollectionService")
 local player = Players.LocalPlayer
 assert(player, "Auto_SAE doit etre execute sur le client")
 
@@ -39,7 +38,6 @@ local MINIMUM_BILLIONS, MAXIMUM_BILLIONS, DEFAULT_BILLIONS = 0.1, 999, 2
 local SLOT_STATE = "Slot"
 local CARRY_LOST = "CARRY_LOST"
 local EggState, Assets, EggRecords, AssetEarnings, SlotIdentity, GuardGeometry, Save
-local HalloweenPets
 local ready, destroyed, autoEnabled = false, false, false
 local generation = 0
 local minimumRatePerSecond = DEFAULT_BILLIONS * 1e9
@@ -101,17 +99,11 @@ local hatchInProgress = false
 local wallMaintenancePending = false
 local HaulRemotes
 local lastEquipBestAt = -math.huge
-local detectedMode = player:GetAttribute("InHalloweenDimension") == true and "Halloween" or "Normal"
-local halloweenRecords = {}
 local activityRecheckPending = false
 local refreshBestEggCard
 local treadmillAssigned, treadmillPending = false, false
 local autoActivity = "IDLE"
 
-local function isEggInCurrentWorld(record)
-	return type(record) == "table"
-		and ((record.IsHalloweenObservation == true) == (detectedMode == "Halloween"))
-end
 
 -- Optional executor APIs. Capture once; never replace Roblox services or remotes.
 local debugLogLines = {}
@@ -522,7 +514,7 @@ local function isSafe(position)
 end
 
 local function validCycle(ctx)
-	if detectedMode ~= "Normal" or destroyed or not autoEnabled or generation ~= ctx.generation or currentCycle ~= ctx then
+	if destroyed or not autoEnabled or generation ~= ctx.generation or currentCycle ~= ctx then
 		return false, "annule"
 	end
 	local character, humanoid, root = getCharacterParts()
@@ -684,16 +676,6 @@ local function recordFlightResult(ctx, succeeded)
 end
 
 local function getRatePerSecond(record)
-	if type(record) == "table" and record.IsHalloweenObservation then
-		if record.ObservedRate then return record.ObservedRate end
-		if not Assets.Directory[record.AssetCategory] then return nil end
-		-- Earnings only needs category, scale and mutations; no cosmetic identity is fabricated.
-		local ok, rate = pcall(AssetEarnings.RatePerSecond, {
-			Category = record.AssetCategory, Scale = record.AssetScale,
-			Mutations = record.Mutations or {}, BaseMutation = record.BaseMutation,
-		})
-		return ok and type(rate) == "number" and rate or nil
-	end
 	if type(record) ~= "table" then
 		return nil
 	end
@@ -731,66 +713,6 @@ local function getWeightKg(record)
 	end
 
 	return nil
-end
-
-local function resolveHalloweenCategory(source)
-	if type(source) ~= "string" then return nil end
-	if Assets.Directory[source] then return source end
-	local match
-	for category, spec in pairs(HalloweenPets and HalloweenPets.Specs or {}) do
-		if spec.Group == "World" and (spec.Source == source or spec.EggSource == source
-			or spec.EggModel == source or spec.DisplayName == source) then
-			if match and match ~= category then return nil end
-			match = category
-		end
-	end
-	return match
-end
-
-local function refreshHalloweenRecords()
-	local updated, seen = {}, {}
-	local map = Workspace:FindFirstChild("HalloweenDimension")
-	local folder = map and map:FindFirstChild("WorldEggs")
-	local models = folder and folder:GetChildren() or {}
-	for _, model in ipairs(CollectionService:GetTagged("HalloweenWorldEgg")) do table.insert(models, model) end
-	for _, model in ipairs(models) do
-		if not seen[model] and model:IsA("Model") and model:IsDescendantOf(Workspace) then
-			seen[model] = true
-			local uid = model:GetAttribute("HalloweenEggUid")
-			if type(uid) == "string" then
-				local source = model:GetAttribute("AssetCategory") or model:GetAttribute("PreparedSourceName")
-				local category = resolveHalloweenCategory(source)
-				local scale = model:GetAttribute("AssetScale")
-				local hasScale = type(scale) == "number" and scale > 0 and scale < math.huge
-				local rate = model:GetAttribute("MoneyPerSecond")
-				local mutations, hasMutations = {}, false
-				local encoded = model:GetAttribute("Mutations")
-				if type(encoded) == "string" then
-					local ok, decoded = pcall(function() return game:GetService("HttpService"):JSONDecode(encoded) end)
-					if ok and type(decoded) == "table" then
-						hasMutations = true
-						for key, value in pairs(decoded) do
-							if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or type(value) ~= "string" then hasMutations = false; break end
-						end
-						if hasMutations then mutations = decoded end
-					end
-				end
-				local baseMutation = model:GetAttribute("BaseMutation")
-				updated[uid] = {
-					Uid = uid, AssetCategory = category or (type(source) == "string" and source or "Halloween Egg"),
-					AssetScale = hasScale and scale or 1,
-					WeightIsReference = not hasScale,
-					RateIsReference = not hasScale or not hasMutations,
-					BottomCFrame = model:GetPivot(), AreaId = "Halloween", Zone = model:GetAttribute("Zone"),
-					State = model:GetAttribute("HalloweenEggCanPickUp") == true and "Slot" or "Unavailable",
-					Mutations = mutations, BaseMutation = type(baseMutation) == "string" and baseMutation or nil,
-					IsHalloweenObservation = true,
-					ObservedRate = type(rate) == "number" and rate >= 0 and rate < math.huge and rate or nil,
-				}
-			end
-		end
-	end
-	halloweenRecords = updated
 end
 
 local function getRecordPosition(record)
@@ -951,9 +873,9 @@ local function requestCarry(ctx)
 		areas = areas and areas:FindFirstChild("Areas")
 		local line = areas and areas:FindFirstChild("SeparationLine")
 		local depth = root and line and line:IsA("BasePart") and line.CFrame.LookVector:Dot(root.Position - line.Position)
-		log("CARRY_CONTEXT", "Pos=%s Distance3D=%s ProfondeurLigne=%s Halloween=%s SlotKey=%s",
+		log("CARRY_CONTEXT", "Pos=%s Distance3D=%s ProfondeurLigne=%s SlotKey=%s",
 			root and FusionModules.Helpers.formatPosition(root.Position) or "absent", tostring(distance), tostring(depth),
-			tostring(player:GetAttribute("InHalloweenDimension")), tostring(slotKey))
+			tostring(slotKey))
 		local ok, accepted, reason = pcall(EggState.CarryFieldEgg, ctx.uid, slotKey)
 		if ok and accepted ~= true and type(reason) == "string" and reason:find("Enter the gameplay area first", 1, true) then
 			ctx.gameplayEntryRejected = ctx.attempts >= CONFIG.MaxCarryAttempts
@@ -1714,7 +1636,6 @@ local function enqueueEgg(record, source)
 		if source == "AUTO" or source == "DIVINE" then logQueueDecision(record.Uid, reason) end
 		return false
 	end
-	if record.IsHalloweenObservation then return reject("EXCLU : Halloween en observation") end
 	if source == "INDEX" and FusionModules.Helpers.plotAnimalCategories()[record.AssetCategory] then return reject("EXCLU : espece deja presente dans ton plot") end
 	if (source == "AUTO" or source == "INDEX") and removedFromAuto[record.Uid] then return reject("EXCLU : retire manuellement de la file") end
 	if source == "MANUEL" then removedFromAuto[record.Uid] = nil end
@@ -1740,7 +1661,6 @@ end
 
 syncQueue = function()
 	if not ready or destroyed then return end
-	refreshHalloweenRecords()
 	local plotCategories = FusionModules.Helpers.plotAnimalCategories()
 	for uid, entry in pairs(queuedEggs) do
 		if not currentCycle or currentCycle.uid ~= uid then
@@ -1800,8 +1720,8 @@ syncQueue = function()
 		if (getRatePerSecond(record) or 0) >= minimumRatePerSecond then above += 1 end
 	end
 	for _ in pairs(queuedEggs) do queued += 1 end
-	local summary = string.format("Mode=%s AutoParam=%s Collecte=%s Pause=%s Seuil=%s Detectes=%d AuDessusSeuil=%d EnFile=%d",
-		detectedMode, tostring(automaticMode), tostring(autoEnabled), tostring(queuePaused), tostring(minimumRatePerSecond), total, above, queued)
+	local summary = string.format("AutoParam=%s Collecte=%s Pause=%s Seuil=%s Detectes=%d AuDessusSeuil=%d EnFile=%d",
+		tostring(automaticMode), tostring(autoEnabled), tostring(queuePaused), tostring(minimumRatePerSecond), total, above, queued)
 	if summary ~= lastQueueSummary then
 		lastQueueSummary = summary
 		log("QUEUE_SUMMARY", "%s", summary)
@@ -1845,7 +1765,7 @@ stopAutomation = function(reason, pause)
 end
 
 local function activityValid(token, character)
-	return detectedMode == "Normal" and not destroyed and autoEnabled and generation == token and not queuePaused
+	return not destroyed and autoEnabled and generation == token and not queuePaused
 		and player.Character == character
 end
 
@@ -2468,7 +2388,7 @@ end
 FusionModules.Butterflies = {Until=0, Revision=0, RetryAt=0}
 function FusionModules.Butterflies.Available()
  local b=FusionModules.Butterflies
- if detectedMode~="Normal" or Workspace:GetServerTimeNow()>=b.Until or os.clock()<b.RetryAt then return false end
+ if Workspace:GetServerTimeNow()>=b.Until or os.clock()<b.RetryAt then return false end
  local world=Workspace:FindFirstChild("World")
  local areas=world and world:FindFirstChild("Areas")
  local area=areas and areas:FindFirstChild("ButterflyBloom")
@@ -2742,7 +2662,6 @@ local function worker(token)
 end
 
 startAutomation = function(billions)
-	if detectedMode ~= "Normal" then setStatus("Mode Halloween : observation uniquement."); return false end
 	if destroyed or not ready then
 		setStatus("Les modules du jeu sont indisponibles", Color3.fromRGB(255, 130, 110))
 		return false
@@ -2784,7 +2703,7 @@ startAutomation = function(billions)
 end
 
 wakeQueue = function()
-	if FusionModules.Pending() or inventoryPlacementBusy or placementRequest or serverHopPending or detectedMode ~= "Normal" or destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
+	if FusionModules.Pending() or inventoryPlacementBusy or placementRequest or serverHopPending or destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
 	if inFlightRequest and not inFlightRequest.done then return end
 	startAutomation(minimumRatePerSecond / 1e9)
 end
@@ -2812,7 +2731,6 @@ local function initialize()
 	ServerClock = loadModule("Shared.Util.ServerClock")
 	syncVisitedServerCycle(false)
 	Assets = loadModule("Data.Assets")
-	HalloweenPets = loadModule("Data.HalloweenPets")
 	EggRecords = loadModule("Shared.Util.EggRecords")
 	AssetEarnings = loadModule("Shared.Util.AssetEarnings")
 	SlotIdentity = loadModule("Shared.Util.AreaEggSlotIdentity")
@@ -2864,28 +2782,6 @@ local function initialize()
     end)
 	EggSaleRemote = remotes.PetSatchel.SellSelection
 	GameplayBalance = loadModule("Shared.Flags.GameplayBalance")
-	-- Optional event support must not prevent the egg interface from starting.
-	local function updateWorldMode()
-		local nextMode = player:GetAttribute("InHalloweenDimension") == true and "Halloween" or "Normal"
-		if nextMode ~= detectedMode then
-			detectedMode = nextMode
-			log("WORLD_MODE", "%s", detectedMode)
-			if autoEnabled then stopAutomation("Changement de monde : " .. detectedMode, false) end
-			autoActivity = "IDLE"
-			activityRecheckPending = true
-			if detectedMode == "Normal" then syncQueue(); wakeQueue() end
-		end
-		if detectedMode == "Halloween" then setStatus("Mode Halloween : observation uniquement, trajets non actives.") end
-		if ready then
-			refreshHalloweenRecords()
-			if refreshEggInterface then refreshEggInterface() end
-			if refreshQueueInterface then refreshQueueInterface() end
-			if refreshBestEggCard then refreshBestEggCard() end
-		end
-		if renderControls then renderControls() end
-	end
-	connect(player:GetAttributeChangedSignal("InHalloweenDimension"), updateWorldMode)
-	updateWorldMode()
 	local resetWall = loadModule("Client.AreaEggResetWall")
 	connect(resetWall.Changed, function(sealed)
 		if sealed == true and not destroyed then
@@ -3416,10 +3312,6 @@ local function createInterface()
 			valueHolder.Value.TextScaled = true
 			if valueHolder:FindFirstChild("Icon") then valueHolder.Icon.Visible = false end
 		end
-		if record.IsHalloweenObservation then
-			visual.Weight.Text = weight and (string.format("%.1f kg", weight) .. (record.WeightIsReference and " base" or "")) or "Poids inconnu"
-			visual.Amount.Text = rate and (formatNumber(rate) .. "/s" .. (not record.ObservedRate and record.RateIsReference and " base" or "")) or "Revenu inconnu"
-		end
 	end
 	local backdrop = gui:FindFirstChild("Backdrop")
 	local hudToggle = gui:FindFirstChild("HudToggle")
@@ -3489,7 +3381,7 @@ local function createInterface()
 	refreshBestEggCard = function()
 		if destroyed or not ready then return end
 		local best, bestRate
-		for _, pool in ipairs({detectedMode == "Halloween" and halloweenRecords or records}) do
+		for _, pool in ipairs({records}) do
 			for uid, record in pairs(pool) do
 				if (record.State == SLOT_STATE or record.State == "Dropped") and record.CarrierUserId == nil and not ownsEgg(uid) then
 					local rate = getRatePerSecond(record)
@@ -3505,7 +3397,7 @@ local function createInterface()
 		else
 			visual.Icon.Image = "rbxassetid://103094823152347"
 			visual.Amount.Text = "Aucun oeuf"
-			visual.Weight.Text = detectedMode
+			visual.Weight.Text = ""
 			local label = visual:FindFirstChild("ValueHolder")
 			if label then label.Value.Text = "Auto Eggs" end
 			mainCard:SetAttribute("EggUid", nil)
@@ -3524,11 +3416,6 @@ local function createInterface()
 	paramsPanel.Size = scroll.Size
 	paramsPanel.Visible = false
 	paramsPanel.Parent = frame
-	local worldModeLabel = thresholdTitle:Clone()
-	worldModeLabel.Name = "DetectedWorldMode"
-	worldModeLabel.LayoutOrder = 0
-	worldModeLabel.Size = UDim2.fromScale(0.95, 0.10)
-	worldModeLabel.Parent = paramsPanel
 	local paramsLayout = Instance.new("UIListLayout", paramsPanel)
 	paramsLayout.Padding = UDim.new(0, 16)
 	paramsLayout.SortOrder = Enum.SortOrder.LayoutOrder
@@ -3587,7 +3474,7 @@ local function createInterface()
 		local entries = queueOrder()
 		local visibleCount = 0
 		for _, entry in ipairs(entries) do
-			if isEggInCurrentWorld(entry.Record or records[entry.Uid]) then visibleCount += 1 end
+			if entry.Record or records[entry.Uid] then visibleCount += 1 end
 		end
 		queueTab.Title.Text = "Queue (" .. visibleCount .. ")"
 		for uid in pairs(queueSelection) do
@@ -3646,10 +3533,9 @@ local function createInterface()
 		return n
 	end
 	local function updateSelection()
-		worldModeLabel.Text = "Mode : " .. detectedMode .. (detectedMode == "Halloween" and " (observation)" or "")
 		for _, name in ipairs({"Title", "Title2Stroke"}) do
 			local title = header:FindFirstChild(name)
-			if title then title.Text = "Auto Eggs - " .. detectedMode end
+			if title then title.Text = "Auto Eggs" end
 		end
 		local count = countSelected()
 		info.Value.Text = activeTab == "Params" and ("AUTO >= " .. formatNumber(minimumRatePerSecond) .. "/s") or (tostring(count) .. (count == 1 and " oeuf" or " oeufs"))
@@ -3688,18 +3574,18 @@ local function createInterface()
 		elseif activeTab == "Queue" then
 			for _, entry in ipairs(queueOrder()) do
 				local record = entry.Record or records[entry.Uid]
-				if isEggInCurrentWorld(record) then table.insert(available, record) end
+				if record then table.insert(available, record) end
 			end
 		else
 
 			local seenMap={}
-			for uid, record in pairs(detectedMode=="Halloween" and halloweenRecords or records) do
-				if (isTrackedFieldState(record) or record.IsHalloweenObservation) and not ownsEgg(uid) then
+			for uid, record in pairs(records) do
+				if isTrackedFieldState(record) and not ownsEgg(uid) then
 					table.insert(available,record)
 					seenMap[uid]=true
 				end
 			end
-			if detectedMode=="Normal" then
+			do
 				for uid in pairs(trackedEggs) do
 					if not seenMap[uid] then
 						local observed=readField(uid)
@@ -3846,11 +3732,11 @@ local function createInterface()
 		if countSelected() == 0 then setStatus("Coche au moins un oeuf puis Add."); return end
 		local added = 0
 		for uid in pairs(selectedEggs) do
-			if enqueueEgg(records[uid] or halloweenRecords[uid], "MANUEL") then added += 1 end
+			if enqueueEgg(records[uid], "MANUEL") then added += 1 end
 		end
 		table.clear(selectedEggs)
 		queuePaused = false
-		setStatus(tostring(added) .. " oeuf(s) ajoute(s). Halloween : observation uniquement.")
+		setStatus(tostring(added) .. " oeuf(s) ajoute(s).")
 		syncQueue()
 		wakeQueue()
 		updateSelection()
