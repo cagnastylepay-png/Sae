@@ -57,6 +57,7 @@ local autoIncludeMissingIndex = true
 local openBelowRate = 20e9
 local searchingServer = false
 local visitedServers = {}
+local visitedCycleIndex
 local continuationPrepared = false
 local searchWaitForEgg = false
 local AreaEggCycle, ServerClock
@@ -196,6 +197,7 @@ function executorTools.SaveSettings()
 		OpenBelowRate = openBelowRate,
 		SearchActive = searchingServer and automaticMode,
 		VisitedPlaceId = game.PlaceId, VisitedServers = visitedServers,
+		VisitedCycleIndex = visitedCycleIndex,
 		TimingEnabled = timingEnabled,
 		MinimumBillions = minimumRatePerSecond / 1e9,
 	})
@@ -225,6 +227,7 @@ local function loadSettings()
 	end
 	searchingServer = automaticMode and settings.SearchActive == true
 	if settings.VisitedPlaceId == game.PlaceId and type(settings.VisitedServers)=="table" then
+		if type(settings.VisitedCycleIndex)=="number" then visitedCycleIndex=settings.VisitedCycleIndex end
 		for id,visited in pairs(settings.VisitedServers) do
 			if type(id)=="string" and id~="" and visited==true then visitedServers[id]=true end
 		end
@@ -236,6 +239,20 @@ local function loadSettings()
 		minimumRatePerSecond = minimum * 1e9
 	end
 	log("SETTINGS_LOADED", "Auto=%s Index=%s Minimum=%s B/s", tostring(automaticMode), tostring(autoIncludeMissingIndex), tostring(minimumRatePerSecond / 1e9))
+end
+
+
+local function syncVisitedServerCycle(forceReset)
+	if not AreaEggCycle or not ServerClock then return end
+	local ok,index=pcall(function() return AreaEggCycle.ActivePeriodIndexAt(ServerClock.Now()) end)
+	if not ok or type(index)~="number" or index~=index or math.abs(index)==math.huge then return end
+	if forceReset or visitedCycleIndex~=index then
+		table.clear(visitedServers)
+		if game.JobId~="" then visitedServers[game.JobId]=true end
+		visitedCycleIndex=index
+		executorTools.SaveSettings()
+		log("SERVER_CHANGE","Nouveau cycle d'oeufs=%s : historique serveurs reinitialise",tostring(index))
+	end
 end
 
 local function logQueueDecision(uid, decision)
@@ -2392,6 +2409,7 @@ local function initialize()
 	EggState = loadModule("Client.EggState")
 	AreaEggCycle = loadModule("Shared.Util.AreaEggCycle")
 	ServerClock = loadModule("Shared.Util.ServerClock")
+	syncVisitedServerCycle(false)
 	Assets = loadModule("Data.Assets")
 	HalloweenPets = loadModule("Data.HalloweenPets")
 	EggRecords = loadModule("Shared.Util.EggRecords")
@@ -2431,6 +2449,7 @@ local function initialize()
 	updateWorldMode()
 	local resetWall = loadModule("Client.AreaEggResetWall")
 	connect(resetWall.Changed, function(sealed)
+		if sealed == true and not destroyed then syncVisitedServerCycle(true) end
 		if sealed == true and not destroyed and automaticMode then
 			wallMaintenancePending = true
 			serverSearchReadyAt = os.clock()+15
@@ -2527,6 +2546,7 @@ inventoryEggRecords = function()
 end
 
 local function filterPublicServers(data, currentJobId)
+	syncVisitedServerCycle(false)
 	local result, seen = {}, {}
 	for _, server in ipairs(type(data) == "table" and data or {}) do
 		if type(server) == "table" and type(server.id) == "string" and server.id ~= currentJobId and not visitedServers[server.id] and not seen[server.id]
@@ -3307,8 +3327,6 @@ local function createInterface()
 		minimumRatePerSecond = value * 1e9
 		automaticMode = not automaticMode
 		if automaticMode then
-			table.clear(visitedServers)
-			if game.JobId~="" then visitedServers[game.JobId]=true end
 			stopAfterFlight = false
 			queuePaused = false
 			safeHome = getStartAreaDestination()
