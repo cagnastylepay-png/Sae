@@ -70,6 +70,12 @@ local lastMaintenanceAt = -math.huge
 local inventoryEggRecords
 local inventoryPlacementBusy = false
 local placementRequest
+local FusionModules = {}
+FusionModules.Busy = false
+FusionModules.Request = shared.__AutoSAEFusionRequest
+function FusionModules.Pending()
+	return FusionModules.Busy or (FusionModules.Request and not FusionModules.Request.done)
+end
 local EggSaleRemote
 local GameplayBalance
 local timingEnabled = false
@@ -166,7 +172,7 @@ end
 shared.__AutoSAEExecutorTools = executorTools
 
 local function log(stage, message, ...)
-	local allowed = {ERROR=true, FLIGHT_RESULT=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, PLOT_PLACE=true, INVENTORY_SELL_REQUEST=true, EGG_TRACK=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
+	local allowed = {ERROR=true, FLIGHT_RESULT=true, BUTTERFLY=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, FUSION=true, PLOT_PLACE=true, INVENTORY_SELL_REQUEST=true, EGG_TRACK=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
 	if not allowed[stage] then
 		return
 	end
@@ -2035,7 +2041,7 @@ local function findPlotEggSpot(plot, eggs, reserved)
 end
 
 local function placeInventoryEggs(selection, token, opened)
-	if inventoryPlacementBusy or placementRequest or currentCycle or serverHopPending or hatchInProgress then return 0, "Placement indisponible : action en cours" end
+	if FusionModules.Pending() or inventoryPlacementBusy or placementRequest or currentCycle or serverHopPending or hatchInProgress then return 0, "Placement indisponible : action en cours" end
 	if not ready or destroyed or not PlotState or not inventoryEggRecords then return 0, "Modules indisponibles" end
 	local carry = readCarry()
 	if not carry or carry.IsCarrying or (inFlightRequest and not inFlightRequest.done) then return 0, "Transport ou requete en cours" end
@@ -2153,7 +2159,7 @@ local function inventoryEggsBelowMinimum(eggs)
 end
 
 local function sellInventoryEggsBelowMinimum(token)
-	if not EggSaleRemote or inventoryPlacementBusy or placementRequest or currentCycle
+	if FusionModules.Pending() or not EggSaleRemote or inventoryPlacementBusy or placementRequest or currentCycle
 		or destroyed or not automaticMode or not autoEnabled or generation~=token
 		or queuePaused or stopAfterFlight then return end
 	local _,_,root=getCharacterParts()
@@ -2181,8 +2187,210 @@ local function sellInventoryEggsBelowMinimum(token)
 	if not ok then log("ERROR","Vente sous seuil : %s",tostring(failure)) end
 end
 
+
+do
+local function fusionBackpackGroups(profile, pen)
+	local equipped={}
+	for _,uid in ipairs(profile.EquippedAssets or {}) do equipped[uid]=true end
+	for _,entry in pairs(pen or {}) do
+		if type(entry)=="table" and type(entry.UID)=="string" then equipped[entry.UID]=true end
+	end
+	local groups={}
+	for uid,saved in pairs(profile.Inventory or {}) do
+		if type(uid)=="string" and type(saved)=="table" and not equipped[uid] then
+			local valid,allowed=pcall(FusionModules.Kernel.MayEnterFuse,uid,saved,nil,false,nil)
+			if valid and allowed then
+				local decoded,item=pcall(FusionModules.Items.Decode,saved)
+				local rated,rate=false,nil
+				if decoded then rated,rate=pcall(AssetEarnings.RatePerSecond,item) end
+				if rated and type(rate)=="number" and rate==rate and rate>=0 and rate<math.huge then
+					local key=item.Category.."|"..tostring(saved.CreatorTemporary==true)
+					groups[key]=groups[key] or {Category=item.Category,Temporary=saved.CreatorTemporary==true,Items={}}
+					table.insert(groups[key].Items,{Uid=uid,Item=item,Rate=rate})
+				end
+			end
+		end
+	end
+	local result={}
+	for _,group in pairs(groups) do
+		table.sort(group.Items,function(a,b) if a.Rate~=b.Rate then return a.Rate>b.Rate end;return a.Uid<b.Uid end)
+		if #group.Items>=3 then table.insert(result,group) end
+	end
+	table.sort(result,function(a,b)
+		if a.Items[1].Rate~=b.Items[1].Rate then return a.Items[1].Rate>b.Items[1].Rate end
+		return a.Items[1].Uid<b.Items[1].Uid
+	end)
+	return result
+end
+
+local function fusionProfile()
+	local ok,profile=pcall(Save.Peek)
+	return ok and type(profile)=="table" and profile or nil
+end
+
+local function fusionPen()
+	local ok,pen=pcall(AssetRoster.ReadOwnerPen,player.UserId)
+	return ok and type(pen)=="table" and pen or nil
+end
+
+local function callFusion(remote,...)
+	if FusionModules.Request and not FusionModules.Request.done then return false,false,"Requete fusion en attente" end
+	local request={done=false}
+	local args=table.pack(...)
+	FusionModules.Request,shared.__AutoSAEFusionRequest=request,request
+	task.spawn(function()
+		request.response=table.pack(pcall(function() return remote:InvokeServer(table.unpack(args,1,args.n)) end))
+		request.done=true
+	end)
+	local deadline=os.clock()+CONFIG.RequestTimeout
+	while not request.done and os.clock()<deadline do task.wait(0.05) end
+	if not request.done then return false,false,"Delai fusion depasse ; attente de la reponse avant toute nouvelle action" end
+	return table.unpack(request.response,1,request.response.n)
+end
+
+FusionModules.Run = function(token)
+	if FusionModules.Pending() or inventoryPlacementBusy or placementRequest or currentCycle or serverHopPending
+		or not FusionModules.Remotes or not FusionModules.Kernel or not FusionModules.Items or not FusionModules.Signals or not FusionModules.Types then return end
+	local function valid()
+		return not destroyed and automaticMode and autoEnabled and generation==token and not queuePaused and not stopAfterFlight
+	end
+	if not valid() then return end
+	if not GameplayBalance or GameplayBalance.Fusion.INPUT_COUNT~=3 then return end
+	local profile,pen=fusionProfile(),fusionPen()
+	if not profile or not pen or profile.FusionLocked or profile.FusionEggReward~=false or next(profile.FusionSlots or {}) then return end
+	if #fusionBackpackGroups(profile,pen)==0 then return end
+	local world=Workspace:FindFirstChild("World")
+	local machines=world and world:FindFirstChild("Machines")
+	local model=machines and machines:FindFirstChild("FuseMachine")
+	local machine=model and model:FindFirstChild("Machine")
+	local character,humanoid,root=getCharacterParts()
+	if not machine or not machine:IsA("BasePart") or not root or not humanoid or isSafe(root.Position)~=true then return end
+	local carry=readCarry()
+	if not carry or carry.IsCarrying or (inFlightRequest and not inFlightRequest.done) then return end
+	FusionModules.Busy=true
+	local loaded,committed={},false
+	local ok,failure=xpcall(function()
+		local exited,why=leaveTreadmill(token)
+		if not exited then error("Sortie tapis : "..tostring(why)) end
+		autoActivity="TO_FUSION"
+		setStatus("Trajet vers la machine de fusion...")
+		local target=machine.Position+machine.CFrame.LookVector*7
+		local reached,why=moveActivity(Vector3.new(target.X,root.Position.Y,target.Z),token,false)
+		if not reached then error("Trajet fusion : "..tostring(why)) end
+		autoActivity="FUSION"
+		while valid() and player.Character==character do
+			profile,pen=fusionProfile(),fusionPen()
+			if not profile or not pen or profile.FusionLocked or profile.FusionEggReward~=false or next(profile.FusionSlots or {}) then break end
+			local count=0
+			for _ in pairs(profile.EggInventory or {}) do count+=1 end
+			local eggTypes=require(ReplicatedStorage.Shared.Types.Eggs)
+			if type(eggTypes.MAX_INVENTORY)~="number" or count>=eggTypes.MAX_INVENTORY then
+				log("FUSION","Inventaire d'oeufs plein : fusion differee")
+				break
+			end
+			local groups=fusionBackpackGroups(profile,pen)
+			local group=groups[1]
+			if not group then break end
+			-- Capture inventory before committing; only a new awarded egg confirms success.
+			local eggsBefore={}
+			for uid in pairs(profile.EggInventory or {}) do eggsBefore[uid]=true end
+			local runtimeItems={}
+			for i=1,3 do runtimeItems[i]=group.Items[i].Item end
+			local priced,price=pcall(FusionModules.Kernel.PriceFor,runtimeItems)
+			if not priced then error("Prix fusion indisponible : "..tostring(price)) end
+			log("FUSION","Categorie=%s Selection=%s,%s,%s Revenus=%s,%s,%s Prix=%s",
+				group.Category,group.Items[1].Uid,group.Items[2].Uid,group.Items[3].Uid,
+				tostring(group.Items[1].Rate),tostring(group.Items[2].Rate),tostring(group.Items[3].Rate),tostring(price))
+			loaded,committed={},false
+			for i=1,3 do
+				if not valid() then return end
+				local fresh,presentPen=fusionProfile(),fusionPen()
+				if not fresh or not presentPen then error("Inventaire fusion indisponible") end
+				local uid=group.Items[i].Uid
+				local stillEligible=false
+				for _,candidateGroup in ipairs(fusionBackpackGroups(fresh,presentPen)) do
+					for _,item in ipairs(candidateGroup.Items) do if item.Uid==uid then stillEligible=true end end
+				end
+				-- After loading the first pet, fewer than three remain: validate the individual directly.
+				if not stillEligible then
+					local equipped={}
+					for _,id in ipairs(fresh.EquippedAssets or {}) do equipped[id]=true end
+					for _,entry in pairs(presentPen) do if type(entry)=="table" and type(entry.UID)=="string" then equipped[entry.UID]=true end end
+					local saved=fresh.Inventory and fresh.Inventory[uid]
+					local verified,allowed=false,false
+					if saved and not equipped[uid] then verified,allowed=pcall(FusionModules.Kernel.MayEnterFuse,uid,saved,group.Category,false,group.Temporary) end
+					stillEligible=verified and allowed==true
+				end
+				if not stillEligible then error("Animal devenu indisponible : "..uid) end
+				local replied,accepted,reason=callFusion(FusionModules.Remotes.LoadPet,uid,false)
+				if not replied or accepted~=true then error("LoadPet : "..tostring(reason or accepted)) end
+				table.insert(loaded,uid)
+				local deadline=os.clock()+3
+				repeat
+					local latest=fusionProfile()
+					if latest and table.find(latest.FusionSlots or {},uid) then break end
+					if os.clock()>=deadline then error("Chargement fusion non confirme") end
+					task.wait(0.05)
+				until false
+			end
+			if not valid() then return end
+			local latest=fusionProfile()
+			if not latest or #(latest.FusionSlots or {})~=3 then error("Les trois animaux ne sont pas confirmes") end
+			for _,uid in ipairs(latest.FusionSlots) do if not table.find(loaded,uid) then error("Selection de fusion modifiee") end end
+			local replied,accepted,reason,reward=callFusion(FusionModules.Remotes.BeginFuse)
+			if not replied or accepted~=true then error("BeginFuse : "..tostring(reason or accepted)) end
+			committed=true
+			local validReward=FusionModules.Types.FuseResult(reward)
+			if not validReward then error("Resultat fusion invalide : ne pas relancer") end
+			-- The game's controller plays its animation and calls FinishReveal exactly once.
+			FusionModules.Signals.FuseStarted:Fire(reward)
+			local deadline=os.clock()+20
+			local awarded
+			repeat
+				latest=fusionProfile()
+				if latest and latest.FusionEggReward==false and not latest.FusionLocked then
+					local consumed=true
+					for _,uid in ipairs(loaded) do if latest.Inventory and latest.Inventory[uid] then consumed=false end end
+					if consumed then
+						for uid,egg in pairs(latest.EggInventory or {}) do
+							if not eggsBefore[uid] and egg.AssetCategory==reward.AssetCategory then awarded=uid;break end
+						end
+					end
+				end
+				if awarded then break end
+				if os.clock()>=deadline or destroyed then error("Attribution fusion non confirmee : aucune relance automatique") end
+				task.wait(0.1)
+			until false
+			log("FUSION","Reussi Categorie=%s Oeuf=%s | traitement au prochain passage",group.Category,awarded)
+			loaded,committed={},false
+			-- Recompute before another group: equipped pets and available UIDs may have changed.
+			task.wait()
+		end
+	end,debug.traceback)
+	-- Return only pets loaded by this operation, and only before a committed fusion.
+	if not committed and not (FusionModules.Request and not FusionModules.Request.done) then
+		for _,uid in ipairs(loaded) do
+			local profile=fusionProfile()
+			if profile and table.find(profile.FusionSlots or {},uid) then
+				local replied,accepted,reason=callFusion(FusionModules.Remotes.EjectPet,uid)
+				log("FUSION","Restitution UID=%s Accepte=%s Raison=%s",uid,tostring(replied and accepted==true),tostring(reason))
+				if not replied then break end
+			end
+		end
+	end
+	FusionModules.Busy=false
+	if not ok then
+		log("FUSION","Interrompu : %s",tostring(failure))
+		if committed or (FusionModules.Request and not FusionModules.Request.done) then
+			stopAutomation("Fusion en attente de confirmation : voir le log")
+		end
+	end
+end
+
+end -- fusion helpers
+
 local function serviceWallMaintenance(token)
-	if destroyed or not automaticMode or not autoEnabled or generation ~= token or currentCycle or inventoryPlacementBusy or placementRequest then return end
+	if destroyed or not automaticMode or not autoEnabled or generation ~= token or currentCycle or FusionModules.Pending() or inventoryPlacementBusy or placementRequest then return end
 	if not wallMaintenancePending and os.clock()-lastMaintenanceAt < 15 then return end
 	local _, _, root = getCharacterParts()
 	if not root or isSafe(root.Position) ~= true then return end
@@ -2199,7 +2407,60 @@ local function serviceWallMaintenance(token)
 		setStatus("Mur ferme : Equip Best...")
 		local ok, accepted, reason = pcall(function() return HaulRemotes.WearBest:InvokeServer() end)
 		log("WALL_EQUIP_BEST", "Accepte=%s Raison=%s", tostring(ok and accepted == true), tostring(ok and reason or accepted))
+		if ok and accepted==true then FusionModules.Run(token) end
 	end
+end
+
+
+-- Butterfly waiting uses the game's event clock and native net tool.
+FusionModules.Butterflies = {Until=0, Revision=0, RetryAt=0}
+function FusionModules.Butterflies.Available()
+ local b=FusionModules.Butterflies
+ if detectedMode~="Normal" or Workspace:GetServerTimeNow()>=b.Until or os.clock()<b.RetryAt then return false end
+ local world=Workspace:FindFirstChild("World")
+ local areas=world and world:FindFirstChild("Areas")
+ local area=areas and areas:FindFirstChild("ButterflyBloom")
+ local bounds=area and area:FindFirstChild("Bounds")
+ if not bounds or not bounds:IsA("BasePart") then return false end
+ for _,container in pairs({player.Character,player:FindFirstChildOfClass("Backpack")}) do
+  if container then for _,tool in ipairs(container:GetChildren()) do
+   if tool:IsA("Tool") and tool:GetAttribute("ButterflyNet")==true then return bounds,tool end
+  end end
+ end
+ return false
+end
+function FusionModules.Butterflies.Idle(token)
+ local b=FusionModules.Butterflies
+ local bounds,tool=b.Available()
+ if not bounds then return false end
+ local revision=b.Revision
+ local exited,reason=leaveTreadmill(token)
+ if not exited then log("BUTTERFLY","Sortie tapis refusee : %s",tostring(reason)); b.RetryAt=os.clock()+5; return false end
+ local character,humanoid,root=getCharacterParts()
+ if not character or not humanoid or not root then return false end
+ if tool.Parent~=character then humanoid:EquipTool(tool) end
+ autoActivity="TO_BUTTERFLIES"
+ setStatus("File vide : trajet vers le centre des papillons...")
+ local arrived,detail=moveActivity(Vector3.new(bounds.Position.X,root.Position.Y,bounds.Position.Z),token,false)
+ if not arrived then
+  log("BUTTERFLY","Trajet interrompu : %s",tostring(detail))
+  b.RetryAt=os.clock()+5
+  return true
+ end
+ autoActivity="BUTTERFLIES"
+ log("BUTTERFLY","Centre rejoint : filet equipe jusqu'au prochain cycle")
+ setStatus("Papillons : filet equipe jusqu'au prochain cycle d'oeufs.")
+ while activityValid(token,character) and automaticMode and not stopAfterFlight
+  and b.Revision==revision and Workspace:GetServerTimeNow()<b.Until do
+  local present,net=b.Available()
+  if not present then break end
+  if net.Parent~=character then humanoid:EquipTool(net) end
+  task.wait(CONFIG.ScanInterval)
+ end
+ stopMovement(true)
+ autoActivity="IDLE"
+ activityRecheckPending=true
+ return true
 end
 
 local function idleOnTreadmill(token)
@@ -2235,7 +2496,7 @@ local function idleOnTreadmill(token)
 	if destroyed or not autoEnabled or generation ~= token then return true end
 	setStatus("TREADMILL : entrainement, attente d'un oeuf...")
 	while autoEnabled and generation == token and automaticMode and not queuePaused
-		and next(queuedEggs) == nil and not (automaticMode and searchingServer and not searchWaitForEgg) and not activityRecheckPending and not destroyed do
+		and next(queuedEggs) == nil and not (automaticMode and searchingServer and not searchWaitForEgg) and not activityRecheckPending and not FusionModules.Butterflies.Available() and not destroyed do
 		serviceWallMaintenance(token)
 		if not treadmillAssigned and autoActivity ~= "TREADMILL" then return true end
 		syncQueue()
@@ -2271,6 +2532,7 @@ local function worker(token)
 			local nextMode = next(queuedEggs) ~= nil and "FARM" or "TREADMILL"
 			log("RESET_MODE_CHECK", "Reinitialisation/session : mode choisi=%s", nextMode)
 		end
+		if FusionModules.Pending() then stopAutomation("Fusion serveur en attente : patienter"); return end
 		if placementRequest then stopAutomation("Placement serveur en attente : reprise apres sa reponse"); return end
 		if inFlightRequest and not inFlightRequest.done then
 			stopAutomation("Requete serveur en cours : attendre sa reponse")
@@ -2363,7 +2625,9 @@ local function worker(token)
 			end
 		else
 			directNext = false
-			if automaticMode and searchingServer then
+			if automaticMode and FusionModules.Butterflies.Available() then
+				FusionModules.Butterflies.Idle(token)
+			elseif automaticMode and searchingServer then
 				if searchWaitForEgg then
 					serverSearchState = "Suspendue : attente d'un oeuf eligible"
 					local ok, reason = idleOnTreadmill(token)
@@ -2433,7 +2697,7 @@ startAutomation = function(billions)
 end
 
 wakeQueue = function()
-	if inventoryPlacementBusy or placementRequest or serverHopPending or detectedMode ~= "Normal" or destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
+	if FusionModules.Pending() or inventoryPlacementBusy or placementRequest or serverHopPending or detectedMode ~= "Normal" or destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
 	if inFlightRequest and not inFlightRequest.done then return end
 	startAutomation(minimumRatePerSecond / 1e9)
 end
@@ -2472,8 +2736,35 @@ local function initialize()
 	PlacedEggRenderer = loadModule("Shared.Eggs.PlacedEggRenderer")
 	EggGrowthPolicy = loadModule("Shared.Eggs.PlacedEggGrowthPresentationPolicy")
 	local remotes = loadModule("Shared.Remotes")
+
+ -- Subscribe before fetching so a late snapshot cannot overwrite a newer event.
+ do
+  local b=FusionModules.Butterflies
+  connect(remotes.LiveEvents.Began.OnClientEvent,function(name,duration)
+   if name=="ButterflyBloom" and type(duration)=="number" then
+    b.Revision+=1; b.Until=Workspace:GetServerTimeNow()+math.max(0,duration)
+   end
+  end)
+  connect(remotes.LiveEvents.Ended.OnClientEvent,function(name)
+   if name=="ButterflyBloom" then b.Revision+=1; b.Until=0 end
+  end)
+  local revision=b.Revision
+  task.spawn(function()
+   local ok,running=pcall(function() return remotes.LiveEvents.FetchRunning:InvokeServer() end)
+   if not destroyed and ok and type(running)=="table" and b.Revision==revision then
+    local expiry=running.ButterflyBloom
+    if type(expiry)=="number" then b.Until=expiry end
+   end
+  end)
+ end
+
 	TreadmillRemotes = remotes.Treadmill
 	HaulRemotes = remotes.Haul
+	FusionModules.Remotes = remotes.Fusery
+	FusionModules.Kernel = loadModule("Shared.Util.FuseKernel")
+	FusionModules.Items = loadModule("Shared.Util.AssetItems")
+	FusionModules.Signals = loadModule("Client.FuseMachineSignals")
+	FusionModules.Types = loadModule("Shared.Types.FuseMachine")
 	EggSaleRemote = remotes.PetSatchel.SellSelection
 	GameplayBalance = loadModule("Shared.Flags.GameplayBalance")
 	-- Optional event support must not prevent the egg interface from starting.
@@ -2500,7 +2791,10 @@ local function initialize()
 	updateWorldMode()
 	local resetWall = loadModule("Client.AreaEggResetWall")
 	connect(resetWall.Changed, function(sealed)
-		if sealed == true and not destroyed then syncVisitedServerCycle(true) end
+		if sealed == true and not destroyed then
+            syncVisitedServerCycle(true)
+            FusionModules.Butterflies.Revision += 1
+        end
 		if sealed == true and not destroyed and automaticMode then
 			wallMaintenancePending = true
 			serverSearchReadyAt = os.clock()+15
@@ -2680,7 +2974,7 @@ end
 requestRandomServerHop = function(token, reason)
 	if serverHopPending then return true end
 	if not automaticMode or not autoEnabled or generation ~= token
-		or destroyed or currentCycle or inventoryPlacementBusy or placementRequest or hatchInProgress or stopAfterFlight or queuePaused
+		or destroyed or currentCycle or FusionModules.Pending() or inventoryPlacementBusy or placementRequest or hatchInProgress or stopAfterFlight or queuePaused
 		or os.clock() < nextServerHopAt then return false end
 	if holdSearchForReset() then return false end
 	local carry = readCarry()
@@ -3425,7 +3719,7 @@ local function createInterface()
 		if activeTab == "Params" or activeTab == "Plot" then return end
 		refreshEggInterface()
 		if activeTab == "Backpack" then
-			if inventoryPlacementBusy or placementRequest then setStatus("Placement deja en cours"); return end
+			if FusionModules.Pending() or inventoryPlacementBusy or placementRequest then setStatus("Operation inventaire deja en cours"); return end
 			if countSelected()==0 then setStatus("Coche les oeufs a placer."); return end
 			if autoEnabled then
 				wallMaintenancePending=true
