@@ -2796,6 +2796,22 @@ function FusionModules.Butterflies.Idle(token)
  local character,humanoid,root=getCharacterParts()
  if not character or not humanoid or not root then return false end
  if tool.Parent~=character then humanoid:EquipTool(tool) end
+ local departure,departureReason=getStartAreaDestination()
+ if not departure then
+  log("BUTTERFLY","Point de depart indisponible : %s",tostring(departureReason))
+  b.RetryAt=os.clock()+5
+  return false
+ end
+ autoActivity="TO_BUTTERFLIES_START"
+ setStatus("Papillons : trajet vers le centre de StartArea...")
+ local nextDestination=Vector3.new(bounds.Position.X,departure.Y,bounds.Position.Z)
+ local reached,departureDetail=measureAction("PAPILLONS_STARTAREA",moveActivity,departure,token,false,nextDestination)
+ if not reached then
+  log("BUTTERFLY","Trajet StartArea interrompu : %s",tostring(departureDetail))
+  b.RetryAt=os.clock()+5
+  return true
+ end
+ if not activityValid(token,character)or not automaticMode or stopAfterFlight then return true end
  autoActivity="TO_BUTTERFLIES"
  setStatus("File vide : trajet vers le centre des papillons...")
  local arrived,detail=moveActivity(Vector3.new(bounds.Position.X,root.Position.Y,bounds.Position.Z),token,false)
