@@ -1,4 +1,4 @@
-print("[Auto_SAE] Build reporting-v2")
+print("[Auto_SAE] Build reporting-v3")
 -- Auto_SAE v2.8. SellPrompt selection UI. Verified client contracts; no character/anticheat replacement.
 -- The live game must provide ReplicatedStorage.Client/Data/Shared.
 -- Refresh outbound MoveTo before its native timeout; verify distance before carry.
@@ -761,6 +761,9 @@ do
  function report.Revealed(payload)
   if type(payload)~="table" or type(payload.PeriodIndex)~="number" then return end
   report.Cycle=tostring(math.floor(payload.PeriodIndex))
+  report.ForceSnapshot=true
+  report.ForcePlayers=true
+  report.MarkPlayersDirty()
   report.Waiting=false
   report.MarkDirty(1)
   -- Rarity reveal follows the batch; refresh the official field snapshot without blocking gameplay.
@@ -841,7 +844,7 @@ do
    table.insert(fingerprint,HttpService:JSONEncode(egg))
   end
   local signature=tostring(message.cycleEndsAt)..";"..table.concat(fingerprint,";")
-  if signature==report.LastFingerprint and os.clock()-report.LastSent<60 and not report.ForceSnapshot then
+  if signature==report.LastFingerprint and not report.ForceSnapshot then
    report.Dirty=false
    return false
   end
@@ -946,18 +949,7 @@ do
   local function bind(signal,callback,list)
    table.insert(list or bag.Base,signal:Connect(callback))
   end
-  local function characterAdded(character)
-   for _,connection in ipairs(bag.Character)do connection:Disconnect()end
-   table.clear(bag.Character)
-   local watched={}
-   local function watchHumanoid(child)
-    if child:IsA("Humanoid") and not watched[child] then
-     watched[child]=true
-     bind(child:GetPropertyChangedSignal("WalkSpeed"),report.MarkPlayersDirty,bag.Character)
-    end
-   end
-   for _,child in ipairs(character:GetChildren())do watchHumanoid(child)end
-   bind(character.ChildAdded,watchHumanoid,bag.Character)
+  local function characterAdded()
    report.MarkPlayersDirty()
   end
   local function statAdded(child)
@@ -990,13 +982,22 @@ do
   local ok,profile=pcall(Save.Peek)
   if not ok then profile=nil end
   for _,target in ipairs(Players:GetPlayers())do
-   local humanoid=target.Character and target.Character:FindFirstChildOfClass("Humanoid")
    local row={userId=tostring(target.UserId),name=target.Name,displayName=target.DisplayName}
-   if humanoid then row.walkSpeed=humanoid.WalkSpeed end
-   if target==player and type(profile)=="table" then row.speedPower=profile.SpeedPower end
+   if target==player then
+    if report.SpeedProjection and type(report.SpeedProjection.ReadProjected)=="function" then
+     local read,value=pcall(report.SpeedProjection.ReadProjected)
+     if read and type(value)=="number" then row.speedPower=value end
+    end
+    if row.speedPower==nil and type(profile)=="table" then row.speedPower=profile.SpeedPower end
+   end
    if row.speedPower==nil then
     local power=target:GetAttribute("SpeedPower")
     if type(power)=="number" then row.speedPower=power end
+   end
+   if row.speedPower==nil then
+    local stats=target:FindFirstChild("leaderstats")
+    local value=stats and (stats:FindFirstChild("SpeedPower") or stats:FindFirstChild("Speed"))
+    if value and value:IsA("ValueBase") and type(value.Value)=="number" then row.speedPower=value.Value end
    end
    local pen=penSnapshot[target.UserId]
    if pen then
@@ -1019,7 +1020,7 @@ do
   local encoded={}
   for _,row in ipairs(message.players)do table.insert(encoded,HttpService:JSONEncode(row))end
   local signature=table.concat(encoded,";")
-  if signature==report.LastPlayerFingerprint and os.clock()-report.LastPlayersSent<15 and not report.ForcePlayers then
+  if signature==report.LastPlayerFingerprint and not report.ForcePlayers then
    report.PlayersDirty=false
    return false
   end
@@ -1041,6 +1042,14 @@ do
 
  function report.Start()
   if not report.Enabled then return end
+  task.spawn(function()
+   local ok,projection=pcall(function()return require(ReplicatedStorage.Client.SpeedPowerProjection)end)
+   if not destroyed and ok and type(projection)=="table" then
+    report.SpeedProjection=projection
+    if projection.Changed then connect(projection.Changed,report.MarkPlayersDirty)end
+    report.MarkPlayersDirty()
+   end
+  end)
   report.Cycle=tostring(AreaEggCycle.ActivePeriodIndexAt(ServerClock.Now()))
   for _,target in ipairs(Players:GetPlayers())do report.TrackPlayer(target)end
   connect(Players.PlayerAdded,report.TrackPlayer)
@@ -1071,9 +1080,9 @@ do
      end
      if not report.Socket and not report.Connecting and os.clock()>=report.NextConnect then report.Connect() end
      if report.Ready and os.clock()-report.LastPlayersSent>=1
-      and (report.PlayersDirty or os.clock()-report.LastPlayersSent>=15) then report.SendPlayers()end
+      and report.PlayersDirty then report.SendPlayers()end
      if report.Ready and not report.Waiting and os.clock()>=report.Due
-      and ((report.Dirty and os.clock()-report.LastSent>=2) or os.clock()-report.LastSent>=60) then report.SendSnapshot() end
+      and report.Dirty and os.clock()-report.LastSent>=2 then report.SendSnapshot() end
     end)
     if not ok then
      report.Log("Reporting interrompu sur cette iteration : %s",tostring(err))
