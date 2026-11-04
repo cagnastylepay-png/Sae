@@ -1,4 +1,4 @@
-print("[Auto_SAE] Build reporting-v3")
+print("[Auto_SAE] Build reporting-v4-all-eggs")
 -- Auto_SAE v2.8. SellPrompt selection UI. Verified client contracts; no character/anticheat replacement.
 -- The live game must provide ReplicatedStorage.Client/Data/Shared.
 -- Refresh outbound MoveTo before its native timeout; verify distance before carry.
@@ -783,7 +783,7 @@ do
   end
   for uid,record in pairs(observed) do
    local rarity=getRarityName(record)
-   if rarity=="Divine" or rarity=="Eternal" or rarity=="Secret" or rarity=="Cosmic" then
+   do -- Send every local egg rarity; Render filters its own history.
     local rate=getRatePerSecond(record)
     local weight=getWeightKg(record)
     local entry={uid=uid,category=record.AssetCategory,name=getAnimalName(record),rarity=rarity,
