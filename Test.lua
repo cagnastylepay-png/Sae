@@ -1,4 +1,4 @@
-print("[Auto_SAE] Build register-fix-2")
+print("[Auto_SAE] Build reporting-v1")
 -- Auto_SAE v2.8. SellPrompt selection UI. Verified client contracts; no character/anticheat replacement.
 -- The live game must provide ReplicatedStorage.Client/Data/Shared.
 -- Refresh outbound MoveTo before its native timeout; verify distance before carry.
@@ -166,7 +166,7 @@ end
 shared.__AutoSAEExecutorTools = executorTools
 
 local function log(stage, message, ...)
-	local allowed = {ERROR=true, FLIGHT_RESULT=true, BUTTERFLY=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, FUSION=true, PLOT_PLACE=true, INVENTORY_SELL_REQUEST=true, EGG_TRACK=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
+	local allowed = {ERROR=true, FLIGHT_RESULT=true, REPORT=true, BUTTERFLY=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, FUSION=true, PLOT_PLACE=true, INVENTORY_SELL_REQUEST=true, EGG_TRACK=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
 	if not allowed[stage] then
 		return
 	end
@@ -719,6 +719,228 @@ local function getWeightKg(record)
 
 	return nil
 end
+
+
+-- Optional observation transport. It never changes the collection queue or executes remote commands.
+FusionModules.Reporting = {
+ Enabled=true, Url="wss://m4gix-ws.onrender.com/sae/ws", Socket=nil, Ready=false,
+ Connections={}, Revision=0, Cycle=nil, Waiting=false, Dirty=true, Due=0,
+ LastSent=0, LastAck=0, NextConnect=0, Backoff=2, Connecting=false, Serial=0,
+}
+do
+ local report=FusionModules.Reporting
+ local options=shared.__AutoSAEReportingOptions
+ if type(options)=="table" then
+  report.Enabled=options.Enabled~=false
+  if type(options.Url)=="string" and options.Url:match("^wss://") then report.Url=options.Url end
+  report.Token=type(options.Token)=="string" and options.Token or nil
+ end
+ report.SessionId=HttpService:GenerateGUID(false)
+ function report.Log(message,...)
+  log("REPORT",message,...)
+ end
+ function report.Disconnect()
+  report.Serial+=1
+  report.Ready=false
+  report.PendingRevision=nil
+  for _,connection in ipairs(report.Connections) do pcall(function()connection:Disconnect()end) end
+  table.clear(report.Connections)
+  local socket=report.Socket
+  report.Socket=nil
+  if socket then pcall(function()socket:Close()end) end
+ end
+ function report.MarkDirty(delay)
+  if not report.Dirty or report.Due==0 then report.Due=os.clock()+(delay or .75) end
+  report.Dirty=true
+ end
+ function report.Reset()
+  report.Waiting=true
+  report.Dirty=true
+  report.Due=os.clock()+1
+ end
+ function report.Revealed(payload)
+  if type(payload)~="table" or type(payload.PeriodIndex)~="number" then return end
+  report.Cycle=tostring(math.floor(payload.PeriodIndex))
+  report.Waiting=false
+  report.MarkDirty(1)
+  -- Rarity reveal follows the batch; refresh the official field snapshot without blocking gameplay.
+  task.spawn(function()
+   local ok,err=pcall(EggState.SyncFieldEggs)
+   if not ok then report.Log("Snapshot apres reset indisponible : %s",tostring(err)) end
+  end)
+ end
+ function report.BuildSnapshot()
+  if report.Waiting or not ready then return nil end
+  local now=ServerClock.Now()
+  local cycle=report.Cycle or tostring(AreaEggCycle.ActivePeriodIndexAt(now))
+  local eggs={}
+  for uid,record in pairs(records) do
+   local rarity=getRarityName(record)
+   if rarity=="Divine" or rarity=="Eternal" or rarity=="Secret" then
+    local rate=getRatePerSecond(record)
+    local weight=getWeightKg(record)
+    local entry={uid=uid,category=record.AssetCategory,name=getAnimalName(record),rarity=rarity}
+    -- JSON null is filled by Encode for unknown metrics.
+    if type(rate)=="number" and rate==rate and rate>=0 and rate<math.huge then entry.incomePerSecond=rate end
+    if type(weight)=="number" and weight==weight and weight>=0 and weight<math.huge then entry.weightKg=weight end
+    table.insert(eggs,entry)
+   end
+  end
+  table.sort(eggs,function(a,b)return a.uid<b.uid end)
+  if #eggs>200 then error("Snapshot reporting depasse 200 oeufs ; envoi annule") end
+  return {version=1,type="eggs.snapshot",moduleId="EggReporter",sessionId=report.SessionId,
+   placeId=tostring(game.PlaceId),jobId=game.JobId,cycleId=cycle,revision=report.Revision+1,
+   observedAt=os.date("!%Y-%m-%dT%H:%M:%SZ"),eggs=eggs}
+ end
+ function report.Encode(message)
+  -- Encode each egg separately so unknown metrics and empty arrays are unambiguous.
+  local encoded={}
+  for _,egg in ipairs(message.eggs) do
+   local item=HttpService:JSONEncode(egg)
+   if egg.weightKg==nil then item=item:sub(1,-2)..',"weightKg":null}' end
+   if egg.incomePerSecond==nil then item=item:sub(1,-2)..',"incomePerSecond":null}' end
+   table.insert(encoded,item)
+  end
+  local header=table.clone(message)
+  header.eggs=nil
+  return HttpService:JSONEncode(header):sub(1,-2)..',"eggs":['..table.concat(encoded,",")..']}'
+ end
+ function report.SendSnapshot()
+  if not report.Ready or not report.Socket then return false end
+  local message=report.BuildSnapshot()
+  if not message or message.jobId=="" then return false end
+  local fingerprint={message.cycleId}
+  for _,egg in ipairs(message.eggs) do
+   table.insert(fingerprint,table.concat({egg.uid,egg.category,egg.name,egg.rarity,tostring(egg.weightKg),tostring(egg.incomePerSecond)},"|"))
+  end
+  local signature=table.concat(fingerprint,";")
+  if signature==report.LastFingerprint and os.clock()-report.LastSent<60 and not report.ForceSnapshot then
+   report.Dirty=false
+   return false
+  end
+  local socket=report.Socket
+  local ok,err=pcall(function()socket:Send(report.Encode(message))end)
+  if not ok then
+   report.Log("Envoi echoue : %s",tostring(err))
+   report.Disconnect()
+   report.NextConnect=os.clock()+report.Backoff
+   return false
+  end
+  report.LastFingerprint=signature
+  report.ForceSnapshot=false
+  report.Revision=message.revision
+  report.LastSent=os.clock()
+  report.PendingRevision=message.revision
+  report.PendingAt=report.LastSent
+  report.Dirty=false
+  report.Log("Snapshot envoye Cycle=%s Revision=%d Oeufs=%d",message.cycleId,message.revision,#message.eggs)
+  return true
+ end
+ function report.Connect()
+  if report.Connecting or report.Socket or destroyed then return end
+  local api=executorEnvironment.WebSocket or getfenv().WebSocket
+  if not api and type(executorEnvironment.syn)=="table" then api=executorEnvironment.syn.websocket end
+  local connector=api and (api.connect or api.Connect)
+  if type(connector)~="function" then
+   report.Log("WebSocket.connect indisponible ; reporting desactive pour cette session")
+   report.Enabled=false
+   return
+  end
+  report.Connecting=true
+  report.ConnectingAt=os.clock()
+  local serial=report.Serial
+  task.spawn(function()
+   local ok,socket=pcall(connector,report.Url)
+   if destroyed or serial~=report.Serial or not report.Enabled then
+    if ok and socket then pcall(function()socket:Close()end) end
+    return
+   end
+   report.Connecting=false
+   if not ok or not socket then
+    report.Log("Connexion echouee ; nouvel essai dans %d s",report.Backoff)
+    report.NextConnect=os.clock()+report.Backoff
+    report.Backoff=math.min(report.Backoff*2,60)
+    return
+   end
+   report.Socket=socket
+   local bound,err=pcall(function()
+    table.insert(report.Connections,socket.OnMessage:Connect(function(raw)
+     if destroyed or report.Socket~=socket then return end
+     local parsed,message=pcall(HttpService.JSONDecode,HttpService,raw)
+     if not parsed or type(message)~="table" then report.Log("Message serveur invalide");return end
+     if message.type=="hello.ack" and message.role=="reporter" then
+      report.Ready=true
+      report.ForceSnapshot=true
+      report.Backoff=2
+      report.LastAck=os.clock()
+      report.MarkDirty(.25)
+      report.Log("Connexion confirmee par le serveur")
+     elseif message.type=="eggs.ack" and message.sessionId==report.SessionId then
+      report.LastAck=os.clock()
+      if message.revision==report.PendingRevision then report.PendingRevision=nil end
+      report.Log("Accuse Cycle=%s Revision=%s Accepte=%s",tostring(message.cycleId),tostring(message.revision),tostring(message.accepted))
+     elseif message.type=="error" then
+      report.Log("Erreur serveur : %s",tostring(message.message))
+     end
+    end))
+    table.insert(report.Connections,socket.OnClose:Connect(function()
+     if report.Socket~=socket then return end
+     report.Log("Connexion fermee ; reconnexion programmee")
+     report.Disconnect()
+     report.NextConnect=os.clock()+report.Backoff
+     report.Backoff=math.min(report.Backoff*2,60)
+    end))
+    socket:Send(HttpService:JSONEncode({version=1,type="hello",role="reporter",token=report.Token}))
+   end)
+   if not bound then
+    report.Log("Initialisation socket echouee : %s",tostring(err))
+    report.Disconnect()
+    report.NextConnect=os.clock()+report.Backoff
+   else
+    report.HelloDeadline=os.clock()+15
+   end
+  end)
+ end
+ function report.Start()
+  if not report.Enabled then return end
+  report.Cycle=tostring(AreaEggCycle.ActivePeriodIndexAt(ServerClock.Now()))
+  if EggState.ResetCountdown then connect(EggState.ResetCountdown,report.Reset) end
+  if EggState.RarityRevealed then connect(EggState.RarityRevealed,report.Revealed) end
+  task.spawn(function()
+   while not destroyed and report.Enabled do
+    local ok,err=pcall(function()
+     if report.Connecting and os.clock()-(report.ConnectingAt or 0)>65 then
+      report.Serial+=1
+      report.Connecting=false
+      report.NextConnect=os.clock()+report.Backoff
+      report.Log("Connexion sans reponse apres 65 s ; nouvel essai programme")
+     end
+     if report.Ready and report.PendingRevision and os.clock()-(report.PendingAt or 0)>20 then
+      report.Log("Accuse snapshot absent : reconnexion")
+      report.PendingRevision=nil
+      report.Disconnect()
+      report.NextConnect=os.clock()+report.Backoff
+     end
+     if report.Socket and not report.Ready and os.clock()>(report.HelloDeadline or math.huge) then
+      report.Log("Accuse de connexion absent : reconnexion")
+      report.Disconnect()
+      report.NextConnect=os.clock()+report.Backoff
+     end
+     if not report.Socket and not report.Connecting and os.clock()>=report.NextConnect then report.Connect() end
+     if report.Ready and not report.Waiting and os.clock()>=report.Due
+      and ((report.Dirty and os.clock()-report.LastSent>=2) or os.clock()-report.LastSent>=60) then report.SendSnapshot() end
+    end)
+    if not ok then
+     report.Log("Reporting interrompu sur cette iteration : %s",tostring(err))
+     task.wait(5)
+    end
+    task.wait(.5)
+   end
+   report.Disconnect()
+  end)
+ end
+end -- reporting scope
+
 
 local function getRecordPosition(record)
 	if type(record) == "table" and typeof(record.BottomCFrame) == "CFrame" then
@@ -1586,6 +1808,7 @@ local function snapshot(snapshotData)
 		end
 	end
 	records = updated
+    if FusionModules.Reporting then FusionModules.Reporting.MarkDirty(.75) end
 end
 
 local function queueOrder()
@@ -2799,6 +3022,7 @@ local function initialize()
 		if sealed == true and not destroyed then
             syncVisitedServerCycle(true)
             FusionModules.Butterflies.Revision += 1
+            FusionModules.Reporting.Reset()
         end
 		if sealed == true and not destroyed and automaticMode then
 			wallMaintenancePending = true
@@ -2835,9 +3059,13 @@ local function initialize()
 		assert(type(EggState[name]) == "function", "EggState." .. name .. " indisponible")
 	end
 	connect(EggState.FieldRefreshed, snapshot)
-	connect(EggState.FieldShifted, ingest)
+	connect(EggState.FieldShifted, function(record)
+        ingest(record)
+        FusionModules.Reporting.MarkDirty(.75)
+    end)
 	connect(EggState.FieldGone, function(uid)
 		records[uid], loggedVersions[uid] = nil, nil
+        FusionModules.Reporting.MarkDirty(.75)
 		if trackedEggs[uid] then log("EGG_TRACK","UID=%s Retire du snapshot : suivi physique conserve",uid) end
 		log("FIELD_GONE", "UID=%s | ne prouve pas la possession", tostring(uid))
 	end)
@@ -2871,6 +3099,7 @@ local function initialize()
 	serverSearchReadyAt = os.clock()+15
 	wallMaintenancePending = true
 	ready = true
+    FusionModules.Reporting.Start()
 	setStatus("AUTO ON : recherche des oeufs, sinon entrainement au tapis.", Color3.fromRGB(96, 230, 145))
 	syncQueue()
 	wakeQueue()
@@ -3861,6 +4090,7 @@ local function destroy()
 	executorTools.SaveSettings()
 	executorTools.SaveLog()
 	destroyed = true
+    FusionModules.Reporting.Disconnect()
 	for _, connection in ipairs(lifetimeConnections) do connection:Disconnect() end
 	table.clear(lifetimeConnections)
 	if shared.__AutoSAEController and shared.__AutoSAEController.Gui == gui then
@@ -3873,7 +4103,7 @@ local previous = shared.__AutoSAEController
 if previous and type(previous.Destroy) == "function" then
 	pcall(previous.Destroy)
 end
-shared.__AutoSAEController = {Destroy = destroy, Gui = gui}
+shared.__AutoSAEController = {Destroy = destroy, Gui = gui, Reporting = FusionModules.Reporting}
 connect(gui.Destroying, destroy)
 connect(script.Destroying, destroy)
 task.spawn(function()
