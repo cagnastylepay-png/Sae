@@ -34,7 +34,7 @@ local CONFIG = {
 	RecoveryStateTimeout = 30,
 	RecoveryRetryDelay = 0.5,
 }
-local MINIMUM_BILLIONS, MAXIMUM_BILLIONS, DEFAULT_BILLIONS = 0.1, 999, 2
+local MINIMUM_BILLIONS, MAXIMUM_BILLIONS, DEFAULT_BILLIONS = 0, 1e24, 2
 local SLOT_STATE = "Slot"
 local CARRY_LOST = "CARRY_LOST"
 local EggState, Assets, EggRecords, AssetEarnings, SlotIdentity, GuardGeometry, Save
@@ -71,6 +71,44 @@ local inventoryPlacementBusy = false
 local placementRequest
 local FusionModules = {}
 FusionModules.Helpers = {}
+FusionModules.Options={AutoEggs=true,AutoEggsMin=2e9,AutoEggsMax=999e9,
+ AutoTreadmill=true,AutoSell=true,AutoSellMin=0,AutoSellMax=2e9,
+ AutoFuse=true,AutoOpen=true,AutoPlace=true,AutoPapillon=true,AutoIndex=true}
+function FusionModules.Helpers.SetOption(key,value)
+ local current=FusionModules.Options[key]
+ if current==nil then return false,"Parametre inconnu"end
+ if type(current)=="boolean"then
+  if type(value)~="boolean"then return false,"Interrupteur invalide"end
+ else
+  if type(value)~="number"or value~=value or value<0 or value>=math.huge then return false,"Revenu invalide"end
+  local prefix=key:sub(1,-4)
+  if key:match("Min$")and value>FusionModules.Options[prefix.."Max"]then return false,"Minimum superieur au maximum"end
+  if key:match("Max$")and value<FusionModules.Options[prefix.."Min"]then return false,"Maximum inferieur au minimum"end
+ end
+ FusionModules.Options[key]=value
+ minimumRatePerSecond=FusionModules.Options.AutoEggsMin
+ autoIncludeMissingIndex=FusionModules.Options.AutoIndex
+ automaticMode=true
+ if FusionModules.OnOptionsChanged then FusionModules.OnOptionsChanged()end
+ return true
+end
+function FusionModules.Helpers.RestoreOptions(saved)
+ if type(saved)~="table"then return false end
+ local candidate=table.clone(FusionModules.Options)
+ for key,current in pairs(candidate)do
+  local value=saved[key]
+  if value~=nil then
+   if type(value)~=type(current)then return false end
+   if type(value)=="number"and(value~=value or value<0 or value>=math.huge)then return false end
+   candidate[key]=value
+  end
+ end
+ if candidate.AutoEggsMin>candidate.AutoEggsMax or candidate.AutoSellMin>candidate.AutoSellMax then return false end
+ FusionModules.Options=candidate
+ minimumRatePerSecond=candidate.AutoEggsMin;autoIncludeMissingIndex=candidate.AutoIndex;automaticMode=true
+ return true
+end
+
 FusionModules.Busy = false
 FusionModules.Request = shared.__AutoSAEFusionRequest
 function FusionModules.Pending()
@@ -83,6 +121,10 @@ local flightHistory = {}
 local refreshFlightLog
 local stopAfterFlight = false
 local queuedEggs = {}
+function FusionModules.Helpers.ShouldRun()
+ for key,value in pairs(FusionModules.Options)do if type(value)=="boolean"and value then return true end end
+ return next(queuedEggs)~=nil
+end
 local removedFromAuto = {}
 local queueDecisionLogs = {}
 local lastQueueSummary
@@ -193,7 +235,7 @@ local settingsPath = "AutoSAE_settings.json"
 local lastSettingsJSON, lastSavedLogSequence = nil, -1
 function executorTools.SaveSettings()
 	local json = HttpService:JSONEncode({
-		Version = 1, AutomaticMode = automaticMode,
+		Version = 1, Settings = FusionModules.Options, AutomaticMode = true,
 		IncludeMissingIndex = autoIncludeMissingIndex,
 		OpenBelowRate = openBelowRate,
 		SearchActive = false,
@@ -239,6 +281,17 @@ local function loadSettings()
 	if type(minimum) == "number" and minimum == minimum and minimum >= MINIMUM_BILLIONS and minimum <= MAXIMUM_BILLIONS then
 		minimumRatePerSecond = minimum * 1e9
 	end
+ for key,value in pairs(FusionModules.Options)do
+  if type(value)=="boolean"then FusionModules.Options[key]=automaticMode end
+ end
+ FusionModules.Options.AutoEggsMin=minimumRatePerSecond
+ FusionModules.Options.AutoSellMax=minimumRatePerSecond
+ FusionModules.Options.AutoIndex=automaticMode and autoIncludeMissingIndex
+ if type(settings.Settings)=="table"then
+  if not FusionModules.Helpers.RestoreOptions(settings.Settings)then warn("[Auto_SAE] Parametres invalides : valeurs migrees conservees")end
+ end
+ automaticMode=true
+ autoIncludeMissingIndex=FusionModules.Options.AutoIndex
 	log("SETTINGS_LOADED", "Auto=%s Index=%s Minimum=%s B/s", tostring(automaticMode), tostring(autoIncludeMissingIndex), tostring(minimumRatePerSecond / 1e9))
 end
 
@@ -285,7 +338,7 @@ function FusionModules.Helpers.formatPosition(position)
 end
 
 local function formatNumber(value)
-	for _, unit in ipairs({{1e15, "Qa"}, {1e12, "T"}, {1e9, "B"}, {1e6, "M"}, {1e3, "K"}}) do
+	for _, unit in ipairs({{1e33,"Dc"},{1e30,"No"},{1e27,"Oc"},{1e24,"Sp"},{1e21,"Sx"},{1e18,"Qi"},{1e15, "Qa"}, {1e12, "T"}, {1e9, "B"}, {1e6, "M"}, {1e3, "K"}}) do
 		if math.abs(value) >= unit[1] then
 			return string.format("%.3g%s", value / unit[1], unit[2])
 		end
@@ -298,7 +351,7 @@ function FusionModules.Helpers.parseIncomeRate(text)
 	if type(text) ~= "string" then return nil end
 	local normalized = text:lower():gsub("%s+", ""):gsub(",", "."):gsub("/s$", "")
 	local number, unit = normalized:match("^(%d*%.?%d+)(%a*)$")
-	local multiplier = ({[""]=1e9,k=1e3,m=1e6,b=1e9,t=1e12,qa=1e15})[unit]
+	local multiplier = ({[""]=1e9,k=1e3,m=1e6,b=1e9,t=1e12,qa=1e15,qi=1e18,sx=1e21,sp=1e24,oc=1e27,no=1e30,dc=1e33})[unit]
 	local value = tonumber(number)
 	if not value or not multiplier then return nil end
 	value *= multiplier
@@ -2049,14 +2102,16 @@ syncQueue = function()
 		if not currentCycle or currentCycle.uid ~= uid then
 			local record = readField(uid)
 			if not record or ownsEgg(uid) or not isTrackedFieldState(record)
-				or (entry.Source == "INDEX" and plotCategories[record.AssetCategory]) then
+				or (entry.Source == "INDEX" and (not FusionModules.Options.AutoIndex or plotCategories[record.AssetCategory]))
+    or ((entry.Source=="AUTO"or entry.Source=="RARITY")and not FusionModules.Options.AutoEggs)
+    or (entry.Source=="AUTO"and ((getRatePerSecond(record)or 0)<FusionModules.Options.AutoEggsMin or (getRatePerSecond(record)or math.huge)>FusionModules.Options.AutoEggsMax))then
 				queuedEggs[uid],trackedEggs[uid] = nil,nil
 			else
 				entry.Record = record
 			end
 		end
 	end
-	if automaticMode then
+	if FusionModules.Options.AutoEggs or FusionModules.Options.AutoIndex then
 		local ok, profile = pcall(Save.Peek)
 		local index = ok and type(profile) == "table" and profile.Index
 		local backpackCategories = FusionModules.Helpers.backpackEggCategories(ok and profile or nil)
@@ -2066,16 +2121,16 @@ syncQueue = function()
 				local calculatedRate = getRatePerSecond(record)
 				local rate = calculatedRate or 0
 
-				local missing = autoIncludeMissingIndex and type(index) == "table"
+				local missing = FusionModules.Options.AutoIndex and type(index) == "table"
 					and type(record.AssetCategory) == "string" and Assets.Directory[record.AssetCategory] ~= nil
 					and index[record.AssetCategory] ~= true
 					and not backpackCategories[record.AssetCategory]
                     and not plotCategories[record.AssetCategory]
-				if FusionModules.Helpers.IsAlwaysEligibleRarity(record) then
+				if FusionModules.Options.AutoEggs and FusionModules.Helpers.IsAlwaysEligibleRarity(record) then
 					local existing = queuedEggs[uid]
 					if existing then existing.Source = "RARITY" end
 					enqueueEgg(record, "RARITY")
-				elseif rate >= minimumRatePerSecond then
+				elseif FusionModules.Options.AutoEggs and calculatedRate and rate >= minimumRatePerSecond and rate<=FusionModules.Options.AutoEggsMax then
 					local existing = queuedEggs[uid]
 					if existing and existing.Source == "INDEX" then existing.Source = "AUTO" end
 					enqueueEgg(record, "AUTO")
@@ -2162,6 +2217,7 @@ local function moveActivity(destination, token, interruptForEgg, nextDestination
 	local previous = root.Position
 	local nextCommand = 0
 	while true do
+  if autoActivity=="TO_TREADMILL"and not FusionModules.Options.AutoTreadmill then stopMovement(true);return false,"tapis OFF"end
 		if not activityValid(token, character) or humanoid.Health <= 0 then
 			stopMovement()
 			return false, "annule"
@@ -2262,6 +2318,7 @@ function FusionModules.YieldToSpawnedEggs()
 end
 
 local function hatchReadyEggsOnWallClose(token)
+ if not FusionModules.Options.AutoOpen then return 0 end
 	if hatchInProgress or not PlacedEggRenderer or not EggGrowthPolicy then return end
 	local ok, eggs = pcall(EggState.ReadOwnerEggs, player.UserId)
 	if not ok or type(eggs) ~= "table" then log("HATCH_SCAN", "Lecture des oeufs indisponible"); return end
@@ -2276,7 +2333,7 @@ local function hatchReadyEggsOnWallClose(token)
 	end
 	table.sort(readyUids)
 	for _, uid in ipairs(readyUids) do
-		if destroyed or not autoEnabled or generation ~= token or not automaticMode or queuePaused or FusionModules.YieldToSpawnedEggs() then break end
+		if not FusionModules.Options.AutoOpen or destroyed or not autoEnabled or generation ~= token or not automaticMode or queuePaused or FusionModules.YieldToSpawnedEggs() then break end
 		local readOK, latest = pcall(EggState.ReadOwnedEgg, player.UserId, uid)
 		local readyOK, grown = false, false
 		if readOK and type(latest) == "table" and latest.Placement ~= nil then
@@ -2366,6 +2423,7 @@ local function findPlotEggSpot(plot, eggs, reserved)
 end
 
 local function placeInventoryEggs(selection, token, opened)
+ if token~=nil and not FusionModules.Options.AutoPlace then return 0,"AutoPlace OFF"end
 	if FusionModules.Pending() or inventoryPlacementBusy or placementRequest or currentCycle or serverHopPending or hatchInProgress then return 0, "Placement indisponible : action en cours" end
 	if not ready or destroyed or not PlotState or not inventoryEggRecords then return 0, "Modules indisponibles" end
 	local carry = readCarry()
@@ -2379,7 +2437,7 @@ local function placeInventoryEggs(selection, token, opened)
 	end
 	local placementGeneration, character = generation, player.Character
 	local function valid()
-		return not destroyed and generation==placementGeneration and player.Character==character
+		return (token==nil or FusionModules.Options.AutoPlace)and not destroyed and generation==placementGeneration and player.Character==character
 			and not currentCycle and not serverHopPending and humanoid.Health>0
 			and (token==nil or (autoEnabled and automaticMode and generation==token and not queuePaused and not stopAfterFlight and not FusionModules.YieldToSpawnedEggs()))
 	end
@@ -2475,7 +2533,7 @@ function FusionModules.Helpers.inventoryEggsBelowMinimum(eggs)
 	for uid,egg in pairs(eggs) do
 		local rate=getRatePerSecond(egg)
 		if not egg.InventoryPlaced and egg.Placement==nil and type(rate)=="number"
-			and rate==rate and rate>=0 and rate<minimumRatePerSecond then
+			and rate==rate and rate>=FusionModules.Options.AutoSellMin and rate<=FusionModules.Options.AutoSellMax then
 			table.insert(ids,uid)
 		end
 	end
@@ -2484,6 +2542,7 @@ function FusionModules.Helpers.inventoryEggsBelowMinimum(eggs)
 end
 
 local function sellInventoryEggsBelowMinimum(token)
+ if not FusionModules.Options.AutoSell then return end
 	if FusionModules.Pending() or not EggSaleRemote or inventoryPlacementBusy or placementRequest or currentCycle
 		or destroyed or not automaticMode or not autoEnabled or generation~=token
 		or queuePaused or stopAfterFlight then return end
@@ -2494,7 +2553,7 @@ local function sellInventoryEggsBelowMinimum(token)
 	inventoryPlacementBusy=true -- Serialize all inventory actions with placement.
 	local ok,failure=pcall(function()
 		for offset=1,#ids,512 do
-			if destroyed or not automaticMode or not autoEnabled or generation~=token or queuePaused or stopAfterFlight or FusionModules.YieldToSpawnedEggs() then break end
+			if not FusionModules.Options.AutoSell or destroyed or not automaticMode or not autoEnabled or generation~=token or queuePaused or stopAfterFlight or FusionModules.YieldToSpawnedEggs() then break end
 			local allowed={}
 			for _,uid in ipairs(FusionModules.Helpers.inventoryEggsBelowMinimum(inventoryEggRecords())) do allowed[uid]=true end
 			local batch={}
@@ -2574,10 +2633,11 @@ local function callFusion(remote,...)
 end
 
 FusionModules.Run = function(token)
+ if not FusionModules.Options.AutoFuse then return end
 	if FusionModules.Pending() or inventoryPlacementBusy or placementRequest or currentCycle or serverHopPending
 		or not FusionModules.Remotes or not FusionModules.Kernel or not FusionModules.Items or not FusionModules.Signals or not FusionModules.Types then return end
 	local function valid()
-		return not destroyed and automaticMode and autoEnabled and generation==token and not queuePaused and not stopAfterFlight and not FusionModules.YieldToSpawnedEggs()
+		return FusionModules.Options.AutoFuse and not destroyed and automaticMode and autoEnabled and generation==token and not queuePaused and not stopAfterFlight and not FusionModules.YieldToSpawnedEggs()
 	end
 	if not valid() then return end
 	if not GameplayBalance or GameplayBalance.Fusion.INPUT_COUNT~=3 then return end
@@ -2772,6 +2832,7 @@ end
 -- Butterfly waiting uses the game's event clock and native net tool.
 FusionModules.Butterflies = {Until=0, Revision=0, RetryAt=0}
 function FusionModules.Butterflies.Available()
+ if not FusionModules.Options.AutoPapillon then return false end
  local b=FusionModules.Butterflies
  if Workspace:GetServerTimeNow()>=b.Until or os.clock()<b.RetryAt then return false end
  local world=Workspace:FindFirstChild("World")
@@ -2823,7 +2884,7 @@ function FusionModules.Butterflies.Idle(token)
  autoActivity="BUTTERFLIES"
  log("BUTTERFLY","Centre rejoint : filet equipe jusqu'au prochain cycle")
  setStatus("Papillons : filet equipe jusqu'au prochain cycle d'oeufs.")
- while activityValid(token,character) and automaticMode and not stopAfterFlight
+ while FusionModules.Options.AutoPapillon and activityValid(token,character) and automaticMode and not stopAfterFlight
   and b.Revision==revision and Workspace:GetServerTimeNow()<b.Until do
   local present,net=b.Available()
   if not present then break end
@@ -2871,6 +2932,10 @@ do
 end
 
 local function idleOnTreadmill(token)
+ if not FusionModules.Options.AutoTreadmill then
+  if treadmillAssigned then leaveTreadmill(token)end
+  autoActivity="IDLE";setStatus("En attente : AutoTreadmill OFF");task.wait(CONFIG.ScanInterval);return true
+ end
 	if not PlotState or not TreadmillRemotes then return false, "modules tapis indisponibles" end
 	local slot = PlotState.ResolveLocalSlot()
 	local plots = Workspace:FindFirstChild("Plots")
@@ -2884,13 +2949,14 @@ local function idleOnTreadmill(token)
 		local destination = bottom.Position + Vector3.new(0, humanoid.HipHeight + 2, 0)
 		local ok, reason = measureAction("ENTREE_TAPIS", moveActivity, destination, token, true)
 		if not ok then
-			if reason == "nouvel oeuf" then return true end
+			if reason == "nouvel oeuf"or reason=="tapis OFF"then return true end
 			return false, reason
 		end
 		-- The normal controller detects entry with its downward raycast.
 		local deadline = os.clock() + 0.35
 		while not treadmillAssigned and autoEnabled and generation == token and os.clock() < deadline
 			and next(queuedEggs) == nil do task.wait(0.1) end
+		if not FusionModules.Options.AutoTreadmill then return true end
 		if not treadmillAssigned and automaticMode and next(queuedEggs) == nil then
 			local accepted, detail = treadmillRequest(TreadmillRemotes.AskWearStill, token)
 			if not accepted and not treadmillAssigned then return false, tostring(detail or "entree tapis refusee") end
@@ -2903,7 +2969,7 @@ local function idleOnTreadmill(token)
 	if destroyed or not autoEnabled or generation ~= token then return true end
 	setStatus("TREADMILL : entrainement, attente d'un oeuf...")
 	while autoEnabled and generation == token and automaticMode and not queuePaused
-		and next(queuedEggs) == nil and not activityRecheckPending and not FusionModules.Butterflies.Available() and not destroyed do
+		and FusionModules.Options.AutoTreadmill and next(queuedEggs) == nil and not activityRecheckPending and not FusionModules.Butterflies.Available() and not destroyed do
 		serviceWallMaintenance(token)
 		if not treadmillAssigned and autoActivity ~= "TREADMILL" then return true end
 		syncQueue()
@@ -2934,6 +3000,7 @@ local function worker(token)
 	while autoEnabled and generation == token and not destroyed do
         syncQueue()
 		serviceWallMaintenance(token)
+  if not FusionModules.Helpers.ShouldRun()and not currentCycle then requestUserStop("Toutes les options sont OFF");return end
 		if activityRecheckPending then
 			activityRecheckPending = false
 			syncQueue()
@@ -3089,6 +3156,7 @@ startAutomation = function(billions)
 end
 
 wakeQueue = function()
+ if not FusionModules.Helpers.ShouldRun()then return end
 	if FusionModules.Pending() or inventoryPlacementBusy or placementRequest or serverHopPending or destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
 	if inFlightRequest and not inFlightRequest.done then return end
 	startAutomation(minimumRatePerSecond / 1e9)
@@ -3463,6 +3531,81 @@ connect(RunService.Heartbeat, function(delta)
 	local ok, reason = pcall(immobilizeReferenceGuards)
 	if not ok then log("GUARD_CONTROL", "Reference FOXIN : %s", tostring(reason)) end
 end)
+
+
+function FusionModules.Helpers.BuildParamsPanel(panel, connect, getOptions, setOption)
+ local controls={}
+ local inputService=game:GetService("UserInputService")
+ local function make(class,parent,name,size,pos)
+  local x=Instance.new(class);x.Name=name;x.Size=size;x.Position=pos or UDim2.new();x.Parent=parent;return x
+ end
+ local function label(parent,name,text,pos,size)
+  local x=make("TextLabel",parent,name,size,pos);x.BackgroundTransparency=1;x.Text=text;x.Font=Enum.Font.GothamBold;x.TextSize=22;x.TextColor3=Color3.new(1,1,1);x.TextXAlignment=Enum.TextXAlignment.Left;return x
+ end
+ local function refresh()
+  local options=getOptions()
+  for key,c in pairs(controls)do
+   if c.Toggle then c.Toggle.Text=options[key]and "ON"or "OFF";c.Toggle.BackgroundColor3=options[key]and Color3.fromRGB(102,210,65)or Color3.fromRGB(150,58,58)end
+   if c.Input then
+    c.Input.Text=formatNumber(options[key]).."/s"
+    local ceiling=math.max(100e9,options[c.Root.."Max"],1)
+    c.Fill.Size=UDim2.fromScale(math.clamp(options[key]/ceiling,0,1),1)
+   end
+  end
+ end
+ local order=0
+ for _,spec in ipairs({
+  {"AutoEggs","AutoEggs",true},{"AutoIndex","AutoIndex — Manquants"},
+  {"AutoTreadmill","AutoTreadmill"},{"AutoPapillon","AutoPapillon"},
+  {"AutoSell","AutoSell",true},{"AutoFuse","AutoFuse"},
+  {"AutoOpen","AutoOpen"},{"AutoPlace","AutoPlace"}
+ })do
+  order+=1
+  local key,title,ranges=spec[1],spec[2],spec[3]
+  local section=make("Frame",panel,key,UDim2.new(1,-12,0,ranges and 216 or 74))
+  section.LayoutOrder=order;section.BackgroundColor3=Color3.fromRGB(29,34,44);section.BorderSizePixel=0
+  Instance.new("UICorner",section).CornerRadius=UDim.new(0,10)
+  label(section,"Title",title,UDim2.fromOffset(16,18),UDim2.new(1,-150,0,34))
+  local toggle=make("TextButton",section,"Toggle",UDim2.fromOffset(110,42),UDim2.new(1,-126,0,16))
+  toggle.Font=Enum.Font.GothamBold;toggle.TextSize=24;toggle.TextColor3=Color3.new(1,1,1);Instance.new("UICorner",toggle)
+  controls[key]={Toggle=toggle}
+  connect(toggle.Activated,function()setOption(key,not getOptions()[key]);refresh()end)
+  if ranges then
+   for index,suffix in ipairs({"Min","Max"})do
+    local option=key..suffix
+    local row=make("Frame",section,suffix,UDim2.new(1,-32,0,66),UDim2.fromOffset(16,72+(index-1)*68));row.BackgroundTransparency=1
+    label(row,"Title",suffix=="Min"and "Revenu minimum"or "Revenu maximum",UDim2.new(),UDim2.new(.55,0,0,30))
+    local input=make("TextBox",row,"Value",UDim2.new(.42,0,0,32),UDim2.fromScale(.58,0))
+    input.BackgroundColor3=Color3.fromRGB(45,52,67);input.TextColor3=Color3.new(1,1,1);input.TextSize=21;input.Font=Enum.Font.GothamBold;input.ClearTextOnFocus=false;Instance.new("UICorner",input)
+    local track=make("TextButton",row,"Slider",UDim2.new(1,0,0,16),UDim2.fromOffset(0,42));track.Text="";track.BackgroundColor3=Color3.fromRGB(58,66,78);track.AutoButtonColor=false
+    local fill=make("Frame",track,"Fill",UDim2.fromScale(0,1));fill.BackgroundColor3=Color3.fromRGB(132,231,83);fill.BorderSizePixel=0
+    controls[option]={Input=input,Fill=fill,Root=key}
+    connect(input.FocusLost,function()
+     local rate=FusionModules.Helpers.parseIncomeRate(input.Text)
+     if rate then setOption(option,rate)end;refresh()
+    end)
+    local dragging=false
+    local function slide(position)
+     local opts=getOptions();local ceiling=math.max(100e9,opts[key.."Max"],1)
+     local value=math.floor(math.clamp((position.X-track.AbsolutePosition.X)/math.max(track.AbsoluteSize.X,1),0,1)*ceiling/1e7+.5)*1e7
+     if suffix=="Min"then value=math.min(value,opts[key.."Max"])else value=math.max(value,opts[key.."Min"])end
+     setOption(option,value);refresh()
+    end
+    connect(track.InputBegan,function(inputObject)
+     if inputObject.UserInputType==Enum.UserInputType.MouseButton1 or inputObject.UserInputType==Enum.UserInputType.Touch then dragging=true;slide(inputObject.Position)end
+    end)
+    connect(inputService.InputChanged,function(inputObject)
+     if dragging and(inputObject.UserInputType==Enum.UserInputType.MouseMovement or inputObject.UserInputType==Enum.UserInputType.Touch)then slide(inputObject.Position)end
+    end)
+    connect(inputService.InputEnded,function(inputObject)
+     if inputObject.UserInputType==Enum.UserInputType.MouseButton1 or inputObject.UserInputType==Enum.UserInputType.Touch then dragging=false end
+    end)
+   end
+  end
+ end
+ refresh()
+ return refresh
+end
 
 local function createInterface()
 	local playerGui = player:WaitForChild("PlayerGui")
@@ -3915,6 +4058,31 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 	autoButton.Size = UDim2.fromScale(0.65, 0.16)
 	thresholdTitle.Size = UDim2.fromScale(0.65, 0.10)
 	minimumInput.Size = UDim2.fromScale(0.65, 0.14)
+ do
+  local legacy=Instance.new("Frame");legacy.Name="LegacyControls";legacy.Visible=false;legacy.Size=UDim2.new()
+  for _,child in ipairs(paramsPanel:GetChildren())do if child:IsA("GuiObject")then child.Parent=legacy end end
+  legacy.Parent=paramsPanel
+  local repaint=FusionModules.Helpers.BuildParamsPanel(paramsPanel,connect,function()return FusionModules.Options end,FusionModules.Helpers.SetOption)
+  FusionModules.OnOptionsChanged=function()
+   wallMaintenancePending=true
+   if ready then
+    syncQueue()
+    if FusionModules.Helpers.ShouldRun()then
+     queuePaused=false;stopAfterFlight=false;wakeQueue()
+    else requestUserStop("Tous les automatismes OFF")end
+   end
+   repaint()
+   if renderControls then renderControls()end
+   if not executorTools.SettingsSavePending then
+    executorTools.SettingsSavePending=true
+    task.delay(.3,function()
+     executorTools.SettingsSavePending=false
+     if not destroyed then executorTools.SaveSettings()end
+    end)
+   end
+  end
+ end
+
 	refreshQueueInterface = function()
 		local entries = queueOrder()
 		local visibleCount = 0
