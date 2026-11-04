@@ -3633,29 +3633,50 @@ function FusionModules.Helpers.BuildParamsPanel(panel, connect, getOptions, setO
 end
 
 
-function FusionModules.Helpers.StyleTabs(frame,active)
- local names={Map="Map",Backpack="Backpack",Plot="Plot",Params="Params"}
- for _,spec in ipairs({
- {"MapTab","Map",Color3.fromRGB(126,230,72),Color3.fromRGB(37,143,97)},
- {"BackpackTab","Backpack",Color3.fromRGB(73,192,255),Color3.fromRGB(64,87,208)},
- {"PlotEggsTab","Plot",Color3.fromRGB(255,201,79),Color3.fromRGB(224,119,48)},
- {"ParamsTab","Params",Color3.fromRGB(202,133,255),Color3.fromRGB(117,69,196)}
- })do
+
+function FusionModules.Helpers.ArrangeNavigation(frame,template)
+ local sort=frame.SortByHolder
+ local hidden=Instance.new("Frame");hidden.Name="LegacySortControls";hidden.Visible=false;hidden.Size=UDim2.new();hidden.Parent=frame
+ for _,child in ipairs(sort:GetChildren())do if child:IsA("GuiObject")then child.Parent=hidden end end
+ local layout=sort:FindFirstChildOfClass("UIListLayout")or Instance.new("UIListLayout",sort)
+ layout.SortOrder=Enum.SortOrder.LayoutOrder;layout.Padding=UDim.new(0,14)
+ layout.HorizontalAlignment=Enum.HorizontalAlignment.Center
+ layout.VerticalAlignment=Enum.VerticalAlignment.Top
+ for order,spec in ipairs({{"MapTab","Map"},{"BackpackTab","Backpack"},{"PlotEggsTab","Plot"},{"ParamsTab","Params"}})do
   local button=frame.TabButtonHolder:FindFirstChild(spec[1])
   if button then
-   button.BackgroundColor3=Color3.new(1,1,1)
-   button.BackgroundTransparency=active==spec[2]and 0 or .2
-   button:SetAttribute("TabName",spec[2])
-   for _,child in ipairs(button:GetDescendants())do
-    if child:IsA("TextLabel")or child:IsA("TextButton")then child.Text="";child.Visible=false end
+   button:ClearAllChildren()
+   for _,child in ipairs(template:GetChildren())do
+    if not child:IsA("UISizeConstraint")and not child:IsA("UIAspectRatioConstraint")then child:Clone().Parent=button end
    end
-   local gradient=button:FindFirstChildOfClass("UIGradient")or Instance.new("UIGradient",button)
-   gradient.Color=ColorSequence.new(spec[3],spec[4]);gradient.Rotation=45
+   button.Image=template.Image;button.ImageColor3=template.ImageColor3;button.ImageTransparency=template.ImageTransparency
+   button.BackgroundColor3=template.BackgroundColor3;button.BackgroundTransparency=template.BackgroundTransparency
+   button.Size=UDim2.new(.91,0,0,68);button.AnchorPoint=Vector2.zero;button.Position=UDim2.new()
+   button.LayoutOrder=order;button.Visible=true;button.Parent=sort
+   local title
+   for _,child in ipairs(button:GetDescendants())do
+    if child:IsA("TextLabel")then
+     if not title then title=child;child.Name="Title";child.Text=spec[2];child.Visible=true;child.TextScaled=true;child.Size=UDim2.fromScale(.92,.85);child.Position=UDim2.fromScale(.5,.5);child.AnchorPoint=Vector2.new(.5,.5)
+     else child.Visible=false end
+    elseif child:IsA("ImageLabel")and child.Name=="Icon"then child.Visible=false end
+   end
+  end
+ end
+ sort.Visible=true
+ frame.TabButtonHolder.Visible=false
+end
+function FusionModules.Helpers.StyleTabs(frame,active)
+ for _,spec in ipairs({{"MapTab","Map"},{"BackpackTab","Backpack"},{"PlotEggsTab","Plot"},{"ParamsTab","Params"}})do
+  local button=frame.SortByHolder:FindFirstChild(spec[1])
+  if button then
+   button.Title.Text=spec[2];button.Title.Visible=true
+   button.Title.TextColor3=active==spec[2]and Color3.new(1,1,1)or Color3.fromRGB(220,240,205)
+   button:SetAttribute("ActiveTab",active==spec[2])
   end
  end
  for _,name in ipairs({"Title","Title2Stroke"})do
   local title=frame.Header:FindFirstChild(name)
-  if title then title.Text="Auto Eggs — "..(names[active]or active)end
+  if title then title.Text="Auto Eggs — "..active end
  end
 end
 
@@ -4169,13 +4190,14 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 	connect(pauseButton.Activated, toggleQueue)
 	connect(pausedButton.Activated, toggleQueue)
 
+	FusionModules.Helpers.ArrangeNavigation(frame,missingButton)
 	local function switchTab(name)
 		activeTab = name
         FusionModules.Helpers.StyleTabs(frame,name)
 		selectedEggs = name == "Queue" and queueSelection or (name == "Backpack" and inventorySelection or (name == "Plot" and plotSelection or mapSelection))
 		scroll.Visible = name ~= "Params"
 		paramsPanel.Visible = name == "Params"
-		sort.Visible = name ~= "Params"
+		sort.Visible = true
 		plotTab.Title.TextColor3 = name == "Plot" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		eggsTab.Title.TextColor3 = name == "Backpack" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		paramsTab.Title.TextColor3 = name == "Params" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
@@ -4212,7 +4234,6 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 		missingButton.Visible = activeTab == "Map"
 		pauseButton.Visible = activeTab ~= "Backpack" and activeTab ~= "Plot" and not queuePaused
 		pausedButton.Visible = activeTab ~= "Backpack" and activeTab ~= "Plot" and queuePaused
-		sort.Title.Visible = activeTab ~= "Backpack" and activeTab ~= "Plot"
 		collectionSpacer.Visible = activeTab ~= "Backpack" and activeTab ~= "Plot"
 		for uid, card in pairs(cards) do
 			local checked = selectedEggs[uid] == true
@@ -4421,8 +4442,6 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 			end
 		end
 	end)
-	sort.SelectAll:Destroy()
-	sort.Clear:Destroy()
 	show(true)
 	log("UI_READY", "Interface autonome creee avec carte meilleur oeuf deplacable.")
 	return gui
