@@ -3501,12 +3501,10 @@ local function createInterface()
 	frame.Visible = false
 	local tabs = frame:WaitForChild("TabButtonHolder")
 	local mapTab = tabs:WaitForChild("EggsTab")
-	local queueTab = tabs:WaitForChild("PetsTab")
+	local paramsTab = tabs:WaitForChild("PetsTab")
 	mapTab.Name = "MapTab"
-	queueTab.Name = "QueueTab"
+	paramsTab.Name = "ParamsTab"
 	mapTab.Title.Text = "Map"
-	queueTab.Title.Text = "Queue"
-	local paramsTab = queueTab:Clone()
 	paramsTab.Name = "ParamsTab"
 	paramsTab.Title.Text = "Params"
 	paramsTab.Parent = tabs
@@ -3518,9 +3516,9 @@ local function createInterface()
 	plotTab.Name = "PlotEggsTab"
 	plotTab.Title.Text = "Plot"
 	plotTab.Parent = tabs
-	mapTab.LayoutOrder, queueTab.LayoutOrder, eggsTab.LayoutOrder, plotTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3, 4, 5
+	mapTab.LayoutOrder, eggsTab.LayoutOrder, plotTab.LayoutOrder, paramsTab.LayoutOrder = 1, 2, 3, 4
 	tabs.Size = UDim2.new(tabs.Size.X.Scale * 0.5, tabs.Size.X.Offset * 0.5, tabs.Size.Y.Scale, tabs.Size.Y.Offset)
-	for _, tabButton in ipairs({mapTab, queueTab, eggsTab, plotTab, paramsTab}) do
+	for _, tabButton in ipairs({mapTab, eggsTab, plotTab, paramsTab}) do
 		tabButton.Size = UDim2.fromScale(1, 0)
 		local aspect = tabButton:FindFirstChildOfClass("UIAspectRatioConstraint")
 		if not aspect then aspect = Instance.new("UIAspectRatioConstraint", tabButton) end
@@ -3923,7 +3921,6 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 		for _, entry in ipairs(entries) do
 			if entry.Record or records[entry.Uid] then visibleCount += 1 end
 		end
-		queueTab.Title.Text = "Queue (" .. visibleCount .. ")"
 		for uid in pairs(queueSelection) do
 			if not queuedEggs[uid] then queueSelection[uid] = nil end
 		end
@@ -3962,13 +3959,11 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 		eggsTab.Title.TextColor3 = name == "Backpack" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		paramsTab.Title.TextColor3 = name == "Params" and Color3.new(1,1,1) or Color3.fromRGB(170,180,200)
 		mapTab.Title.TextColor3 = name == "Map" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
-		queueTab.Title.TextColor3 = name == "Queue" and Color3.new(1, 1, 1) or Color3.fromRGB(170, 180, 200)
 		if name == "Queue" and refreshQueueInterface then refreshQueueInterface() end
 		if (name == "Map" or name == "Backpack" or name == "Plot") and refreshEggInterface then refreshEggInterface() end
 		if renderControls then renderControls() end
 	end
 	connect(mapTab.Activated, function() switchTab("Map") end)
-	connect(queueTab.Activated, function() switchTab("Queue") end)
 	connect(paramsTab.Activated, function() switchTab("Params") end)
 	connect(eggsTab.Activated, function() switchTab("Backpack") end)
 	connect(plotTab.Activated, function() switchTab("Plot") end)
