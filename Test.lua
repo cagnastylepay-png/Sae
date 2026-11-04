@@ -3660,6 +3660,33 @@ local function createInterface()
 	scroll.Size = UDim2.fromScale(0.766, 0.67)
 	local template = gui.Assets:WaitForChild("TemplateHolder"):Clone()
 	template.Visible = true
+ local function enlargeEggMetrics(visual)
+ for _,name in ipairs({"Weight","Amount"})do
+  local label=visual:FindFirstChild(name)
+  if label and label:IsA("TextLabel")then
+   label.TextScaled=true
+   label.TextWrapped=false
+   label.Font=Enum.Font.GothamBold
+   label.TextStrokeColor3=Color3.new(0,0,0)
+   label.TextStrokeTransparency=.15
+   local limit=label:FindFirstChildOfClass("UITextSizeConstraint")or Instance.new("UITextSizeConstraint",label)
+   limit.MinTextSize=10
+   limit.MaxTextSize=name=="Weight"and 26 or 32
+   if name=="Weight"then
+    label.AnchorPoint=Vector2.zero
+    label.Position=UDim2.fromScale(.05,.035)
+    label.Size=UDim2.fromScale(.90,.15)
+    label.TextXAlignment=Enum.TextXAlignment.Left
+   else
+    label.AnchorPoint=Vector2.new(.5,1)
+    label.Position=UDim2.fromScale(.5,.76)
+    label.Size=UDim2.fromScale(.92,.18)
+    label.TextXAlignment=Enum.TextXAlignment.Center
+   end
+  end
+ end
+end
+ enlargeEggMetrics(template:WaitForChild("Template"))
 	for _, object in ipairs(scroll:GetChildren()) do
 		if object:IsA("GuiObject") then object:Destroy() end
 	end
