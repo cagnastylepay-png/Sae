@@ -213,8 +213,10 @@ function executorTools.FirePrompt(prompt)
 end
 shared.__AutoSAEExecutorTools = executorTools
 
+executorTools.RemoteLogQueue={}
+executorTools.RemoteLogSequence=0
 local function log(stage, message, ...)
-	local allowed = {ERROR=true, FLIGHT_RESULT=true, REPORT=true, BUTTERFLY=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, FUSION=true, PLOT_PLACE=true, INVENTORY_SELL_REQUEST=true, EGG_TRACK=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
+	local allowed = {ACTION=true, ERROR=true, FLIGHT_RESULT=true, REPORT=true, BUTTERFLY=true, SESSION=true, STOP=true, WALL_HATCH=true, WALL_EQUIP_BEST=true, FUSION=true, PLOT_PLACE=true, INVENTORY_SELL_REQUEST=true, EGG_TRACK=true, SYNC_DIAG=true, CARRY_DIAG=true, SERVER_CHANGE=true, GUARD_CONTROL=true}
 	if not allowed[stage] then
 		return
 	end
@@ -225,6 +227,13 @@ local function log(stage, message, ...)
 	end
 	local line = string.format("[Auto_SAE][%04d][%.3f][%s][%s] %s",
 		sequence, os.clock(), stage, currentCycle and currentCycle.uid or "-", text)
+ if ({ACTION=true,FLIGHT_RESULT=true,WALL_HATCH=true,WALL_EQUIP_BEST=true,FUSION=true,PLOT_PLACE=true,INVENTORY_SELL_REQUEST=true})[stage]then
+	executorTools.RemoteLogSequence+=1
+ table.insert(executorTools.RemoteLogQueue,{sequence=executorTools.RemoteLogSequence,at=os.date("!%Y-%m-%dT%H:%M:%SZ"),text=line:sub(1,4000)})
+ if #executorTools.RemoteLogQueue>2000 then table.remove(executorTools.RemoteLogQueue,1)end
+ if FusionModules.Reporting and FusionModules.Reporting.ScheduleLogs then FusionModules.Reporting.ScheduleLogs()end
+
+ end
 	table.insert(debugLogLines, line)
 	table.insert(pendingLogLines, line)
 	if #debugLogLines > 1000 then table.remove(debugLogLines, 1) end
@@ -797,12 +806,25 @@ do
   report.Token=type(options.Token)=="string" and options.Token or nil
  end
  report.SessionId=HttpService:GenerateGUID(false)
+ function report.ScheduleLogs()
+  if report.LogScheduled or destroyed or not report.Ready or not report.LogIdentityReady or not report.Socket or #executorTools.RemoteLogQueue==0 then return end
+  report.LogScheduled=true
+  task.delay(1,function()
+   report.LogScheduled=false
+   if destroyed or not report.Ready or not report.LogIdentityReady or not report.Socket or #executorTools.RemoteLogQueue==0 then return end
+   local batch={}
+   for i=1,math.min(100,#executorTools.RemoteLogQueue)do batch[i]=executorTools.RemoteLogQueue[i]end
+   pcall(function()report.Socket:Send(HttpService:JSONEncode({version=1,type="logs.append",sessionId=report.SessionId,lines=batch}))end)
+   task.delay(5,function()report.ScheduleLogs()end)
+  end)
+ end
  function report.Log(message,...)
   log("REPORT",message,...)
  end
  function report.Disconnect()
   report.Serial+=1
   report.Ready=false
+  report.LogIdentityReady=false
   report.PendingRevision=nil
   for _,connection in ipairs(report.Connections) do pcall(function()connection:Disconnect()end) end
   table.clear(report.Connections)
@@ -972,8 +994,15 @@ do
       report.LastAck=os.clock()
       if message.revision==report.PendingRevision then report.PendingRevision=nil end
       report.Log("Accuse Cycle=%s Revision=%s Accepte=%s",tostring(message.cycleId),tostring(message.revision),tostring(message.accepted))
+     elseif message.type=="logs.ack" and message.sessionId==report.SessionId then
+      local upto=tonumber(message.sequence)
+      if upto then
+       while executorTools.RemoteLogQueue[1]and executorTools.RemoteLogQueue[1].sequence<=upto do table.remove(executorTools.RemoteLogQueue,1)end
+      end
+      report.ScheduleLogs()
      elseif message.type=="players.ack" then
       report.LastPlayersAck=os.clock()
+      if message.accepted then report.LogIdentityReady=true;report.ScheduleLogs()end
      elseif message.type=="error" then
       report.Log("Erreur serveur : %s",tostring(message.message))
      end
@@ -1932,6 +1961,7 @@ local function runCycle(record, rate, recovering, findNext)
 	ctx.movementLock = {Owner = "Auto_SAE", Character = character, Generation = generation}
 	shared.__AutoSAEMovementLock = ctx.movementLock
 	currentCycle = ctx
+ log("ACTION",'Vol de "%s" en cours',getAnimalName(record))
 	log("TARGET", "Animal=%s Revenu=%s/s Home=%s Recovery=%s",
 		getAnimalName(record), formatNumber(rate or 0), FusionModules.Helpers.formatPosition(ctx.home), tostring(recovering))
 	local cycleOK, completed, failure = xpcall(function()
@@ -2354,7 +2384,7 @@ local function hatchReadyEggsOnWallClose(token)
 			local activated, accepted, reason = pcall(PlacedEggRenderer.ActivateLocalEgg, uid)
 			hatchInProgress = false
 			if activated and accepted == true then opened += 1 end
-			log("WALL_HATCH", "UID=%s Accepte=%s Raison=%s", uid, tostring(activated and accepted == true), tostring(activated and reason or accepted))
+			log("WALL_HATCH", "Ouverture de %s UID=%s Accepte=%s Raison=%s", getAnimalName(latest), uid, tostring(activated and accepted == true), tostring(activated and reason or accepted))
 		end
 	end
 	return opened
@@ -2509,7 +2539,7 @@ local function placeInventoryEggs(selection, token, opened)
 				if not request.done then summary="Placement en attente du serveur : aucun nouvel envoi"; break end
 				if not request.ok or request.accepted~=true then
 					summary="Placement refuse : "..tostring(request.ok and request.reason or request.accepted)
-					log("PLOT_PLACE","UID=%s %s",uid,summary)
+					log("PLOT_PLACE","Placement de %s UID=%s %s",getAnimalName(egg),uid,summary)
 					break
 				end
 				table.insert(reserved,point)
@@ -2521,7 +2551,7 @@ local function placeInventoryEggs(selection, token, opened)
 					if confirmed or not valid() or os.clock()>=deadline then break end
 					task.wait(0.05)
 				until false
-				log("PLOT_PLACE","UID=%s Accepte=true Confirme=%s",uid,tostring(confirmed))
+				log("PLOT_PLACE","Placement de %s UID=%s Accepte=true Confirme=%s",getAnimalName(egg),uid,tostring(confirmed))
 				if not confirmed then summary="Placement accepte : confirmation inventaire en attente"; break end
 				placed+=1
 				if selection then selection[uid]=nil end
@@ -2573,7 +2603,11 @@ local function sellInventoryEggsBelowMinimum(token)
 				if allowed[ids[i]] then table.insert(batch,ids[i]) end
 			end
 			if #batch>0 then
-				EggSaleRemote:FireServer({Assets={},Eggs=batch})
+				local saleNames={}
+                local snapshot=inventoryEggRecords()
+                for _,uid in ipairs(batch)do table.insert(saleNames,getAnimalName(snapshot[uid]or{}).." ("..uid..")")end
+                EggSaleRemote:FireServer({Assets={},Eggs=batch})
+                log("INVENTORY_SELL_REQUEST","Vente envoyee : %s",table.concat(saleNames,", "))
 				log("INVENTORY_SELL_REQUEST","Oeufs=%d Revenu < %s/s | confirmation via inventaire",#batch,formatNumber(minimumRatePerSecond))
 			end
 			if offset+512<=#ids then task.wait() end
@@ -2908,6 +2942,7 @@ function FusionModules.Butterflies.Idle(token)
  end
  autoActivity="BUTTERFLIES"
  log("BUTTERFLY","Centre rejoint : filet equipe jusqu'au prochain cycle")
+ log("ACTION","Collecte des papillons en cours")
  setStatus("Papillons : filet equipe jusqu'au prochain cycle d'oeufs.")
  while FusionModules.Options.AutoPapillon and activityValid(token,character) and automaticMode and not stopAfterFlight
   and b.Revision==revision and Workspace:GetServerTimeNow()<b.Until do
@@ -2916,6 +2951,7 @@ function FusionModules.Butterflies.Idle(token)
   if net.Parent~=character then humanoid:EquipTool(net) end
   task.wait(CONFIG.ScanInterval)
  end
+ log("ACTION","Collecte des papillons terminee")
  stopMovement(true)
  autoActivity="IDLE"
  activityRecheckPending=true
