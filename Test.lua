@@ -73,7 +73,13 @@ local FusionModules = {}
 FusionModules.Helpers = {}
 FusionModules.Options={AutoEggs=true,AutoEggsMin=2e9,AutoEggsMax=999e9,
  AutoTreadmill=true,AutoSell=true,AutoSellMin=0,AutoSellMax=2e9,
- AutoFuse=true,AutoOpen=true,AutoOpenMin=0,AutoOpenMax=20e9,AutoPlace=true,AutoPapillon=true,AutoIndex=true}
+ AutoFuse=true,AutoFuseMin=0,AutoFuseMax=1e33,AutoOpen=true,AutoOpenMin=0,AutoOpenMax=20e9,AutoPlace=true,AutoPlaceMin=2e9,AutoPlaceMax=1e33,AutoPapillon=true,AutoIndex=true}
+
+function FusionModules.Helpers.InIncomeRange(key,rate)
+ return type(rate)=="number"and rate==rate and rate<math.huge
+  and rate>=FusionModules.Options[key.."Min"]and rate<=FusionModules.Options[key.."Max"]
+end
+
 function FusionModules.Helpers.SetOption(key,value)
  local current=FusionModules.Options[key]
  if current==nil then return false,"Parametre inconnu"end
@@ -103,7 +109,7 @@ function FusionModules.Helpers.RestoreOptions(saved)
    candidate[key]=value
   end
  end
- if candidate.AutoEggsMin>candidate.AutoEggsMax or candidate.AutoSellMin>candidate.AutoSellMax or candidate.AutoOpenMin>candidate.AutoOpenMax then return false end
+ if candidate.AutoEggsMin>candidate.AutoEggsMax or candidate.AutoSellMin>candidate.AutoSellMax or candidate.AutoOpenMin>candidate.AutoOpenMax or candidate.AutoPlaceMin>candidate.AutoPlaceMax or candidate.AutoFuseMin>candidate.AutoFuseMax then return false end
  FusionModules.Options=candidate
  minimumRatePerSecond=candidate.AutoEggsMin;autoIncludeMissingIndex=candidate.AutoIndex;automaticMode=true
  return true
@@ -287,6 +293,7 @@ local function loadSettings()
  FusionModules.Options.AutoEggsMin=minimumRatePerSecond
  FusionModules.Options.AutoSellMax=minimumRatePerSecond
  FusionModules.Options.AutoOpenMax=openBelowRate
+ FusionModules.Options.AutoPlaceMin=minimumRatePerSecond
  FusionModules.Options.AutoIndex=automaticMode and autoIncludeMissingIndex
  if type(settings.Settings)=="table"then
   if not FusionModules.Helpers.RestoreOptions(settings.Settings)then warn("[Auto_SAE] Parametres invalides : valeurs migrees conservees")end
@@ -2370,7 +2377,7 @@ function FusionModules.Helpers.inventoryPlacementOrder(eggs, selection)
 	for uid, egg in pairs(eggs) do
 		local rate=getRatePerSecond(egg)
 		if not egg.InventoryPlaced and egg.Placement == nil and type(rate)=="number" and rate==rate
-			and rate>=minimumRatePerSecond and rate<math.huge and (not selection or selection[uid]) then
+			and FusionModules.Helpers.InIncomeRange("AutoPlace",rate) and (not selection or selection[uid]) then
 			table.insert(ids, uid)
 		end
 	end
@@ -2478,7 +2485,7 @@ local function placeInventoryEggs(selection, token, opened)
 			local egg=eggs[uid]
 			local rate=egg and getRatePerSecond(egg)
 			if egg and not egg.InventoryPlaced and egg.Placement==nil and type(rate)=="number"
-				and rate==rate and rate>=minimumRatePerSecond and rate<math.huge then
+				and FusionModules.Helpers.InIncomeRange("AutoPlace",rate) then
 				local localFrame, point=findPlotEggSpot(plot,eggs,reserved)
 				if not localFrame then summary="Aucun emplacement libre detecte"; break end
 				local request={done=false}
@@ -2488,6 +2495,10 @@ local function placeInventoryEggs(selection, token, opened)
 						local equipped,why=EggState.WearEggTool(uid)
 						if equipped~=true then return false,why end
 						if not valid() then return false,"Placement annule" end
+                        local latest=EggState.ReadOwnedEgg(player.UserId,uid)
+                        if not latest or latest.Placement~=nil or not FusionModules.Helpers.InIncomeRange("AutoPlace",getRatePerSecond(latest))then
+                         return false,"Oeuf hors plage ou indisponible"
+                        end
 						return EggState.PlantEgg(uid,localFrame)
 					end)
 					request.done=true
@@ -2588,7 +2599,7 @@ local function fusionBackpackGroups(profile, pen)
 				local decoded,item=pcall(FusionModules.Items.Decode,saved)
 				local rated,rate=false,nil
 				if decoded then rated,rate=pcall(AssetEarnings.RatePerSecond,item) end
-				if rated and type(rate)=="number" and rate==rate and rate>=0 and rate<math.huge then
+				if rated and FusionModules.Helpers.InIncomeRange("AutoFuse",rate) then
 					local key=item.Category.."|"..tostring(saved.CreatorTemporary==true)
 					groups[key]=groups[key] or {Category=item.Category,Temporary=saved.CreatorTemporary==true,Items={}}
 					table.insert(groups[key].Items,{Uid=uid,Item=item,Rate=rate})
@@ -2706,6 +2717,12 @@ FusionModules.Run = function(token)
 					local verified,allowed=false,false
 					if saved and not equipped[uid] then verified,allowed=pcall(FusionModules.Kernel.MayEnterFuse,uid,saved,group.Category,false,group.Temporary) end
 					stillEligible=verified and allowed==true
+                    if stillEligible then
+                     local decoded,item=pcall(FusionModules.Items.Decode,saved)
+                     local rated,rate=false,nil
+                     if decoded then rated,rate=pcall(AssetEarnings.RatePerSecond,item)end
+                     stillEligible=rated and FusionModules.Helpers.InIncomeRange("AutoFuse",rate)
+                    end
 				end
 				if not stillEligible then error("Animal devenu indisponible : "..uid) end
 				local replied,accepted,reason=callFusion(FusionModules.Remotes.LoadPet,uid,false)
@@ -2723,6 +2740,13 @@ FusionModules.Run = function(token)
 			local latest=fusionProfile()
 			if not latest or #(latest.FusionSlots or {})~=3 then error("Les trois animaux ne sont pas confirmes") end
 			for _,uid in ipairs(latest.FusionSlots) do if not table.find(loaded,uid) then error("Selection de fusion modifiee") end end
+            for _,uid in ipairs(loaded)do
+             local saved=latest.Inventory and latest.Inventory[uid]
+             local decoded,item=pcall(FusionModules.Items.Decode,saved)
+             local rated,rate=false,nil
+             if decoded then rated,rate=pcall(AssetEarnings.RatePerSecond,item)end
+             if not rated or not FusionModules.Helpers.InIncomeRange("AutoFuse",rate)then error("Animal hors plage de revenu : "..uid)end
+            end
 			local replied,accepted,reason,reward=callFusion(FusionModules.Remotes.BeginFuse)
 			if not replied or accepted~=true then error("BeginFuse : "..tostring(reason or accepted)) end
 			committed=true
@@ -3558,8 +3582,8 @@ function FusionModules.Helpers.BuildParamsPanel(panel, connect, getOptions, setO
  for _,spec in ipairs({
   {"AutoEggs","AutoEggs",true},{"AutoIndex","AutoIndex — Manquants"},
   {"AutoTreadmill","AutoTreadmill"},{"AutoPapillon","AutoPapillon"},
-  {"AutoSell","AutoSell",true},{"AutoFuse","AutoFuse"},
-  {"AutoOpen","AutoOpen",true},{"AutoPlace","AutoPlace"}
+  {"AutoSell","AutoSell",true},{"AutoFuse","AutoFuse",true},
+  {"AutoOpen","AutoOpen",true},{"AutoPlace","AutoPlace",true}
  })do
   order+=1
   local key,title,ranges=spec[1],spec[2],spec[3]
