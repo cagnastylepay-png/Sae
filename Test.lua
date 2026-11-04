@@ -73,7 +73,7 @@ local FusionModules = {}
 FusionModules.Helpers = {}
 FusionModules.Options={AutoEggs=true,AutoEggsMin=2e9,AutoEggsMax=999e9,
  AutoTreadmill=true,AutoSell=true,AutoSellMin=0,AutoSellMax=2e9,
- AutoFuse=true,AutoOpen=true,AutoPlace=true,AutoPapillon=true,AutoIndex=true}
+ AutoFuse=true,AutoOpen=true,AutoOpenMin=0,AutoOpenMax=20e9,AutoPlace=true,AutoPapillon=true,AutoIndex=true}
 function FusionModules.Helpers.SetOption(key,value)
  local current=FusionModules.Options[key]
  if current==nil then return false,"Parametre inconnu"end
@@ -103,7 +103,7 @@ function FusionModules.Helpers.RestoreOptions(saved)
    candidate[key]=value
   end
  end
- if candidate.AutoEggsMin>candidate.AutoEggsMax or candidate.AutoSellMin>candidate.AutoSellMax then return false end
+ if candidate.AutoEggsMin>candidate.AutoEggsMax or candidate.AutoSellMin>candidate.AutoSellMax or candidate.AutoOpenMin>candidate.AutoOpenMax then return false end
  FusionModules.Options=candidate
  minimumRatePerSecond=candidate.AutoEggsMin;autoIncludeMissingIndex=candidate.AutoIndex;automaticMode=true
  return true
@@ -286,6 +286,7 @@ local function loadSettings()
  end
  FusionModules.Options.AutoEggsMin=minimumRatePerSecond
  FusionModules.Options.AutoSellMax=minimumRatePerSecond
+ FusionModules.Options.AutoOpenMax=openBelowRate
  FusionModules.Options.AutoIndex=automaticMode and autoIncludeMissingIndex
  if type(settings.Settings)=="table"then
   if not FusionModules.Helpers.RestoreOptions(settings.Settings)then warn("[Auto_SAE] Parametres invalides : valeurs migrees conservees")end
@@ -2328,7 +2329,7 @@ local function hatchReadyEggsOnWallClose(token)
 		if type(uid) == "string" and type(record) == "table" and record.Placement ~= nil then
 			local valid, grown = pcall(EggGrowthPolicy.IsReady, record, 0)
 			local rate = getRatePerSecond(record)
-			if valid and grown and rate and rate < openBelowRate then table.insert(readyUids, uid) end
+			if valid and grown and rate and rate >= FusionModules.Options.AutoOpenMin and rate <= FusionModules.Options.AutoOpenMax then table.insert(readyUids, uid) end
 		end
 	end
 	table.sort(readyUids)
@@ -2340,7 +2341,7 @@ local function hatchReadyEggsOnWallClose(token)
 			readyOK, grown = pcall(EggGrowthPolicy.IsReady, latest, 0)
 		end
 		local rate = readOK and type(latest) == "table" and getRatePerSecond(latest)
-		if readyOK and grown and rate and rate < openBelowRate then
+		if readyOK and grown and rate and rate >= FusionModules.Options.AutoOpenMin and rate <= FusionModules.Options.AutoOpenMax then
 			hatchInProgress = true
 			setStatus("Mur ferme : ouverture des oeufs prets...")
 			local activated, accepted, reason = pcall(PlacedEggRenderer.ActivateLocalEgg, uid)
@@ -3558,7 +3559,7 @@ function FusionModules.Helpers.BuildParamsPanel(panel, connect, getOptions, setO
   {"AutoEggs","AutoEggs",true},{"AutoIndex","AutoIndex — Manquants"},
   {"AutoTreadmill","AutoTreadmill"},{"AutoPapillon","AutoPapillon"},
   {"AutoSell","AutoSell",true},{"AutoFuse","AutoFuse"},
-  {"AutoOpen","AutoOpen"},{"AutoPlace","AutoPlace"}
+  {"AutoOpen","AutoOpen",true},{"AutoPlace","AutoPlace"}
  })do
   order+=1
   local key,title,ranges=spec[1],spec[2],spec[3]
@@ -3605,6 +3606,33 @@ function FusionModules.Helpers.BuildParamsPanel(panel, connect, getOptions, setO
  end
  refresh()
  return refresh
+end
+
+
+function FusionModules.Helpers.StyleTabs(frame,active)
+ local names={Map="Map",Backpack="Backpack",Plot="Plot",Params="Params"}
+ for _,spec in ipairs({
+ {"MapTab","Map",Color3.fromRGB(126,230,72),Color3.fromRGB(37,143,97)},
+ {"BackpackTab","Backpack",Color3.fromRGB(73,192,255),Color3.fromRGB(64,87,208)},
+ {"PlotEggsTab","Plot",Color3.fromRGB(255,201,79),Color3.fromRGB(224,119,48)},
+ {"ParamsTab","Params",Color3.fromRGB(202,133,255),Color3.fromRGB(117,69,196)}
+ })do
+  local button=frame.TabButtonHolder:FindFirstChild(spec[1])
+  if button then
+   button.BackgroundColor3=Color3.new(1,1,1)
+   button.BackgroundTransparency=active==spec[2]and 0 or .2
+   button:SetAttribute("TabName",spec[2])
+   for _,child in ipairs(button:GetDescendants())do
+    if child:IsA("TextLabel")or child:IsA("TextButton")then child.Text="";child.Visible=false end
+   end
+   local gradient=button:FindFirstChildOfClass("UIGradient")or Instance.new("UIGradient",button)
+   gradient.Color=ColorSequence.new(spec[3],spec[4]);gradient.Rotation=45
+  end
+ end
+ for _,name in ipairs({"Title","Title2Stroke"})do
+  local title=frame.Header:FindFirstChild(name)
+  if title then title.Text="Auto Eggs — "..(names[active]or active)end
+ end
 end
 
 local function createInterface()
@@ -3786,7 +3814,7 @@ local function createInterface()
 	local header = frame:WaitForChild("Header")
 	for _, name in ipairs({"Title", "Title2Stroke"}) do
 		local title = header:FindFirstChild(name)
-		if title then title.Text = "Auto Eggs" end
+		if title then title.Text = "Auto Eggs — Map" end
 	end
 	local info = frame:WaitForChild("SellInfoHolder")
 	info.Title.Text = "Selection :"
@@ -4119,6 +4147,7 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 
 	local function switchTab(name)
 		activeTab = name
+        FusionModules.Helpers.StyleTabs(frame,name)
 		selectedEggs = name == "Queue" and queueSelection or (name == "Backpack" and inventorySelection or (name == "Plot" and plotSelection or mapSelection))
 		scroll.Visible = name ~= "Params"
 		paramsPanel.Visible = name == "Params"
@@ -4145,7 +4174,7 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 	local function updateSelection()
 		for _, name in ipairs({"Title", "Title2Stroke"}) do
 			local title = header:FindFirstChild(name)
-			if title then title.Text = "Auto Eggs" end
+			if title then title.Text = "Auto Eggs — "..activeTab end
 		end
 		local count = countSelected()
 		info.Value.Text = activeTab == "Params" and ("AUTO >= " .. formatNumber(minimumRatePerSecond) .. "/s") or (tostring(count) .. (count == 1 and " oeuf" or " oeufs"))
