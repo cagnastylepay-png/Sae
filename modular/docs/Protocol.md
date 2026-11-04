@@ -1,37 +1,49 @@
-# Protocole proposé : AutoSAE v1
+# AutoSAE : protocole WebSocket v1
 
-Transport JSON WebSocket, futur chemin /sae/ws. Non branché dans cette étape.
-Les modules accèdent au transport commun via NotreLib ; pas de socket supplémentaire par module.
+Transport JSON texte : wss://m4gix-ws.onrender.com/sae/ws.
+Test.lua implémente temporairement le client. Les modules modular/ restent des squelettes.
+Une connexion par session ; aucune commande distante et GO désactivé.
 
-## eggs.snapshot
+## Connexion
 
-Envoi à chaque réinitialisation une fois les données du nouveau cycle reçues.
-Aussi à la première connexion et à la reconnexion, pour rattraper un reset manqué.
-Un snapshot vide remplace les anciens œufs de ce serveur/cycle.
-Observer le reset ET FieldRefreshed ; ne pas envoyer le snapshot du cycle précédent au signal de fermeture.
-Après reset, un premier snapshot complet puis des révisions peuvent corriger les arrivées tardives.
+Premier message : {version:1,type:"hello",role:"reporter"|"viewer",token?:string}.
+Réponse : {version:1,type:"hello.ack",role}.
+Les clés sont optionnelles en test anonyme. SAE_REPORT_TOKEN et SAE_VIEW_TOKEN
+activent la restriction correspondante sur Render. Les clés restent hors Git et logs.
+Le navigateur renseigne la clé de lecture en mémoire. Le reporter la lit dans
+shared.__AutoSAEReportingOptions.Token avant lancement ; aucune sauvegarde du token.
+Un viewer ne peut pas publier. Aucun message reçu ne peut exécuter du Lua.
+
+## eggs.snapshot (reporter -> serveur)
 
 Champs : version=1, type="eggs.snapshot", moduleId="EggReporter", sessionId,
-placeId (chaîne), jobId, cycleId (chaîne), revision (entier croissant par session/cycle),
-observedAt (date ISO UTC), eggs (liste).
+placeId (chaîne), jobId, cycleId (chaîne numérique), revision (entier >=1),
+observedAt (ISO UTC), eggs (liste).
 Œuf : uid, category, name, rarity (Divine/Eternal/Secret), weightKg et incomePerSecond
-(nombre fini >=0 ou null si inconnu). Ne jamais remplacer une donnée inconnue par zéro.
+(nombre fini >=0 ou null). Les métriques inconnues ne deviennent jamais zéro.
 
-L'envoi n'applique pas le minimum de collecte ni le filtre Manquants.
-Le serveur conserve des observations par session et serveur/cycle ; il ne compare pas les numéros
-de révision de deux sessions différentes. Déduplication de l'affichage par placeId/jobId/cycleId/uid.
-Les snapshots périmés doivent être ignorés et les anciennes sessions expirer.
-Ne pas comparer les poids de deux serveurs sans vérifier le cycle.
+Tous les œufs de ces trois raretés sont signalés, sans appliquer le seuil de collecte
+ni le filtre Manquants. Après reset, attendre RarityRevealed.PeriodIndex et le batch
+officiel ; relire le snapshot du jeu et regrouper les modifications.
+Publier à la connexion, à chaque reset, aux changements de données utiles et toutes les
+60 secondes pour renouveler les observations. Réémission forcée après reconnexion.
 
-## Dashboard
+## Accusé et affichage
 
-Le futur serveur publiera eggs.state aux abonnés autorisés : affichage dans Eggs,
-revenu décroissant et filtre par rareté/cycle, avec serveur et heure de dernière observation.
-Le bouton GO apparaît désactivé. Aucune commande distante n'est définie pour l'instant.
+Réponse : {version:1,type:"eggs.ack",sessionId,cycleId,revision,accepted}.
+Les révisions sont comparées par session/serveur/cycle. Les cycles plus anciens sont rejetés.
+Le dernier snapshot complet reçu remplace celui du serveur, même si eggs est vide.
+Les viewers reçoivent {version:1,type:"eggs.state",serverCount,eggs}.
+Chaque ligne inclut placeId/jobId/cycleId et les heures d'observation/réception.
+Le stockage mémoire expire après 10 minutes, borne à 100 serveurs et 200 œufs par snapshot.
+Le serveur ignore un snapshot ancien/dupliqué ; les autres erreurs donnent type="error".
+Le mode anonyme et les données clientes ne constituent aucune preuve d'autorité.
 
-## Avant activation
+## Disponibilité
 
-Réutiliser l'authentification existante du dashboard ; définir séparément l'authentification
-des clients Roblox avant de monter /sae/ws. Ne pas mettre de secret dans ce dépôt public.
-Prévoir taille maximale, validation des messages, limite de fréquence, ping/pong et
-reconnexion avec temporisation. Les clients sont des sources d'observation non autoritaires.
+Connexion initiale et reconnexion en tâche séparée, temporisation 2..60 s,
+attente de connexion jusqu'à 65 s pour le réveil de Render ; hello.ack sous 15 s
+et eggs.ack sous 20 s. Le transport ne bloque pas l'Auto.
+Logs [REPORT] persistés avec le reste des logs.
+API de test : shared.__AutoSAEController.Reporting.MarkDirty(0).
+Une instance fermée/remplacée déconnecte son socket et ses abonnements.
