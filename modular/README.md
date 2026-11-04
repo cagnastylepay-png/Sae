@@ -40,7 +40,7 @@ La collecte, le reporting et le futur bouton GO restent trois responsabilités d
 
 ## Serveur
 
-Dépôt : cagnastylepay-png/Render, dossier sae/.
+Dépôt : cagnastylepay-png/Render, nouvelle base à la racine (server.js, src/, public/, protocol/).
 Hôte fourni : https://m4gix-ws.onrender.com ; futur chemin /sae/ws (pas encore enregistré).
-Le dashboard Eggs sera intégré après validation du protocole ; GO reste désactivé.
-Aucun déploiement ni branchement au serveur actuel dans cette étape.
+Une page Eggs préparatoire et /health sont disponibles dans la nouvelle base Node ; GO reste désactivé.
+Le WebSocket et la remontée des œufs ne sont pas encore branchés.
