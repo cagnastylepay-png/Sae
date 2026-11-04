@@ -3492,6 +3492,17 @@ local function createInterface()
 		if descendant:IsA("BaseScript") then descendant:Destroy() end
 	end
 	local frame = gui:WaitForChild("Frame")
+ -- Fixed HD design dimensions; scale the complete hierarchy uniformly.
+ local referenceSize=frame:GetAttribute("HDReferenceSize")
+ if typeof(referenceSize)~="Vector2"then
+  referenceSize=Vector2.new(frame.Size.X.Scale*1920+frame.Size.X.Offset,frame.Size.Y.Scale*1080+frame.Size.Y.Offset)
+  frame:SetAttribute("HDReferenceSize",referenceSize)
+ end
+ frame.Size=UDim2.fromOffset(referenceSize.X,referenceSize.Y)
+ local displayScale=frame:FindFirstChild("ResolutionScale")or Instance.new("UIScale")
+ displayScale.Name="ResolutionScale";displayScale.Parent=frame
+ gui:SetAttribute("ReferenceResolution",Vector2.new(1920,1080))
+
 	frame.Visible = false
 	local tabs = frame:WaitForChild("TabButtonHolder")
 	local mapTab = tabs:WaitForChild("EggsTab")
@@ -3663,7 +3674,7 @@ local function createInterface()
 	scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 	scroll.CanvasSize = UDim2.new()
 	local function resizeGrid()
-		local width = math.max(scroll.AbsoluteSize.X - scroll.ScrollBarThickness - 12, 120)
+		local width = math.max(scroll.AbsoluteSize.X / math.max(displayScale.Scale, .01) - scroll.ScrollBarThickness - 12, 120)
 		local columns = math.max(1, math.floor((width + 10) / 130))
 		local side = math.floor((width - (columns - 1) * 10) / columns)
 		grid.CellSize = UDim2.fromOffset(side, side + 25)
@@ -3762,6 +3773,7 @@ local function createInterface()
 				local x = math.clamp(dragPosition.X.Scale * viewport.X + dragPosition.X.Offset + delta.X, minX, viewport.X)
 				local y = math.clamp(dragPosition.Y.Scale * viewport.Y + dragPosition.Y.Offset + delta.Y, 0, math.max(0, viewport.Y-mainCard.AbsoluteSize.Y))
 				mainCard.Position = UDim2.fromOffset(x, y)
+    gui:SetAttribute("LauncherPositionNormalized",Vector2.new(x/math.max(viewport.X,1),y/math.max(viewport.Y,1)))
 			end
 		end
 	end)
@@ -3774,6 +3786,24 @@ local function createInterface()
 	connect(openCard.Activated, function()
 		if not moved and os.clock() >= suppressClickUntil then show(not frame.Visible) end
 	end)
+local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("UIScale")
+ launcherScale.Name="ResolutionScale";launcherScale.Parent=mainCard
+ local function resizeDisplay()
+  local viewport=gui.AbsoluteSize
+  if viewport.X<=0 or viewport.Y<=0 then return end
+  local scale=math.max(.01,math.min(viewport.X/1920,viewport.Y/1080))
+  displayScale.Scale=scale;launcherScale.Scale=scale
+  local normalized=gui:GetAttribute("LauncherPositionNormalized")
+  if typeof(normalized)=="Vector2"then
+   mainCard.Position=UDim2.fromOffset(
+    math.clamp(normalized.X*viewport.X,math.min(120*scale,viewport.X),viewport.X),
+    math.clamp(normalized.Y*viewport.Y,0,math.max(0,viewport.Y-145*scale)))
+  else mainCard.Position=UDim2.new(1,-16*scale,0,16*scale)end
+  resizeGrid()
+ end
+ connect(gui:GetPropertyChangedSignal("AbsoluteSize"),resizeDisplay)
+ resizeDisplay()
+
 	refreshBestEggCard = function()
 		if destroyed or not ready then return end
 		local best, bestRate
