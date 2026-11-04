@@ -146,7 +146,7 @@ local PlacedEggRenderer, EggGrowthPolicy
 local hatchInProgress = false
 local wallMaintenancePending = false
 local HaulRemotes
-local lastEquipBestAt = -math.huge
+-- Equip Best is keyed to the game's egg cycle, independent of inventory maintenance.
 local activityRecheckPending = false
 local refreshBestEggCard
 local treadmillAssigned, treadmillPending = false, false
@@ -2858,6 +2858,24 @@ function FusionModules.AcknowledgeReward(reward)
  return true
 end
 
+
+FusionModules.EquipBestCycle={Busy=false}
+function FusionModules.Helpers.EquipBestForCycle()
+ local state=FusionModules.EquipBestCycle
+ if state.Busy or not HaulRemotes or not AreaEggCycle or not ServerClock then return false end
+ local clockOK,cycle=pcall(function()return AreaEggCycle.ActivePeriodIndexAt(ServerClock.Now())end)
+ if not clockOK or type(cycle)~="number"or cycle~=cycle or math.abs(cycle)==math.huge then return false end
+ if state.Attempted==cycle then return state.Succeeded==cycle end
+ -- Reserve before yielding to the server so concurrent maintenance cannot duplicate it.
+ state.Attempted=cycle;state.Busy=true
+ setStatus("Cycle d'oeufs : Equip Best...")
+ local ok,accepted,reason=pcall(function()return HaulRemotes.WearBest:InvokeServer()end)
+ state.Busy=false
+ if ok and accepted==true then state.Succeeded=cycle end
+ log("WALL_EQUIP_BEST","Cycle=%s Accepte=%s Raison=%s",tostring(cycle),tostring(ok and accepted==true),tostring(ok and reason or accepted))
+ return ok and accepted==true
+end
+
 local function serviceWallMaintenance(token)
 	if destroyed or not automaticMode or not autoEnabled or generation ~= token or currentCycle or FusionModules.Pending() or inventoryPlacementBusy or placementRequest then return end
     if FusionModules.YieldToSpawnedEggs() then return end
@@ -2872,19 +2890,15 @@ local function serviceWallMaintenance(token)
 	if destroyed or not autoEnabled or generation~=token or queuePaused or FusionModules.YieldToSpawnedEggs() then return end
 	placeInventoryEggs(nil,token,opened)
 	if destroyed or not autoEnabled or generation ~= token or queuePaused or placementRequest or FusionModules.YieldToSpawnedEggs() then return end
-	if HaulRemotes and os.clock() - lastEquipBestAt >= 5 then
-		lastEquipBestAt = os.clock()
-		setStatus("Mur ferme : Equip Best...")
-		local ok, accepted, reason = pcall(function() return HaulRemotes.WearBest:InvokeServer() end)
-		log("WALL_EQUIP_BEST", "Accepte=%s Raison=%s", tostring(ok and accepted == true), tostring(ok and reason or accepted))
-		if ok and accepted==true and FusionModules.Ready then
-            local fusionOK=FusionModules.Protect("FUSION_ACTION",FusionModules.Run,token)
-            if not fusionOK then
-                if FusionModules.Pending() then stopAutomation("Fusion interrompue : verification requise dans le log")
-                else FusionModules.Ready=false end
-            end
+	if FusionModules.Helpers.EquipBestForCycle() and FusionModules.Ready
+        and not destroyed and autoEnabled and generation==token and not queuePaused
+        and not FusionModules.YieldToSpawnedEggs() then
+        local fusionOK=FusionModules.Protect("FUSION_ACTION",FusionModules.Run,token)
+        if not fusionOK then
+            if FusionModules.Pending() then stopAutomation("Fusion interrompue : verification requise dans le log")
+            else FusionModules.Ready=false end
         end
-	end
+    end
 end
 
 
