@@ -1,4 +1,4 @@
-print("[Auto_SAE] Build reporting-v1")
+print("[Auto_SAE] Build reporting-v2")
 -- Auto_SAE v2.8. SellPrompt selection UI. Verified client contracts; no character/anticheat replacement.
 -- The live game must provide ReplicatedStorage.Client/Data/Shared.
 -- Refresh outbound MoveTo before its native timeout; verify distance before carry.
@@ -774,12 +774,39 @@ do
   local now=ServerClock.Now()
   local cycle=report.Cycle or tostring(AreaEggCycle.ActivePeriodIndexAt(now))
   local eggs={}
-  for uid,record in pairs(records) do
+  local observed=table.clone(records)
+  for uid in pairs(trackedEggs) do
+   if not observed[uid] then local record=readField(uid);if record then observed[uid]=record end end
+  end
+  for uid,record in pairs(observed) do
    local rarity=getRarityName(record)
-   if rarity=="Divine" or rarity=="Eternal" or rarity=="Secret" then
+   if rarity=="Divine" or rarity=="Eternal" or rarity=="Secret" or rarity=="Cosmic" then
     local rate=getRatePerSecond(record)
     local weight=getWeightKg(record)
-    local entry={uid=uid,category=record.AssetCategory,name=getAnimalName(record),rarity=rarity}
+    local entry={uid=uid,category=record.AssetCategory,name=getAnimalName(record),rarity=rarity,
+     state=record.State,areaId=record.AreaId and tostring(record.AreaId),zone=record.Zone and tostring(record.Zone),
+     assetScale=record.AssetScale,nestId=record.NestId,nestScale=record.NestScale,eyeColor=record.AssetEyeColor,
+     colorSeed=record.AssetColorSeed,colorIndex=record.AssetColorIndex,version=record.Version,droppedAt=record.DroppedAt,hasParasite=record.HasParasite==true,baseMutation=record.BaseMutation,gender=record.AssetGender,
+     personality=record.AssetPersonality,skin=record.EggSkin,ownerUserId=record.OwnerUserId,carrierUserId=record.CarrierUserId,
+     observationOnly=record.ObservationOnly==true}
+    if type(record.Mutations)=="table" then entry.mutations=table.clone(record.Mutations) end
+    if typeof(record.BottomCFrame)=="CFrame" then
+     local pos=record.BottomCFrame.Position
+     entry.position={x=pos.X,y=pos.Y,z=pos.Z}
+     entry.cframe={record.BottomCFrame:GetComponents()}
+    end
+    local config=Assets.Directory[record.AssetCategory]
+    if config and config.Egg then entry.icon=config.Egg.Icon end
+    local valued,value=pcall(EggRecords.SellPrice,record)
+    if not valued then
+     valued,value=pcall(function()
+      local item=EggRecords.ToAssetItemData(record)
+      item.Mutations={}
+      item.BaseMutation=nil
+      return require(ReplicatedStorage.Shared.Util.AssetItems).SalePrice(item)*GameplayBalance.Eggs.SELL_PRICE_SHARE
+     end)
+    end
+    if valued and type(value)=="number" and value==value and value>=0 and value<math.huge then entry.sellValue=value end
     -- JSON null is filled by Encode for unknown metrics.
     if type(rate)=="number" and rate==rate and rate>=0 and rate<math.huge then entry.incomePerSecond=rate end
     if type(weight)=="number" and weight==weight and weight>=0 and weight<math.huge then entry.weightKg=weight end
@@ -787,10 +814,10 @@ do
    end
   end
   table.sort(eggs,function(a,b)return a.uid<b.uid end)
-  if #eggs>200 then error("Snapshot reporting depasse 200 oeufs ; envoi annule") end
+  if #eggs>500 then error("Snapshot reporting depasse 500 oeufs ; envoi annule") end
   return {version=1,type="eggs.snapshot",moduleId="EggReporter",sessionId=report.SessionId,
    placeId=tostring(game.PlaceId),jobId=game.JobId,cycleId=cycle,revision=report.Revision+1,
-   observedAt=os.date("!%Y-%m-%dT%H:%M:%SZ"),eggs=eggs}
+   observedAt=os.date("!%Y-%m-%dT%H:%M:%SZ"),eggs=eggs,cycleEndsAt=AreaEggCycle.NextNightTime(now)}
  end
  function report.Encode(message)
   -- Encode each egg separately so unknown metrics and empty arrays are unambiguous.
@@ -811,9 +838,9 @@ do
   if not message or message.jobId=="" then return false end
   local fingerprint={message.cycleId}
   for _,egg in ipairs(message.eggs) do
-   table.insert(fingerprint,table.concat({egg.uid,egg.category,egg.name,egg.rarity,tostring(egg.weightKg),tostring(egg.incomePerSecond)},"|"))
+   table.insert(fingerprint,HttpService:JSONEncode(egg))
   end
-  local signature=table.concat(fingerprint,";")
+  local signature=tostring(message.cycleEndsAt)..";"..table.concat(fingerprint,";")
   if signature==report.LastFingerprint and os.clock()-report.LastSent<60 and not report.ForceSnapshot then
    report.Dirty=false
    return false
@@ -871,6 +898,8 @@ do
      if message.type=="hello.ack" and message.role=="reporter" then
       report.Ready=true
       report.ForceSnapshot=true
+      report.ForcePlayers=true
+      report.PlayersDirty=true
       report.Backoff=2
       report.LastAck=os.clock()
       report.MarkDirty(.25)
@@ -879,6 +908,8 @@ do
       report.LastAck=os.clock()
       if message.revision==report.PendingRevision then report.PendingRevision=nil end
       report.Log("Accuse Cycle=%s Revision=%s Accepte=%s",tostring(message.cycleId),tostring(message.revision),tostring(message.accepted))
+     elseif message.type=="players.ack" then
+      report.LastPlayersAck=os.clock()
      elseif message.type=="error" then
       report.Log("Erreur serveur : %s",tostring(message.message))
      end
@@ -901,9 +932,121 @@ do
    end
   end)
  end
+
+ -- Presence has independent revisions and is not delayed by an egg reset.
+ report.PlayerConnections={}
+ report.PlayersDirty=true
+ report.PlayerRevision=0
+ report.LastPlayersSent=0
+ function report.MarkPlayersDirty()report.PlayersDirty=true end
+ function report.TrackPlayer(target)
+  if report.PlayerConnections[target] then return end
+  local bag={Base={},Character={}}
+  report.PlayerConnections[target]=bag
+  local function bind(signal,callback,list)
+   table.insert(list or bag.Base,signal:Connect(callback))
+  end
+  local function characterAdded(character)
+   for _,connection in ipairs(bag.Character)do connection:Disconnect()end
+   table.clear(bag.Character)
+   local watched={}
+   local function watchHumanoid(child)
+    if child:IsA("Humanoid") and not watched[child] then
+     watched[child]=true
+     bind(child:GetPropertyChangedSignal("WalkSpeed"),report.MarkPlayersDirty,bag.Character)
+    end
+   end
+   for _,child in ipairs(character:GetChildren())do watchHumanoid(child)end
+   bind(character.ChildAdded,watchHumanoid,bag.Character)
+   report.MarkPlayersDirty()
+  end
+  local function statAdded(child)
+   if child:IsA("ValueBase") and child.Parent and child.Parent.Name=="leaderstats" then bind(child.Changed,report.MarkPlayersDirty)end
+  end
+  bind(target.CharacterAdded,characterAdded)
+  bind(target.CharacterRemoving,report.MarkPlayersDirty)
+  bind(target.AttributeChanged,report.MarkPlayersDirty)
+  bind(target:GetPropertyChangedSignal("DisplayName"),report.MarkPlayersDirty)
+  bind(target.DescendantAdded,statAdded)
+  bind(target.DescendantRemoving,report.MarkPlayersDirty)
+  for _,child in ipairs(target:GetDescendants())do statAdded(child)end
+  if target.Character then characterAdded(target.Character)end
+  report.MarkPlayersDirty()
+ end
+ function report.UntrackPlayer(target)
+  local bag=report.PlayerConnections[target]
+  if bag then
+   for _,list in pairs(bag)do for _,connection in ipairs(list)do pcall(function()connection:Disconnect()end)end end
+   report.PlayerConnections[target]=nil
+  end
+  report.MarkPlayersDirty()
+ end
+ function report.BuildPlayers()
+  local list,penSnapshot={},{}
+  if AssetRoster and type(AssetRoster.ReadSnapshot)=="function" then
+   local ok,snapshot=pcall(AssetRoster.ReadSnapshot)
+   if ok then for _,owner in ipairs(snapshot)do penSnapshot[owner.OwnerUserId]=owner.Records end end
+  end
+  local ok,profile=pcall(Save.Peek)
+  if not ok then profile=nil end
+  for _,target in ipairs(Players:GetPlayers())do
+   local humanoid=target.Character and target.Character:FindFirstChildOfClass("Humanoid")
+   local row={userId=tostring(target.UserId),name=target.Name,displayName=target.DisplayName}
+   if humanoid then row.walkSpeed=humanoid.WalkSpeed end
+   if target==player and type(profile)=="table" then row.speedPower=profile.SpeedPower end
+   if row.speedPower==nil then
+    local power=target:GetAttribute("SpeedPower")
+    if type(power)=="number" then row.speedPower=power end
+   end
+   local pen=penSnapshot[target.UserId]
+   if pen then
+    local total,known=0,true
+    for _,asset in pairs(pen)do
+     if type(asset.MoneyPerSecond)=="number" then total+=asset.MoneyPerSecond else known=false end
+    end
+    if known then row.incomePerSecond=total;row.incomeSource="replicated-pen-roster" end
+   end
+   table.insert(list,row)
+  end
+  table.sort(list,function(a,b)return a.userId<b.userId end)
+  return {version=1,type="players.snapshot",moduleId="PlayerReporter",sessionId=report.SessionId,
+   placeId=tostring(game.PlaceId),jobId=game.JobId,reporterUserId=tostring(player.UserId),
+   revision=report.PlayerRevision+1,players=list}
+ end
+ function report.SendPlayers()
+  if not report.Ready or not report.Socket or game.JobId=="" then return false end
+  local message=report.BuildPlayers()
+  local encoded={}
+  for _,row in ipairs(message.players)do table.insert(encoded,HttpService:JSONEncode(row))end
+  local signature=table.concat(encoded,";")
+  if signature==report.LastPlayerFingerprint and os.clock()-report.LastPlayersSent<15 and not report.ForcePlayers then
+   report.PlayersDirty=false
+   return false
+  end
+  local header=table.clone(message);header.players=nil
+  local data=HttpService:JSONEncode(header):sub(1,-2)..',"players":['..table.concat(encoded,",")..']}'
+  local ok,err=pcall(function()report.Socket:Send(data)end)
+  if not ok then
+   report.Log("Envoi Players echoue : %s",tostring(err))
+   report.Disconnect();report.NextConnect=os.clock()+report.Backoff
+   return false
+  end
+  report.PlayerRevision=message.revision
+  report.LastPlayersSent=os.clock()
+  report.PlayersDirty=false
+  report.ForcePlayers=false
+  report.LastPlayerFingerprint=signature
+  return true
+ end
+
  function report.Start()
   if not report.Enabled then return end
   report.Cycle=tostring(AreaEggCycle.ActivePeriodIndexAt(ServerClock.Now()))
+  for _,target in ipairs(Players:GetPlayers())do report.TrackPlayer(target)end
+  connect(Players.PlayerAdded,report.TrackPlayer)
+  connect(Players.PlayerRemoving,report.UntrackPlayer)
+  if AssetRoster and AssetRoster.SnapshotRefreshed then connect(AssetRoster.SnapshotRefreshed,report.MarkPlayersDirty)end
+  if Save and type(Save.Watch)=="function" then connect(Save.Watch("SpeedPower"),report.MarkPlayersDirty)end
   if EggState.ResetCountdown then connect(EggState.ResetCountdown,report.Reset) end
   if EggState.RarityRevealed then connect(EggState.RarityRevealed,report.Revealed) end
   task.spawn(function()
@@ -927,6 +1070,8 @@ do
       report.NextConnect=os.clock()+report.Backoff
      end
      if not report.Socket and not report.Connecting and os.clock()>=report.NextConnect then report.Connect() end
+     if report.Ready and os.clock()-report.LastPlayersSent>=1
+      and (report.PlayersDirty or os.clock()-report.LastPlayersSent>=15) then report.SendPlayers()end
      if report.Ready and not report.Waiting and os.clock()>=report.Due
       and ((report.Dirty and os.clock()-report.LastSent>=2) or os.clock()-report.LastSent>=60) then report.SendSnapshot() end
     end)
@@ -937,6 +1082,7 @@ do
     task.wait(.5)
    end
    report.Disconnect()
+   for target in pairs(report.PlayerConnections)do report.UntrackPlayer(target)end
   end)
  end
 end -- reporting scope
