@@ -857,7 +857,7 @@ do
    end
    report.Connecting=false
    if not ok or not socket then
-    report.Log("Connexion echouee ; nouvel essai dans %d s",report.Backoff)
+    report.Log("Connexion echouee : %s ; nouvel essai dans %d s",tostring(socket):sub(1,240),report.Backoff)
     report.NextConnect=os.clock()+report.Backoff
     report.Backoff=math.min(report.Backoff*2,60)
     return
