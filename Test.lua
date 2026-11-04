@@ -196,7 +196,7 @@ function executorTools.SaveSettings()
 		Version = 1, AutomaticMode = automaticMode,
 		IncludeMissingIndex = autoIncludeMissingIndex,
 		OpenBelowRate = openBelowRate,
-		SearchActive = searchingServer and automaticMode,
+		SearchActive = false,
 		VisitedPlaceId = game.PlaceId, VisitedServers = visitedServers,
 		VisitedCycleIndex = visitedCycleIndex,
 		TimingEnabled = timingEnabled,
@@ -226,7 +226,7 @@ local function loadSettings()
 			openBelowRate = value
 		end
 	end
-	searchingServer = automaticMode and settings.SearchActive == true
+	searchingServer = false -- Never resume automatic server changes from saved settings.
 	if settings.VisitedPlaceId == game.PlaceId and type(settings.VisitedServers)=="table" then
 		if type(settings.VisitedCycleIndex)=="number" then visitedCycleIndex=settings.VisitedCycleIndex end
 		for id,visited in pairs(settings.VisitedServers) do
@@ -2071,11 +2071,6 @@ syncQueue = function()
 					and index[record.AssetCategory] ~= true
 					and not backpackCategories[record.AssetCategory]
                     and not plotCategories[record.AssetCategory]
-                if getRarityName(record)=="Eternal" and rate<minimumRatePerSecond and not missing
-                    and isTrackedFieldState(record) and not ownsEgg(uid) and not searchingServer then
-                    searchingServer=true
-                    log("SERVER_CHANGE","Eternal sous le seuil et non manquant eligible : recherche sans collecte")
-                end
 				if FusionModules.Helpers.IsAlwaysEligibleRarity(record) then
 					local existing = queuedEggs[uid]
 					if existing then existing.Source = "RARITY" end
@@ -2892,7 +2887,7 @@ local function idleOnTreadmill(token)
 	if destroyed or not autoEnabled or generation ~= token then return true end
 	setStatus("TREADMILL : entrainement, attente d'un oeuf...")
 	while autoEnabled and generation == token and automaticMode and not queuePaused
-		and next(queuedEggs) == nil and not (automaticMode and searchingServer and not searchWaitForEgg) and not activityRecheckPending and not FusionModules.Butterflies.Available() and not destroyed do
+		and next(queuedEggs) == nil and not activityRecheckPending and not FusionModules.Butterflies.Available() and not destroyed do
 		serviceWallMaintenance(token)
 		if not treadmillAssigned and autoActivity ~= "TREADMILL" then return true end
 		syncQueue()
@@ -2989,9 +2984,7 @@ local function worker(token)
 				if refreshQueueInterface then refreshQueueInterface() end
 				if renderControls then renderControls() end
 				if automaticMode and not stopAfterFlight then
-					searchingServer = true
 					serviceWallMaintenance(token)
-					if requestRandomServerHop and requestRandomServerHop(token, "Oeuf attribue") then return end
 				end
 			end
 			if not success then
@@ -3024,19 +3017,6 @@ local function worker(token)
 			directNext = false
 			if automaticMode and FusionModules.Butterflies.Available() then
 				FusionModules.Butterflies.Idle(token)
-			elseif automaticMode and searchingServer then
-				if searchWaitForEgg then
-					serverSearchState = "Suspendue : attente d'un oeuf eligible"
-					local ok, reason = idleOnTreadmill(token)
-					if not ok then stopAutomation("Tapis : "..tostring(reason)); return end
-				elseif os.clock() < serverSearchReadyAt then
-					serverSearchState = "Recherche : chargement des oeufs"
-					task.wait(CONFIG.ScanInterval)
-				else
-					serverSearchState = "Recherche : aucun oeuf eligible"
-					if requestRandomServerHop and requestRandomServerHop(token, "Aucun oeuf eligible") then return end
-					task.wait(0.5)
-				end
 			elseif automaticMode then
 				serverSearchState = "OFF"
 				local ok, reason = idleOnTreadmill(token)
@@ -3119,7 +3099,6 @@ local function initialize()
 	EggState = loadModule("Client.EggState")
 	AreaEggCycle = loadModule("Shared.Util.AreaEggCycle")
 	ServerClock = loadModule("Shared.Util.ServerClock")
-	syncVisitedServerCycle(false)
 	Assets = loadModule("Data.Assets")
 	EggRecords = loadModule("Shared.Util.EggRecords")
 	AssetEarnings = loadModule("Shared.Util.AssetEarnings")
@@ -3175,7 +3154,6 @@ local function initialize()
 	local resetWall = loadModule("Client.AreaEggResetWall")
 	connect(resetWall.Changed, function(sealed)
 		if sealed == true and not destroyed then
-            syncVisitedServerCycle(true)
             FusionModules.Butterflies.Revision += 1
             FusionModules.Reporting.Reset()
         end
@@ -3361,6 +3339,7 @@ function FusionModules.Helpers.prepareServerContinuation()
 	return ok,reason
 end
 
+-- Retained for future explicit use only. No automatic caller is registered.
 requestRandomServerHop = function(token, reason)
 	if serverHopPending then return true end
 	if not automaticMode or not autoEnabled or generation ~= token
