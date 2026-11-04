@@ -3665,7 +3665,6 @@ local function createInterface()
   local label=visual:FindFirstChild(name)
   if label and label:IsA("TextLabel")then
    label.TextScaled=true
-   label.TextWrapped=false
    label.Font=Enum.Font.GothamBold
    label.TextStrokeColor3=Color3.new(0,0,0)
    label.TextStrokeTransparency=.15
