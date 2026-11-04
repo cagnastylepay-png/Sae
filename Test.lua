@@ -3490,7 +3490,7 @@ local function createInterface()
  -- Fixed HD design dimensions; scale the complete hierarchy uniformly.
  local referenceSize=frame:GetAttribute("HDReferenceSize")
  if typeof(referenceSize)~="Vector2"then
-  referenceSize=Vector2.new(frame.Size.X.Scale*1920+frame.Size.X.Offset,frame.Size.Y.Scale*1080+frame.Size.Y.Offset)
+  referenceSize=Vector2.new(1280,800)
   frame:SetAttribute("HDReferenceSize",referenceSize)
  end
  frame.Size=UDim2.fromOffset(referenceSize.X,referenceSize.Y)
@@ -3670,7 +3670,7 @@ local function createInterface()
 	scroll.CanvasSize = UDim2.new()
 	local function resizeGrid()
 		local width = math.max(scroll.AbsoluteSize.X / math.max(displayScale.Scale, .01) - scroll.ScrollBarThickness - 12, 120)
-		local columns = math.max(1, math.floor((width + 10) / 130))
+		local columns = math.clamp(math.floor((width + 10) / 190), 1, 4)
 		local side = math.floor((width - (columns - 1) * 10) / columns)
 		grid.CellSize = UDim2.fromOffset(side, side + 25)
 	end
