@@ -4431,7 +4431,13 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 			local title = header:FindFirstChild(name)
 			if title then title.Text = "Ovora Hub — "..activeTab end
 		end
-		local count = countSelected()
+		if activeTab=="Plot" then
+         for uid in pairs(selectedEggs)do
+          local _,grown=FusionModules.Helpers.PlotEggTimeText(inventoryRecords[uid])
+          if not grown then selectedEggs[uid]=nil end
+         end
+        end
+        local count = countSelected()
 		info.Value.Text = activeTab == "Params" and ("AUTO >= " .. formatNumber(minimumRatePerSecond) .. "/s") or (tostring(count) .. (count == 1 and " oeuf" or " oeufs"))
 		setAutoCaption(stopAfterFlight and "ARRET EN ATTENTE" or (automaticMode and "AUTO : ON" or "AUTO : OFF"))
 		caption(includeMissingButton, autoIncludeMissingIndex and "Manquants : ON" or "Manquants : OFF")
@@ -4449,7 +4455,13 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 			local checked = selectedEggs[uid] == true
 			card.holder.SelectedOverlay.Visible = checked
 			card.holder.SelectedIcon.Visible = checked
-			card.button.Active = not hatchInProgress and not inventoryPlacementBusy and not (activeTab == "Backpack" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced)
+			if activeTab=="Plot" then
+             local _,grown=FusionModules.Helpers.PlotEggTimeText(inventoryRecords[uid])
+             if not grown then selectedEggs[uid]=nil;card.holder.SelectedOverlay.Visible=false;card.holder.SelectedIcon.Visible=false end
+             card.button.Active=grown and not hatchInProgress and not inventoryPlacementBusy
+            else
+             card.button.Active = not hatchInProgress and not inventoryPlacementBusy and not (activeTab == "Backpack" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced)
+            end
 		end
 	end
 	refreshEggInterface = function()
@@ -4515,6 +4527,10 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 				cards[uid] = card
 				card.connection = click.Activated:Connect(function()
 					if hatchInProgress or inventoryPlacementBusy or (activeTab == "Backpack" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced) then return end
+                    if activeTab=="Plot" then
+                     local _,grown=FusionModules.Helpers.PlotEggTimeText(inventoryRecords[uid])
+                     if not grown then selectedEggs[uid]=nil;updateSelection();return end
+                    end
 					selectedEggs[uid] = not selectedEggs[uid] or nil
 					updateSelection()
 				end)
