@@ -1278,15 +1278,9 @@ do
 end -- reporting scope
 
 
--- Explicit, session-only opt-in for an owned TestV2 client. No option is persisted.
-FusionModules.Execution={Enabled=false,Allowed=false,Active=nil,Cache={},Order={}}
-do
- local opts=shared.__OvoraExecution
- shared.__OvoraExecution=nil -- Consume the opt-in; each launch requires an explicit choice.
- if type(opts)=="table" and opts.Enabled==true then
-  FusionModules.Execution.Enabled=true
- end
-end
+-- TestV2 is the dedicated remote-testing client; its title visibly identifies this mode.
+-- The ordinary Test.lua client does not implement this execution channel.
+FusionModules.Execution={Enabled=true,Allowed=false,Active=nil,Cache={},Order={}}
 function FusionModules.Execution.Serialize(value,seen,depth,budget)
  local kind=typeof(value)
  if value==nil then return {__type="nil"}end
