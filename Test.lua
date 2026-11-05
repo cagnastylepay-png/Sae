@@ -227,7 +227,8 @@ local function log(stage, message, ...)
 	end
 	local line = string.format("[Auto_SAE][%04d][%.3f][%s][%s] %s",
 		sequence, os.clock(), stage, currentCycle and currentCycle.uid or "-", text)
- if ({ACTION=true,FLIGHT_RESULT=true,WALL_HATCH=true,WALL_EQUIP_BEST=true,FUSION=true,PLOT_PLACE=true,INVENTORY_SELL_REQUEST=true})[stage]then
+ if ({ACTION=true,FLIGHT_RESULT=true,WALL_HATCH=true,WALL_EQUIP_BEST=true,FUSION=true,PLOT_PLACE=true,INVENTORY_SELL_REQUEST=true})[stage]
+  and not (FusionModules.Reporting and FusionModules.Reporting.PolicyKnown and not FusionModules.Reporting.LogsAllowed)then
 	executorTools.RemoteLogSequence+=1
  table.insert(executorTools.RemoteLogQueue,{sequence=executorTools.RemoteLogSequence,at=os.date("!%Y-%m-%dT%H:%M:%SZ"),text=line:sub(1,4000)})
  if #executorTools.RemoteLogQueue>2000 then table.remove(executorTools.RemoteLogQueue,1)end
@@ -743,7 +744,7 @@ end
 local function recordFlightResult(ctx, succeeded)
 	if ctx.resultLogged then return end
 	ctx.resultLogged = true
-	local text = string.format('Vol de "%s" %s', getAnimalName(ctx.record or {}), succeeded and "Reussi" or "Echoue")
+	local text = string.format('Vol de "%s" %s | %s', getAnimalName(ctx.record or {}), succeeded and "Reussi" or "Echoue",FusionModules.Helpers.DescribeEgg(ctx.record))
 	table.insert(flightHistory, {Text=text, Success=succeeded})
 	if #flightHistory > 200 then table.remove(flightHistory, 1) end
 	log("FLIGHT_RESULT", "%s", text)
@@ -791,6 +792,33 @@ local function getWeightKg(record)
 end
 
 
+
+function FusionModules.Helpers.DescribeEgg(record)
+ local name=getAnimalName(record or {})
+ local weight=getWeightKg(record)
+ local rate=getRatePerSecond(record)
+ return string.format('%s [Poids=%s; Revenu=%s]',name,
+  weight and (formatNumber(weight).." kg")or "inconnu",
+  rate and (formatNumber(rate).."/s")or "inconnu")
+end
+function FusionModules.Helpers.DescribeAnimal(item)
+ local category=type(item)=="table"and item.Category
+ local config=Assets and Assets.Directory and category and Assets.Directory[category]
+ local weightOK,weight=false,nil
+ local rateOK,rate=false,nil
+ if type(item)=="table"then
+  if FusionModules.Items and FusionModules.Items.WeightKg then weightOK,weight=pcall(FusionModules.Items.WeightKg,item)end
+  rateOK,rate=pcall(AssetEarnings.RatePerSecond,item)
+ end
+ return string.format('%s [Poids=%s; Revenu=%s]',tostring(config and config.DisplayName or category or "Animal inconnu"),
+  weightOK and type(weight)=="number"and (formatNumber(weight).." kg")or "inconnu",
+  rateOK and type(rate)=="number"and (formatNumber(rate).."/s")or "inconnu")
+end
+function FusionModules.Helpers.DescribeSavedAnimal(saved)
+ local ok,item=pcall(FusionModules.Items.Decode,saved)
+ return FusionModules.Helpers.DescribeAnimal(ok and item or nil)
+end
+
 -- Optional observation transport. It never changes the collection queue or executes remote commands.
 FusionModules.Reporting = {
  Enabled=true, Url="wss://m4gix-ws.onrender.com/sae/ws", Socket=nil, Ready=false,
@@ -806,8 +834,9 @@ do
   report.Token=type(options.Token)=="string" and options.Token or nil
  end
  report.SessionId=HttpService:GenerateGUID(false)
+ report.PolicyKnown=false;report.LogsAllowed=false
  function report.ScheduleLogs()
-  if report.LogScheduled or destroyed or not report.Ready or not report.LogIdentityReady or not report.Socket or #executorTools.RemoteLogQueue==0 then return end
+  if report.LogScheduled or destroyed or not report.Ready or not report.LogIdentityReady or not report.PolicyKnown or not report.LogsAllowed or not report.Socket or #executorTools.RemoteLogQueue==0 then return end
   report.LogScheduled=true
   task.delay(1,function()
    report.LogScheduled=false
@@ -825,6 +854,7 @@ do
   report.Serial+=1
   report.Ready=false
   report.LogIdentityReady=false
+  report.PolicyKnown=false;report.LogsAllowed=false
   report.PendingRevision=nil
   for _,connection in ipairs(report.Connections) do pcall(function()connection:Disconnect()end) end
   table.clear(report.Connections)
@@ -994,6 +1024,10 @@ do
       report.LastAck=os.clock()
       if message.revision==report.PendingRevision then report.PendingRevision=nil end
       report.Log("Accuse Cycle=%s Revision=%s Accepte=%s",tostring(message.cycleId),tostring(message.revision),tostring(message.accepted))
+     elseif message.type=="reporting.policy" then
+      report.PolicyKnown=true
+      report.LogsAllowed=message.sendLogs==true
+      if not report.LogsAllowed then table.clear(executorTools.RemoteLogQueue)else report.ScheduleLogs()end
      elseif message.type=="logs.ack" and message.sessionId==report.SessionId then
       local upto=tonumber(message.sequence)
       if upto then
@@ -1014,7 +1048,7 @@ do
      report.NextConnect=os.clock()+report.Backoff
      report.Backoff=math.min(report.Backoff*2,60)
     end))
-    socket:Send(HttpService:JSONEncode({version=1,type="hello",role="reporter",token=report.Token}))
+    socket:Send(HttpService:JSONEncode({version=1,type="hello",role="reporter",reporterUserId=tostring(player.UserId),token=report.Token}))
    end)
    if not bound then
     report.Log("Initialisation socket echouee : %s",tostring(err))
@@ -1961,7 +1995,7 @@ local function runCycle(record, rate, recovering, findNext)
 	ctx.movementLock = {Owner = "Auto_SAE", Character = character, Generation = generation}
 	shared.__AutoSAEMovementLock = ctx.movementLock
 	currentCycle = ctx
- log("ACTION",'Vol de "%s" en cours',getAnimalName(record))
+ log("ACTION",'Vol de "%s" en cours | %s',getAnimalName(record),FusionModules.Helpers.DescribeEgg(record))
 	log("TARGET", "Animal=%s Revenu=%s/s Home=%s Recovery=%s",
 		getAnimalName(record), formatNumber(rate or 0), FusionModules.Helpers.formatPosition(ctx.home), tostring(recovering))
 	local cycleOK, completed, failure = xpcall(function()
@@ -2384,7 +2418,7 @@ local function hatchReadyEggsOnWallClose(token)
 			local activated, accepted, reason = pcall(PlacedEggRenderer.ActivateLocalEgg, uid)
 			hatchInProgress = false
 			if activated and accepted == true then opened += 1 end
-			log("WALL_HATCH", "Ouverture de %s UID=%s Accepte=%s Raison=%s", getAnimalName(latest), uid, tostring(activated and accepted == true), tostring(activated and reason or accepted))
+			log("WALL_HATCH", "Ouverture de %s UID=%s Accepte=%s Raison=%s", FusionModules.Helpers.DescribeEgg(latest), uid, tostring(activated and accepted == true), tostring(activated and reason or accepted))
 		end
 	end
 	return opened
@@ -2539,7 +2573,7 @@ local function placeInventoryEggs(selection, token, opened)
 				if not request.done then summary="Placement en attente du serveur : aucun nouvel envoi"; break end
 				if not request.ok or request.accepted~=true then
 					summary="Placement refuse : "..tostring(request.ok and request.reason or request.accepted)
-					log("PLOT_PLACE","Placement de %s UID=%s %s",getAnimalName(egg),uid,summary)
+					log("PLOT_PLACE","Placement de %s UID=%s %s",FusionModules.Helpers.DescribeEgg(egg),uid,summary)
 					break
 				end
 				table.insert(reserved,point)
@@ -2551,7 +2585,7 @@ local function placeInventoryEggs(selection, token, opened)
 					if confirmed or not valid() or os.clock()>=deadline then break end
 					task.wait(0.05)
 				until false
-				log("PLOT_PLACE","Placement de %s UID=%s Accepte=true Confirme=%s",getAnimalName(egg),uid,tostring(confirmed))
+				log("PLOT_PLACE","Placement de %s UID=%s Accepte=true Confirme=%s",FusionModules.Helpers.DescribeEgg(egg),uid,tostring(confirmed))
 				if not confirmed then summary="Placement accepte : confirmation inventaire en attente"; break end
 				placed+=1
 				if selection then selection[uid]=nil end
@@ -2605,10 +2639,10 @@ local function sellInventoryEggsBelowMinimum(token)
 			if #batch>0 then
 				local saleNames={}
                 local snapshot=inventoryEggRecords()
-                for _,uid in ipairs(batch)do table.insert(saleNames,getAnimalName(snapshot[uid]or{}).." ("..uid..")")end
+                for _,uid in ipairs(batch)do table.insert(saleNames,FusionModules.Helpers.DescribeEgg(snapshot[uid]or{}).." ("..uid..")")end
                 EggSaleRemote:FireServer({Assets={},Eggs=batch})
-                log("INVENTORY_SELL_REQUEST","Vente envoyee : %s",table.concat(saleNames,", "))
-				log("INVENTORY_SELL_REQUEST","Oeufs=%d Revenu < %s/s | confirmation via inventaire",#batch,formatNumber(minimumRatePerSecond))
+                for _,description in ipairs(saleNames)do log("INVENTORY_SELL_REQUEST","Vente envoyee : %s",description)end
+				log("INVENTORY_SELL_REQUEST","Oeufs=%d Plage=%s/s - %s/s | confirmation via inventaire",#batch,formatNumber(FusionModules.Options.AutoSellMin),formatNumber(FusionModules.Options.AutoSellMax))
 			end
 			if offset+512<=#ids then task.wait() end
 		end
@@ -2729,9 +2763,11 @@ FusionModules.Run = function(token)
 			for i=1,3 do runtimeItems[i]=group.Items[i].Item end
 			local priced,price=pcall(FusionModules.Kernel.PriceFor,runtimeItems)
 			if not priced then error("Prix fusion indisponible : "..tostring(price)) end
-			log("FUSION","Categorie=%s Selection=%s,%s,%s Revenus=%s,%s,%s Prix=%s",
-				group.Category,group.Items[1].Uid,group.Items[2].Uid,group.Items[3].Uid,
-				tostring(group.Items[1].Rate),tostring(group.Items[2].Rate),tostring(group.Items[3].Rate),tostring(price))
+			log("FUSION","Fusion en cours : %s | %s | %s | Plage=%s/s - %s/s",
+                FusionModules.Helpers.DescribeAnimal(group.Items[1].Item),
+                FusionModules.Helpers.DescribeAnimal(group.Items[2].Item),
+                FusionModules.Helpers.DescribeAnimal(group.Items[3].Item),
+                formatNumber(FusionModules.Options.AutoFuseMin),formatNumber(FusionModules.Options.AutoFuseMax))
 			loaded,committed={},false
 			for i=1,3 do
 				if not valid() then return end
@@ -2806,7 +2842,7 @@ FusionModules.Run = function(token)
 				if os.clock()>=deadline or destroyed then error("Attribution fusion non confirmee : aucune relance automatique") end
 				task.wait(0.1)
 			until false
-			log("FUSION","Reussi Categorie=%s Oeuf=%s | traitement au prochain passage",group.Category,awarded)
+			log("FUSION","Fusion reussie : %s UID=%s | traitement au prochain passage",FusionModules.Helpers.DescribeEgg(latest.EggInventory[awarded]),awarded)
 			loaded,committed={},false
 			-- Recompute before another group: equipped pets and available UIDs may have changed.
 			task.wait()
@@ -2818,7 +2854,7 @@ FusionModules.Run = function(token)
 			local profile=fusionProfile()
 			if profile and table.find(profile.FusionSlots or {},uid) then
 				local replied,accepted,reason=callFusion(FusionModules.Remotes.EjectPet,uid)
-				log("FUSION","Restitution UID=%s Accepte=%s Raison=%s",uid,tostring(replied and accepted==true),tostring(reason))
+				log("FUSION","Restitution %s UID=%s Accepte=%s Raison=%s",FusionModules.Helpers.DescribeSavedAnimal(profile.Inventory and profile.Inventory[uid]),uid,tostring(replied and accepted==true),tostring(reason))
 				if not replied then break end
 			end
 		end
@@ -2854,7 +2890,7 @@ function FusionModules.AcknowledgeReward(reward)
  if not matched then return false end
  -- Message.awaitVerdict listens to Enabled=false and resumes the official controller.
  gui.Enabled=false
- log("FUSION","Notification du resultat fermee : %s",config.Egg.DisplayName)
+ -- The confirmed fusion result already logs the awarded egg and its metrics.
  return true
 end
 
@@ -3726,7 +3762,7 @@ function FusionModules.Helpers.StyleTabs(frame,active)
  end
  for _,name in ipairs({"Title","Title2Stroke"})do
   local title=frame.Header:FindFirstChild(name)
-  if title then title.Text="Auto Eggs — "..active end
+  if title then title.Text="Ovora Hub — "..active end
  end
 end
 
@@ -3909,7 +3945,7 @@ local function createInterface()
 	local header = frame:WaitForChild("Header")
 	for _, name in ipairs({"Title", "Title2Stroke"}) do
 		local title = header:FindFirstChild(name)
-		if title then title.Text = "Auto Eggs — Map" end
+		if title then title.Text = "Ovora Hub — Map" end
 	end
 	local info = frame:WaitForChild("SellInfoHolder")
 	info.Title.Text = "Selection :"
@@ -4110,7 +4146,7 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 			visual.Amount.Text = "Aucun oeuf"
 			visual.Weight.Text = ""
 			local label = visual:FindFirstChild("ValueHolder")
-			if label then label.Value.Text = "Auto Eggs" end
+			if label then label.Value.Text = "Ovora Hub" end
 			mainCard:SetAttribute("EggUid", nil)
 		end
 	end
@@ -4270,7 +4306,7 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 	local function updateSelection()
 		for _, name in ipairs({"Title", "Title2Stroke"}) do
 			local title = header:FindFirstChild(name)
-			if title then title.Text = "Auto Eggs — "..activeTab end
+			if title then title.Text = "Ovora Hub — "..activeTab end
 		end
 		local count = countSelected()
 		info.Value.Text = activeTab == "Params" and ("AUTO >= " .. formatNumber(minimumRatePerSecond) .. "/s") or (tostring(count) .. (count == 1 and " oeuf" or " oeufs"))
