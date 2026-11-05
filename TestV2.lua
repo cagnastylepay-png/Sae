@@ -29,7 +29,7 @@ function O.Connect(signal,callback)
  if ok then table.insert(O.Connections,connection)end
 end
 function O.Disconnect()
- O.Ready=false;O.IdentityReady=false;O.Connecting=false
+ O.Ready=false;O.IdentityReady=false;O.Connecting=false;O.EggAckRevision=nil;O.Relocation=nil
  local socket=O.Socket;O.Socket=nil
  if socket then pcall(function()socket:Close()end)end
  O.NextConnect=os.clock()+O.Backoff;O.Backoff=math.min(60,O.Backoff*2)
@@ -177,13 +177,11 @@ end
 for _,name in ipairs({"FieldRefreshed","FieldShifted","FieldGone","RarityRevealed"})do O.Connect(O.EggState[name],markEggs)end
 function O.ShouldRelocate()
  local message=O.Relocation
- if not message or not message.relocate or message.placeId~=tostring(game.PlaceId)or message.jobId~=game.JobId then return false end
- local favorites={}
- for _,id in ipairs(message.favoriteUserIds or {})do favorites[tostring(id)]=true end
- for _,target in ipairs(Players:GetPlayers())do
-  if target~=player and favorites[tostring(target.UserId)]then return true end
- end
- return false
+ if not O.Ready or not O.IdentityReady or not message or not message.relocate
+  or message.placeId~=tostring(game.PlaceId)or message.jobId~=game.JobId then return false end
+ -- Never leave until Render has accepted the latest complete egg snapshot.
+ return message.mode=="roam" and O.EggAckRevision==O.EggRevision and O.EggRevision>0
+  and not O.EggDirty and not O.PlayerDirty and not O.Syncing
 end
 function O.Relocate()
  if O.HopBusy or os.clock()<O.NextHop or not O.ShouldRelocate()then return end
@@ -209,15 +207,14 @@ function O.Relocate()
     for _,server in ipairs(data.data or {})do
      if type(server.id)=="string"and not avoid[server.id]and not O.Tried[server.id]
       and type(server.playing)=="number"and type(server.maxPlayers)=="number"
-      and server.playing<math.min(7,server.maxPlayers)then
+      and server.playing<=math.min(7,server.maxPlayers)-2 then
       table.insert(candidates,{id=server.id,playing=server.playing,tie=math.random()})
      end
     end
     cursor=data.nextPageCursor
     if #candidates>0 or not cursor then break end
    end
-   table.sort(candidates,function(a,b)return a.playing==b.playing and a.tie<b.tie or a.playing<b.playing end)
-   local destination=candidates[1]
+   local destination=#candidates>0 and candidates[math.random(1,#candidates)]or nil
    if not destination or not O.ShouldRelocate()then return end
    local queue=env.queue_on_teleport or env.queueonteleport or (env.syn and env.syn.queue_on_teleport)
    if type(queue)~="function"then O.Status("Rechargement automatique indisponible",false);return end
@@ -259,7 +256,11 @@ function O.OpenSocket()
      O.Ready=true;O.Connecting=false;O.Backoff=2;O.LastAck=os.clock()
      O.PlayerDirty=true;O.EggDirty=true;O.ForcePlayers=true;O.ForceEggs=true
     elseif message.type=="players.ack"then O.IdentityReady=true;O.LastAck=os.clock();O.PendingAt=nil
-    elseif message.type=="eggs.ack"then O.LastAck=os.clock();O.PendingAt=nil;O.Status("Observation active",true)
+    elseif message.type=="eggs.ack"then
+     O.LastAck=os.clock();O.PendingAt=nil
+     if message.accepted==true and message.sessionId==O.Session and message.revision==O.EggRevision then
+      O.EggAckRevision=message.revision;O.Status("Observation transmise",true)
+     end
     elseif message.type=="observer.relocate"then
      O.Relocation=message
     elseif message.type=="error"then O.Disconnect()
