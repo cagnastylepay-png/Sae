@@ -48,6 +48,7 @@ function O.Connect(signal,callback)
 end
 function O.Disconnect()
  O.Ready=false;O.IdentityReady=false;O.Connecting=false;O.EggAckRevision=nil;O.Relocation=nil
+ O.Destination=nil;O.DestinationRequest=nil;O.DestinationRequestedAt=nil
  local socket=O.Socket;O.Socket=nil
  if socket then pcall(function()socket:Close()end)end
  O.NextConnect=os.clock()+O.Backoff;O.Backoff=math.min(60,O.Backoff*2)
@@ -213,91 +214,69 @@ function O.ShouldRelocate(serial)
  return message.mode=="roam" and O.EggAckRevision==O.EggRevision and O.EggRevision>0
   and not O.EggDirty and not O.PlayerDirty and not O.Syncing
 end
-function O.ServerTier(server,avoid)
- if type(server)~="table"or type(server.id)~="string"or avoid[server.id]or O.Tried[server.id]then return nil end
- local playing,capacity=server.playing,server.maxPlayers
- if type(playing)~="number"or type(capacity)~="number"or playing~=math.floor(playing)
-  or playing~=3 or playing>=math.min(7,capacity)then return nil end
- return "preferred"
+function O.AcceptDestination(message)
+     if message.requestId~=O.DestinationRequest then return end
+     O.DestinationRequest=nil;O.DestinationRequestedAt=nil
+     if message.placeId~=tostring(game.PlaceId)or message.jobId~=game.JobId or not O.ShouldRelocate()then return end
+     local target=message.target
+     if type(target)~="table"then
+      O.NextHop=os.clock()+math.clamp(tonumber(message.retryAfter)or 5,5,300)
+      O.Status(message.status and ("Recherche Render : "..tostring(message.status))or "Render poursuit la recherche (2 a 5 joueurs)",false)
+      return
+     end
+     if target.placeId~=tostring(game.PlaceId)or type(target.jobId)~="string"or target.jobId==game.JobId
+      or type(target.playing)~="number"or target.playing<2 or target.playing>5
+      or type(target.leaseId)~="string"or type(target.expiresAt)~="number"or type(message.serverTime)~="number"then return end
+     local remaining=(target.expiresAt-message.serverTime)/1000
+     if remaining<=0 or remaining>180 then return end
+     target.Deadline=os.clock()+remaining;O.Destination=target;O.NextHop=0
+end
+function O.RequestDestination()
+ if O.DestinationRequest or not O.ShouldRelocate()or os.clock()<O.NextHop then return end
+ local id=Http:GenerateGUID(false)
+ O.DestinationRequest=id;O.DestinationRequestedAt=os.clock()
+ O.Status("Render recherche un serveur de 2 a 5 joueurs",false)
+ if not O.Send({version=1,type="observer.next",requestId=id})then O.DestinationRequest=nil end
+end
+function O.FailDestination(detail)
+ local lease=O.CurrentLease
+ O.CurrentLease=nil;O.Destination=nil;O.HopBusy=false
+ O.NextHop=os.clock()+10
+ if lease then O.Send({version=1,type="observer.result",leaseId=lease.leaseId,failed=true})end
+ O.LastError=tostring(detail)
+ O.Status("Teleportation refusee : "..O.LastError.."; autre serveur via Render",false)
 end
 function O.Relocate()
  if O.HopBusy or os.clock()<O.NextHop or not O.ShouldRelocate()then return end
+ local destination=O.Destination
+ if not destination then O.RequestDestination();return end
+ if os.clock()>=destination.Deadline or O.Tried[destination.jobId]then O.Destination=nil;O.RequestDestination();return end
+ for _,id in ipairs(O.Relocation.avoidJobIds or {})do
+  if id==destination.jobId then O.Destination=nil;O.Send({version=1,type="observer.result",leaseId=destination.leaseId,failed=true});O.NextHop=os.clock()+5;return end
+ end
  local serial=O.Serial
- O.HopBusy=true;O.NextHop=os.clock()+30
+ O.HopBusy=true;O.CurrentLease=destination
  task.spawn(function()
   local success,failure=pcall(function()
    local env=type(getgenv)=="function"and getgenv()or getfenv()
-   local requestFn=env.request or env.http_request or (env.syn and env.syn.request)
-   local avoid={[game.JobId]=true}
-   for _,id in ipairs(O.Relocation.avoidJobIds or {})do avoid[id]=true end
-   O.Status("Recherche de serveur : exactement 3 joueurs",false)
-   local candidates,cursor={},O.SearchCursor
-   for _=1,3 do
-    if not O.ShouldRelocate(serial)then return end
-    local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Desc&excludeFullGames=true&limit=100"
-    if cursor then url=url.."&cursor="..Http:UrlEncode(cursor)end
-    local body
-    local requestWait=1.5-(os.clock()-(O.LastServerRequest or -math.huge))
-    if requestWait>0 then task.wait(requestWait)end
-    if not O.ShouldRelocate(serial)then return end
-    O.LastServerRequest=os.clock()
-    if requestFn then
-     local response=requestFn({Url=url,Method="GET"})
-     if type(response)=="table"and tonumber(response.StatusCode)==429 then
-      local headers=response.Headers or response.headers
-      local retry=type(headers)=="table"and tonumber(headers["Retry-After"]or headers["retry-after"])or 0
-      O.ApiBackoff=math.min(300,math.max(60,(O.ApiBackoff or 30)*2,retry or 0))
-      O.NextHop=os.clock()+O.ApiBackoff
-      O.Status("Limite Roblox HTTP 429 : pause de "..O.ApiBackoff.." s",false)
-      return
-     end
-     if type(response)~="table"or tonumber(response.StatusCode)~=200 then error("Liste serveurs indisponible : HTTP "..tostring(type(response)=="table"and response.StatusCode or "?"))end
-     body=response.Body
-    else body=game:HttpGet(url)end
-    local data=Http:JSONDecode(body)
-    for _,server in ipairs(data.data or {})do
-     local tier=O.ServerTier(server,avoid)
-     if tier then table.insert(candidates,{id=server.id,playing=server.playing})end
-    end
-    cursor=data.nextPageCursor
-    O.SearchCursor=cursor
-    if #candidates>0 or not cursor then break end
-   end
-   local destination=#candidates>0 and candidates[math.random(1,#candidates)]or nil
-   if not O.ShouldRelocate(serial)then return end
-   if not destination then
-    O.NextHop=os.clock()+(cursor and 20 or 30)
-    O.Status(cursor and "Recherche en cours : suite des serveurs dans 20 s (3 joueurs obligatoires)"or "Aucun serveur a 3 joueurs ; nouvel essai dans 30 s",false)
-    return
-   end
    local queue=env.queue_on_teleport or env.queueonteleport or (env.syn and env.syn.queue_on_teleport)
-   if type(queue)~="function"then O.Status("Rechargement automatique indisponible",false);return end
+   if type(queue)~="function"then error("Rechargement automatique indisponible")end
    if not O.Queued then
     queue('loadstring(game:HttpGet("https://raw.githubusercontent.com/cagnastylepay-png/Sae/main/TestV2.lua"))()')
     O.Queued=true
    end
-   if not O.ShouldRelocate(serial)then return end
-   for _,id in ipairs(O.Relocation.avoidJobIds or {})do if id==destination.id then return end end
-   O.LastDestination=destination.id;O.Tried[destination.id]=true;O.Status("Changement de serveur (3 joueurs observes)",false)
-   Teleport:TeleportToPlaceInstance(game.PlaceId,destination.id,player)
-   task.wait(25)
+   if not O.ShouldRelocate(serial)or O.Destination~=destination then O.HopBusy=false;return end
+   O.Tried[destination.jobId]=true;O.LastDestination=destination.jobId
+   O.Status("Teleportation Render : "..destination.playing.." joueurs observes",false)
+   Teleport:TeleportToPlaceInstance(game.PlaceId,destination.jobId,player)
+   task.wait(30)
+   if not O.Destroyed and serial==O.Serial and O.CurrentLease==destination then O.FailDestination("Connexion non terminee apres 30 s")end
   end)
-  O.HopBusy=false
-  if not success and serial==O.Serial then
-   O.LastError=tostring(failure)
-   if O.LastError:find("429",1,true)then
-    O.ApiBackoff=math.min(300,math.max(60,(O.ApiBackoff or 30)*2));O.NextHop=os.clock()+O.ApiBackoff
-    O.Status("Limite Roblox HTTP 429 : pause de "..O.ApiBackoff.." s",false)
-   else O.Status("Teleportation : "..O.LastError:sub(1,140),false)end
-  end
+  if not success and serial==O.Serial then O.FailDestination(failure)end
  end)
 end
 O.Connect(Teleport.TeleportInitFailed,function(target,result,message)
- if target~=player then return end
- O.HopBusy=false;O.NextHop=math.max(O.NextHop or 0,os.clock()+30)
- if O.LastDestination then O.Tried[O.LastDestination]=true end
- O.LastError=tostring(result)..": "..tostring(message)
- O.Status("Echec de teleportation : "..O.LastError.." ; autre serveur dans 30 s",false)
+ if target==player then O.FailDestination(tostring(result)..": "..tostring(message))end
 end)
 function O.OpenSocket()
  if not O.Enabled or O.Connecting or O.Destroyed then return end
@@ -326,14 +305,18 @@ function O.OpenSocket()
      if message.accepted==true and message.sessionId==O.Session and message.revision==O.EggRevision then
       O.EggAckRevision=message.revision;O.Status("Observation transmise",true)
      end
+    elseif message.type=="observer.destination"then
+     O.AcceptDestination(message)
     elseif message.type=="observer.relocate"then
      O.Relocation=message
-     if message.mode=="hold"then O.Status("En attente du favori : maintien du serveur",true)
+     if message.mode=="hold"then
+      O.Destination=nil;O.DestinationRequest=nil;O.DestinationRequestedAt=nil
+      O.Status("En attente du favori : maintien du serveur",true)
      elseif message.mode=="roam"then O.Status("Exploration des serveurs",true)end
     elseif message.type=="error"then O.Disconnect()
     end
    end)
-   O.Send({version=1,type="hello",role="reporter",reporterUserId=tostring(player.UserId),observerOnly=true})
+   O.Send({version=1,type="hello",role="reporter",reporterUserId=tostring(player.UserId),observerOnly=true,observerRouting="render"})
   end)
   if serial~=O.Serial or O.Destroyed or not O.Enabled then return end
   if not success then O.Disconnect();O.Status("Socket : "..tostring(failure):sub(1,140),false)end
@@ -379,7 +362,11 @@ function O.Step()
     end
    end
   end
-  O.Phase="Selection du prochain serveur"
+  if O.DestinationRequestedAt and now-O.DestinationRequestedAt>20 then
+   O.DestinationRequest=nil;O.DestinationRequestedAt=nil;O.NextHop=now+5
+   O.Status("Attente de Render : nouvelle demande dans 5 s",false)
+  end
+  O.Phase="Destination fournie par Render"
   O.Relocate()
 end
 task.spawn(function()
