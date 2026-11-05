@@ -183,6 +183,15 @@ function O.ShouldRelocate()
  return message.mode=="roam" and O.EggAckRevision==O.EggRevision and O.EggRevision>0
   and not O.EggDirty and not O.PlayerDirty and not O.Syncing
 end
+function O.IsCandidateServer(server,avoid)
+ if type(server)~="table"or type(server.id)~="string"or server.id==""or server.id==game.JobId
+  or avoid[server.id]or O.Tried[server.id]then return false end
+ local count,capacity=server.playing,server.maxPlayers
+ if type(count)~="number"or type(capacity)~="number"or count~=math.floor(count)
+  or count<1 or count>math.min(7,capacity)-2 then return false end
+ if type(server.fps)=="number"and server.fps<=0 then return false end
+ return true
+end
 function O.Relocate()
  if O.HopBusy or os.clock()<O.NextHop or not O.ShouldRelocate()then return end
  O.HopBusy=true;O.NextHop=os.clock()+30
@@ -195,7 +204,7 @@ function O.Relocate()
    local candidates,cursor={},nil
    for _=1,3 do
     if not O.ShouldRelocate()then return end
-    local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100"
+    local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
     if cursor then url=url.."&cursor="..Http:UrlEncode(cursor)end
     local body
     if requestFn then
@@ -205,17 +214,15 @@ function O.Relocate()
     else body=game:HttpGet(url)end
     local data=Http:JSONDecode(body)
     for _,server in ipairs(data.data or {})do
-     if type(server.id)=="string"and not avoid[server.id]and not O.Tried[server.id]
-      and type(server.playing)=="number"and type(server.maxPlayers)=="number"
-      and server.playing<=math.min(7,server.maxPlayers)-2 then
-      table.insert(candidates,{id=server.id,playing=server.playing,tie=math.random()})
+     if O.IsCandidateServer(server,avoid)then
+      table.insert(candidates,{id=server.id,playing=server.playing,observedAt=os.clock()})
      end
     end
     cursor=data.nextPageCursor
     if #candidates>0 or not cursor then break end
    end
    local destination=#candidates>0 and candidates[math.random(1,#candidates)]or nil
-   if not destination or not O.ShouldRelocate()then return end
+   if not destination or not O.ShouldRelocate()or os.clock()-destination.observedAt>15 then return end
    local queue=env.queue_on_teleport or env.queueonteleport or (env.syn and env.syn.queue_on_teleport)
    if type(queue)~="function"then O.Status("Rechargement automatique indisponible",false);return end
    if not O.Queued then
@@ -224,6 +231,7 @@ function O.Relocate()
    end
    if not O.ShouldRelocate()then return end
    for _,id in ipairs(O.Relocation.avoidJobIds or {})do if id==destination.id then return end end
+   if os.clock()-destination.observedAt>15 then return end
    O.Tried[destination.id]=true;O.Status("Changement de serveur",false)
    Teleport:TeleportToPlaceInstance(game.PlaceId,destination.id,player)
    task.wait(25)
