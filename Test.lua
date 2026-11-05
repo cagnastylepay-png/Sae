@@ -836,7 +836,20 @@ do
  end
  report.SessionId=HttpService:GenerateGUID(false)
  function report.AutomationActive()
-  return autoEnabled and automaticMode and FusionModules.Options.AutoEggs and not queuePaused and not stopAfterFlight and not destroyed and not serverHopPending
+  return autoEnabled and automaticMode and (FusionModules.Options.AutoEggs or FusionModules.Options.AutoIndex) and not queuePaused and not stopAfterFlight and not destroyed and not serverHopPending
+ end
+ function report.MissingCategories()
+  local result={}
+  if not ready or not FusionModules.Options.AutoIndex or not Assets or not Assets.Directory then return result end
+  local ok,profile=pcall(Save.Peek)
+  if not ok or type(profile)~="table"or type(profile.Index)~="table"then return result end
+  if not FusionModules.Helpers.backpackEggCategories or not FusionModules.Helpers.plotAnimalCategories then return result end
+  local backpack=FusionModules.Helpers.backpackEggCategories(profile)
+  local plot=FusionModules.Helpers.plotAnimalCategories()
+  for category in pairs(Assets.Directory)do
+   if type(category)=="string"and profile.Index[category]~=true and not backpack[category]and not plot[category]then result[category]=true end
+  end
+  return result
  end
  function report.VisitedJobs()
   local ids={}
@@ -858,7 +871,7 @@ do
    local options=table.clone(FusionModules.Options)
    report.SettingsDirty=false
    report.SettingsPending=revision
-   local ok=pcall(function()report.Socket:Send(HttpService:JSONEncode({version=1,type="settings.snapshot",sessionId=report.SessionId,revision=revision,options=options,automationActive=report.AutomationActive(),visitedJobIds=report.VisitedJobs()}))end)
+   local ok=pcall(function()report.Socket:Send(HttpService:JSONEncode({version=1,type="settings.snapshot",sessionId=report.SessionId,revision=revision,options=options,automationActive=report.AutomationActive(),visitedJobIds=report.VisitedJobs(),missingCategories=report.MissingCategories()}))end)
    if not ok then report.SettingsDirty=true end
    task.delay(5,function()
     if destroyed or report.Serial~=serial or report.SettingsPending~=revision or not report.SettingsAllowed then return end
@@ -1226,8 +1239,15 @@ do
   for _,target in ipairs(Players:GetPlayers())do report.TrackPlayer(target)end
   connect(Players.PlayerAdded,report.TrackPlayer)
   connect(Players.PlayerRemoving,report.UntrackPlayer)
-  if AssetRoster and AssetRoster.SnapshotRefreshed then connect(AssetRoster.SnapshotRefreshed,report.MarkPlayersDirty)end
-  if Save and type(Save.Watch)=="function" then connect(Save.Watch("SpeedPower"),report.MarkPlayersDirty)end
+  if AssetRoster and AssetRoster.SnapshotRefreshed then
+   connect(AssetRoster.SnapshotRefreshed,report.MarkPlayersDirty)
+   connect(AssetRoster.SnapshotRefreshed,report.MarkSettingsDirty)
+  end
+  if Save and type(Save.Watch)=="function" then
+   connect(Save.Watch("SpeedPower"),report.MarkPlayersDirty)
+   connect(Save.Watch("Index"),report.MarkSettingsDirty)
+   connect(Save.Watch("EggInventory"),report.MarkSettingsDirty)
+  end
   if EggState.ResetCountdown then connect(EggState.ResetCountdown,report.Reset) end
   if EggState.RarityRevealed then connect(EggState.RarityRevealed,report.Revealed) end
   task.spawn(function()
@@ -3871,7 +3891,8 @@ function FusionModules.RemoteHop.Validate(target)
  if type(target)~="table" or target.placeId~=tostring(game.PlaceId) or type(target.jobId)~="string" or target.jobId=="" or #target.jobId>128 or target.jobId==game.JobId then return false end
  local rate=target.incomePerSecond
  if type(rate)~="number" or rate~=rate or rate<0 or rate>=math.huge then return false end
- if rate<FusionModules.Options.AutoEggsMin or rate>FusionModules.Options.AutoEggsMax then return false end
+  local missing=FusionModules.Options.AutoIndex and report.MissingCategories()[target.category]==true
+ if not missing and not (FusionModules.Options.AutoEggs and rate>=FusionModules.Options.AutoEggsMin and rate<=FusionModules.Options.AutoEggsMax)then return false end
  if visitedServers[target.jobId] or target.carrierUserId or target.state=="Carried" or target.observationOnly then return false end
  return true
 end
