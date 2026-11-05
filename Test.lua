@@ -2456,6 +2456,59 @@ local function hatchReadyEggsOnWallClose(token)
 	return opened
 end
 
+function FusionModules.Helpers.PlotEggCountdown(record)
+ if type(record)~="table" or record.Placement==nil or not EggGrowthPolicy then return nil,false end
+ local ok,grown=pcall(EggGrowthPolicy.IsReady,record,0)
+ if ok and grown then return 0,true end
+ local valid,seconds=pcall(EggGrowthPolicy.GetRemainingGrowthSeconds,record,0)
+ if not valid or type(seconds)~="number" or seconds~=seconds or seconds==math.huge then return nil,false end
+ return math.max(0,math.ceil(seconds)),false
+end
+function FusionModules.Helpers.PlotEggTimeText(record)
+ local seconds,grown=FusionModules.Helpers.PlotEggCountdown(record)
+ if grown then return "Pret a ouvrir",true end
+ if not seconds then return "Temps indisponible",false end
+ if seconds>=3600 then return string.format("%dh %02dm %02ds",math.floor(seconds/3600),math.floor(seconds/60)%60,seconds%60),false end
+ return string.format("%dm %02ds",math.floor(seconds/60),seconds%60),false
+end
+function FusionModules.Helpers.OpenSelectedPlotEggs(selection)
+ if hatchInProgress or inventoryPlacementBusy or placementRequest or FusionModules.Pending() or currentCycle or serverHopPending then
+  setStatus("Operation deja en cours");return
+ end
+ if not ready or destroyed or not PlacedEggRenderer or not EggGrowthPolicy then return end
+ local ids={}
+ for uid,selected in pairs(selection)do if selected then table.insert(ids,uid)end end
+ if #ids==0 then setStatus("Selectionne les oeufs du Plot a ouvrir.");return end
+ local eggs=inventoryEggRecords()
+ table.sort(ids,function(a,b)
+  local ar,br=getRatePerSecond(eggs[a])or 0,getRatePerSecond(eggs[b])or 0
+  if ar~=br then return ar>br end
+  return a<b
+ end)
+ hatchInProgress=true
+ if renderControls then renderControls()end
+ local opened,waiting,failed=0,0,0
+ local ok,err=xpcall(function()
+  for _,uid in ipairs(ids)do
+   if destroyed then break end
+   local readOK,record=pcall(EggState.ReadOwnedEgg,player.UserId,uid)
+   if readOK and type(record)=="table" and record.Placement~=nil then
+    local _,grown=FusionModules.Helpers.PlotEggCountdown(record)
+    if grown then
+     local activated,accepted,reason=pcall(PlacedEggRenderer.ActivateLocalEgg,uid)
+     if activated and accepted==true then opened+=1;selection[uid]=nil else failed+=1 end
+     log("MANUAL_HATCH","Ouverture manuelle de %s UID=%s Accepte=%s Raison=%s",FusionModules.Helpers.DescribeEgg(record),uid,tostring(activated and accepted==true),tostring(activated and reason or accepted))
+     task.wait()
+    else waiting+=1 end
+   else selection[uid]=nil;failed+=1 end
+  end
+ end,debug.traceback)
+ hatchInProgress=false
+ if not ok then log("MANUAL_HATCH_ERROR","%s",tostring(err));failed+=1 end
+ setStatus(string.format("Ouverture : %d demande(s) acceptee(s), %d en croissance, %d indisponible(s).",opened,waiting,failed))
+ if refreshEggInterface then refreshEggInterface()end
+end
+
 
 -- Egg capacity is independent of the equipped-animal limit.
 local function plotEggCapacity(eggs)
@@ -4348,8 +4401,9 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 		minimumInput.TextEditable = true
 		thresholdTitle.Visible = true
 		minimumInput.Visible = true
-		toggleButton.Title.Text = activeTab == "Backpack" and (inventoryPlacementBusy and "Placement..." or "Placer") or (activeTab == "Queue" and "Remove" or "Add")
-		toggleButton.Visible = activeTab ~= "Plot" and activeTab ~= "Params"
+		toggleButton.Title.Text = activeTab == "Plot" and (hatchInProgress and "Ouverture..." or "Ouvrir") or activeTab == "Backpack" and (inventoryPlacementBusy and "Placement..." or "Placer") or (activeTab == "Queue" and "Remove" or "Add")
+		toggleButton.Visible = activeTab ~= "Params"
+        toggleButton.Active = not hatchInProgress and not inventoryPlacementBusy
 		missingButton.Visible = activeTab == "Map"
 		pauseButton.Visible = activeTab ~= "Backpack" and activeTab ~= "Plot" and not queuePaused
 		pausedButton.Visible = activeTab ~= "Backpack" and activeTab ~= "Plot" and queuePaused
@@ -4358,7 +4412,7 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 			local checked = selectedEggs[uid] == true
 			card.holder.SelectedOverlay.Visible = checked
 			card.holder.SelectedIcon.Visible = checked
-			card.button.Active = activeTab ~= "Plot" and not inventoryPlacementBusy and not (activeTab == "Backpack" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced)
+			card.button.Active = not hatchInProgress and not inventoryPlacementBusy and not (activeTab == "Backpack" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced)
 		end
 	end
 	refreshEggInterface = function()
@@ -4423,7 +4477,7 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 				card = {holder = holder, visual = visual, button = click}
 				cards[uid] = card
 				card.connection = click.Activated:Connect(function()
-					if activeTab == "Plot" or inventoryPlacementBusy or (activeTab == "Backpack" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced) then return end
+					if hatchInProgress or inventoryPlacementBusy or (activeTab == "Backpack" and inventoryRecords[uid] and inventoryRecords[uid].InventoryPlaced) then return end
 					selectedEggs[uid] = not selectedEggs[uid] or nil
 					updateSelection()
 				end)
@@ -4431,12 +4485,29 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 			end
 			card.holder.LayoutOrder = index
 			paintEggCard(card.visual, record)
+            if not card.countdown then
+             card.countdown=card.visual.Weight:Clone()
+             card.countdown.Name="OpenCountdown"
+             card.countdown.Position=UDim2.fromScale(.05,.20)
+             card.countdown.Size=UDim2.fromScale(.90,.15)
+             card.countdown.BackgroundColor3=Color3.fromRGB(15,20,28)
+             card.countdown.BackgroundTransparency=.15
+             card.countdown.TextScaled=true
+             card.countdown.TextXAlignment=Enum.TextXAlignment.Center
+             card.countdown.Parent=card.visual
+            end
+            card.countdown.Visible=activeTab=="Plot"
+            if activeTab=="Plot" then
+             local text,grown=FusionModules.Helpers.PlotEggTimeText(record)
+             card.countdown.Text=text
+             card.countdown.TextColor3=grown and Color3.fromRGB(170,255,100)or Color3.fromRGB(255,220,130)
+            end
 			if isHeldByOther(record) then
 				card.visual.Weight.Text = "Suivi : "..(record.CarrierUserId and tostring(record.CarrierUserId) or "transport")
 			elseif record.ObservationOnly then
 				card.visual.Weight.Text = "Oeuf retrouve - serveur a confirmer"
 			elseif record.InventoryPlaced then
-				card.visual.Weight.Text = "Place"
+				-- Keep the actual weight painted by paintEggCard.
 				if activeTab == "Backpack" then inventorySelection[uid] = nil end
 			end
 		end
@@ -4504,7 +4575,17 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 		setStatus(tostring(count) .. " oeuf(s) d'animaux manquants selectionne(s). Clique Add.")
 	end)
 	connect(toggleButton.Activated, function()
-		if activeTab == "Params" or activeTab == "Plot" then return end
+		if activeTab == "Params" then return end
+        if activeTab == "Plot" then
+         if hatchInProgress then return end
+         local selection=table.clone(plotSelection)
+         task.spawn(function()
+          FusionModules.Helpers.OpenSelectedPlotEggs(selection)
+          for uid in pairs(plotSelection)do if not selection[uid]then plotSelection[uid]=nil end end
+          if refreshEggInterface then refreshEggInterface()end
+         end)
+         return
+        end
 		refreshEggInterface()
 		if activeTab == "Backpack" then
 			if FusionModules.Pending() or inventoryPlacementBusy or placementRequest then setStatus("Operation inventaire deja en cours"); return end
