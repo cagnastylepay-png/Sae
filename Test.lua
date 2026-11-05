@@ -73,7 +73,7 @@ local FusionModules = {}
 FusionModules.Helpers = {}
 FusionModules.Options={AutoEggs=true,AutoEggsMin=2e9,AutoEggsMax=999e9,
  AutoTreadmill=true,AutoSell=true,AutoSellMin=0,AutoSellMax=2e9,
- AutoFuse=true,AutoFuseMin=0,AutoFuseMax=1e33,AutoOpen=true,AutoOpenMin=0,AutoOpenMax=20e9,AutoPlace=true,AutoPlaceMin=2e9,AutoPlaceMax=1e33,AutoPapillon=true,AutoIndex=true,QueueNearest=false}
+ AutoFuse=true,AutoFuseMin=0,AutoFuseMax=1e33,AutoOpen=true,AutoOpenMin=0,AutoOpenMax=20e9,AutoPlace=true,AutoPlaceMin=2e9,AutoPlaceMax=1e33,AutoPapillon=true,AutoIndex=true,QueueNearest=false,TeleportInstantMin=100e9}
 
 function FusionModules.Helpers.InIncomeRange(key,rate)
  return type(rate)=="number"and rate==rate and rate<math.huge
@@ -88,8 +88,8 @@ function FusionModules.Helpers.SetOption(key,value)
  else
   if type(value)~="number"or value~=value or value<0 or value>=math.huge then return false,"Revenu invalide"end
   local prefix=key:sub(1,-4)
-  if key:match("Min$")and value>FusionModules.Options[prefix.."Max"]then return false,"Minimum superieur au maximum"end
-  if key:match("Max$")and value<FusionModules.Options[prefix.."Min"]then return false,"Maximum inferieur au minimum"end
+  if key:match("Min$")and type(FusionModules.Options[prefix.."Max"])=="number"and value>FusionModules.Options[prefix.."Max"]then return false,"Minimum superieur au maximum"end
+  if key:match("Max$")and type(FusionModules.Options[prefix.."Min"])=="number"and value<FusionModules.Options[prefix.."Min"]then return false,"Maximum inferieur au minimum"end
  end
  FusionModules.Options[key]=value
  minimumRatePerSecond=FusionModules.Options.AutoEggsMin
@@ -322,6 +322,7 @@ local function syncVisitedServerCycle(forceReset)
 		table.clear(visitedServers)
 		if game.JobId~="" then visitedServers[game.JobId]=true end
 		visitedCycleIndex=index
+        if FusionModules.Reporting then FusionModules.Reporting.MarkSettingsDirty()end
 		executorTools.SaveSettings()
 		log("SERVER_CHANGE","Nouveau cycle d'oeufs=%s : historique serveurs reinitialise",tostring(index))
 	end
@@ -834,7 +835,16 @@ do
   report.Token=type(options.Token)=="string" and options.Token or nil
  end
  report.SessionId=HttpService:GenerateGUID(false)
- report.PolicyKnown=false;report.LogsAllowed=false;report.SettingsAllowed=false;report.SettingsDirty=true
+ function report.AutomationActive()
+  return autoEnabled and automaticMode and FusionModules.Options.AutoEggs and not queuePaused and not stopAfterFlight and not destroyed and not serverHopPending
+ end
+ function report.VisitedJobs()
+  local ids={}
+  for id,visited in pairs(visitedServers)do if visited and #ids<500 then table.insert(ids,id)end end
+  table.sort(ids)
+  return ids
+ end
+ report.PolicyKnown=false;report.LogsAllowed=false;report.SettingsAllowed=false;report.SettingsDirty=true;report.TeleportAllowed=false
  report.SettingsRevision=0
  function report.ScheduleSettings()
   if report.SettingsScheduled or destroyed or not report.Ready or not report.LogIdentityReady or not report.SettingsAllowed or not report.Socket or not report.SettingsDirty then return end
@@ -848,7 +858,7 @@ do
    local options=table.clone(FusionModules.Options)
    report.SettingsDirty=false
    report.SettingsPending=revision
-   local ok=pcall(function()report.Socket:Send(HttpService:JSONEncode({version=1,type="settings.snapshot",sessionId=report.SessionId,revision=revision,options=options}))end)
+   local ok=pcall(function()report.Socket:Send(HttpService:JSONEncode({version=1,type="settings.snapshot",sessionId=report.SessionId,revision=revision,options=options,automationActive=report.AutomationActive(),visitedJobIds=report.VisitedJobs()}))end)
    if not ok then report.SettingsDirty=true end
    task.delay(5,function()
     if destroyed or report.Serial~=serial or report.SettingsPending~=revision or not report.SettingsAllowed then return end
@@ -877,6 +887,7 @@ do
   log("REPORT",message,...)
  end
  function report.Disconnect()
+  if FusionModules.RemoteHop then FusionModules.RemoteHop.Pending=nil end
   report.Serial+=1
   report.Ready=false
   report.LogIdentityReady=false
@@ -1052,12 +1063,17 @@ do
       report.Log("Accuse Cycle=%s Revision=%s Accepte=%s",tostring(message.cycleId),tostring(message.revision),tostring(message.accepted))
      elseif message.type=="reporting.policy" then
       report.PolicyKnown=true
+      report.TeleportAllowed=message.sendTeleport==true and message.favorite==true
+      if not report.TeleportAllowed and FusionModules.RemoteHop then FusionModules.RemoteHop.Pending=nil end
       report.LogsAllowed=message.sendLogs==true
       if report.SettingsAllowed~= (message.sendSettings==true)then
        report.SettingsAllowed=message.sendSettings==true
        if report.SettingsAllowed then report.MarkSettingsDirty()end
       end
       if not report.LogsAllowed then table.clear(executorTools.RemoteLogQueue)else report.ScheduleLogs()end
+      if FusionModules.RefreshParams then FusionModules.RefreshParams()end
+     elseif message.type=="teleport.request" then
+      if FusionModules.RemoteHop then FusionModules.RemoteHop.Receive(message)end
      elseif message.type=="settings.ack" and message.sessionId==report.SessionId then
       if report.SettingsPending==message.revision then report.SettingsPending=nil end
      elseif message.type=="logs.ack" and message.sessionId==report.SessionId then
@@ -2309,6 +2325,7 @@ end
 stopAutomation = function(reason, pause)
 	queuePaused = pause ~= false
 	autoEnabled = false
+    if FusionModules.Reporting then FusionModules.Reporting.MarkSettingsDirty()end
 	generation += 1
 	if currentCycle then cleanupCycle(currentCycle) end
 	stopMovement(true)
@@ -3223,6 +3240,7 @@ end
 local function requestUserStop(reason)
 	if autoEnabled and (currentCycle ~= nil or autoActivity == "FARM") then
 		stopAfterFlight = true
+        if FusionModules.Reporting then FusionModules.Reporting.MarkSettingsDirty()end
 		setStatus("Arret demande : fin du vol puis pause.")
 		if renderControls then renderControls() end
 		return
@@ -3383,6 +3401,7 @@ startAutomation = function(billions)
 	generation += 1
 	local token = generation
 	autoEnabled = true
+    if FusionModules.Reporting then FusionModules.Reporting.MarkSettingsDirty()end
 	snapshot(EggState.ReadFieldEggs())
 	if renderControls then renderControls() end
 	log("START", "Minimum=%s/s SafeHome=%s Session=%d",
@@ -3746,6 +3765,101 @@ requestRandomServerHop = function(token, reason)
 	return true
 end
 
+-- Render sends data-only destinations. Revalidate favorite status, Auto and income locally.
+FusionModules.RemoteHop={Pending=nil,Processing=false,RetryAt=0}
+function FusionModules.RemoteHop.Validate(target)
+ local report=FusionModules.Reporting
+ if destroyed or not ready or not report or not report.Ready or not report.TeleportAllowed or not report.SettingsAllowed or not report.AutomationActive() then return false end
+ if type(target)~="table" or target.placeId~=tostring(game.PlaceId) or type(target.jobId)~="string" or target.jobId=="" or #target.jobId>128 or target.jobId==game.JobId then return false end
+ local rate=target.incomePerSecond
+ if type(rate)~="number" or rate~=rate or rate<0 or rate>=math.huge then return false end
+ if rate<FusionModules.Options.AutoEggsMin or rate>FusionModules.Options.AutoEggsMax then return false end
+ if visitedServers[target.jobId] or target.carrierUserId or target.state=="Carried" or target.observationOnly then return false end
+ return true
+end
+function FusionModules.RemoteHop.Receive(message)
+ local hop=FusionModules.RemoteHop
+ if type(message)~="table" or not FusionModules.RemoteHop.Validate(message.target) then hop.Pending=nil;return end
+ local expiry,serverTime=message.target.expiresAt,message.serverTime
+ if type(expiry)~="number" or type(serverTime)~="number" or expiry<=serverTime or expiry-serverTime>1200000 then hop.Pending=nil;return end
+ hop.Pending={Target=message.target,Deadline=os.clock()+(expiry-serverTime)/1000,Id=message.requestId}
+ hop.Try()
+end
+function FusionModules.RemoteHop.Try()
+ local hop=FusionModules.RemoteHop
+ if hop.Processing or serverHopPending or not hop.Pending or os.clock()<hop.RetryAt then return false end
+ local request=hop.Pending
+ if os.clock()>=request.Deadline or not hop.Validate(request.Target) then hop.Pending=nil;return false end
+ local immediate=request.Target.incomePerSecond>=FusionModules.Options.TeleportInstantMin
+ if not immediate then
+  if next(queuedEggs)~=nil or currentCycle or inventoryPlacementBusy or placementRequest or hatchInProgress or FusionModules.Pending() or (inFlightRequest and not inFlightRequest.done) then return false end
+  local carry=readCarry()
+  if not carry or carry.IsCarrying then return false end
+ end
+ hop.Processing=true
+ task.spawn(function()
+  local function release(reason)
+   hop.Processing=false;hop.RetryAt=os.clock()+30
+   if reason then setStatus("Teleportation Render : "..tostring(reason));log("ACTION","Teleportation Render refusee : %s",tostring(reason))end
+  end
+  local success,failure=xpcall(function()
+   local saved,why=executorTools.SaveSettings()
+   if not saved then release(why);return end
+   local queued,reason=FusionModules.Helpers.prepareServerContinuation()
+   if not queued then release(reason);return end
+   if hop.Pending~=request or os.clock()>=request.Deadline or not hop.Validate(request.Target) then release();return end
+   if not immediate and (next(queuedEggs)~=nil or currentCycle)then hop.Processing=false;return end
+   local target=request.Target
+   -- Cancel old generation before dispatch so movement and optional actions cannot restart.
+   serverHopPending=true
+   generation+=1
+   autoEnabled=false
+   if currentCycle then cleanupCycle(currentCycle)end
+   stopMovement(true)
+   visitedServers[target.jobId]=true
+   local stored,storeReason=executorTools.SaveSettings()
+   if not stored then visitedServers[target.jobId]=nil;error(storeReason)end
+   FusionModules.Reporting.MarkSettingsDirty()
+   local description=string.format("%s [Poids=%s kg; Revenu=%s/s]",tostring(target.name or target.category or target.uid),(type(target.weightKg)=="number"and formatNumber(target.weightKg)or "inconnu"),formatNumber(target.incomePerSecond))
+   setStatus("Teleportation vers "..description)
+   log("ACTION","Teleportation %s vers %s Serveur=%s",immediate and "immediate"or "file vide",description,target.jobId)
+   local connection
+   local resumed=false
+   local function resume(detail)
+    if resumed or destroyed then return end
+    resumed=true
+    if connection then connection:Disconnect()end
+    serverHopPending=false;hop.Processing=false;hop.RetryAt=os.clock()+30
+    hop.Pending=nil
+    autoActivity="IDLE"
+    log("ACTION","Teleportation echouee : %s",tostring(detail))
+    if automaticMode and not queuePaused and not stopAfterFlight then wakeQueue()end
+    FusionModules.Reporting.MarkSettingsDirty()
+   end
+   connection=connect(game:GetService("TeleportService").TeleportInitFailed,function(failedPlayer,result,detail)
+    if failedPlayer==player then resume(tostring(result)..": "..tostring(detail))end
+   end)
+   local sent,err=pcall(function()game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId,target.jobId,player)end)
+   if not sent then resume(err);return end
+   task.delay(25,function()resume("Connexion non terminee apres 25 s")end)
+  end,debug.traceback)
+  if not success then
+   if serverHopPending then serverHopPending=false;autoEnabled=false;if automaticMode and not queuePaused then wakeQueue()end end
+   release(failure)
+  end
+ end)
+ return true
+end
+do
+ local elapsed=0
+ connect(RunService.Heartbeat,function(dt)
+  elapsed+=dt
+  if elapsed<.1 then return end
+  elapsed=0
+  FusionModules.RemoteHop.Try()
+ end)
+end
+
 -- FOXIN reference logic: direct Workspace models, matching names, zero Velocity,
 -- MoveTo at the current root position, every 0.2 seconds. Always active.
 local function immobilizeReferenceGuards()
@@ -3787,14 +3901,17 @@ function FusionModules.Helpers.BuildParamsPanel(panel, connect, getOptions, setO
  local function refresh()
   local options=getOptions()
   for key,c in pairs(controls)do
+   if c.FavoriteSection then c.FavoriteSection.Visible=FusionModules.Reporting and FusionModules.Reporting.SettingsAllowed==true end
    if c.Toggle then
     c.Toggle.Text=key=="QueueNearest"and(options[key]and "Proche"or "Revenu")or(options[key]and "ON"or "OFF")
     c.Toggle.BackgroundColor3=(key=="QueueNearest"or options[key])and Color3.fromRGB(102,210,65)or Color3.fromRGB(150,58,58)
    end
    if c.Input then
     c.Input.Text=formatNumber(options[key]).."/s"
-    local ceiling=math.max(100e9,options[c.Root.."Max"],1)
-    c.Fill.Size=UDim2.fromScale(math.clamp(options[key]/ceiling,0,1),1)
+    if c.Fill then
+     local ceiling=math.max(100e9,options[c.Root.."Max"],1)
+     c.Fill.Size=UDim2.fromScale(math.clamp(options[key]/ceiling,0,1),1)
+    end
    end
   end
  end
@@ -3848,6 +3965,20 @@ function FusionModules.Helpers.BuildParamsPanel(panel, connect, getOptions, setO
    end
   end
  end
+ local remoteSection=make("Frame",panel,"FavoriteTeleport",UDim2.new(1,-12,0,116))
+ remoteSection.LayoutOrder=order+1;remoteSection.BackgroundColor3=Color3.fromRGB(29,34,44);remoteSection.BorderSizePixel=0
+ Instance.new("UICorner",remoteSection).CornerRadius=UDim.new(0,10)
+ label(remoteSection,"Title","Teleportation immediate : revenu minimum",UDim2.fromOffset(16,12),UDim2.new(1,-32,0,32))
+ local instantInput=make("TextBox",remoteSection,"Minimum",UDim2.new(1,-32,0,42),UDim2.fromOffset(16,56))
+ instantInput.BackgroundColor3=Color3.fromRGB(45,52,67);instantInput.TextColor3=Color3.new(1,1,1);instantInput.TextSize=24;instantInput.Font=Enum.Font.GothamBold;instantInput.ClearTextOnFocus=false
+ Instance.new("UICorner",instantInput)
+ controls.TeleportInstantMin={Input=instantInput,FavoriteSection=remoteSection}
+ connect(instantInput.FocusLost,function()
+  local rate=FusionModules.Helpers.parseIncomeRate(instantInput.Text)
+  if rate then setOption("TeleportInstantMin",math.min(rate,1e33))end
+  refresh()
+ end)
+
  refresh()
  return refresh
 end
@@ -4356,6 +4487,7 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
   for _,child in ipairs(paramsPanel:GetChildren())do if child:IsA("GuiObject")then child.Parent=legacy end end
   legacy.Parent=paramsPanel
   local repaint=FusionModules.Helpers.BuildParamsPanel(paramsPanel,connect,function()return FusionModules.Options end,FusionModules.Helpers.SetOption)
+  FusionModules.RefreshParams=repaint
   FusionModules.OnOptionsChanged=function()
    if FusionModules.Reporting and FusionModules.Reporting.MarkSettingsDirty then FusionModules.Reporting.MarkSettingsDirty()end
    wallMaintenancePending=true
@@ -4407,6 +4539,7 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 		end
 		if renderControls then renderControls() end
 		refreshQueueInterface()
+        if FusionModules.Reporting then FusionModules.Reporting.MarkSettingsDirty()end
 	end
 	connect(pauseButton.Activated, toggleQueue)
 	connect(pausedButton.Activated, toggleQueue)
