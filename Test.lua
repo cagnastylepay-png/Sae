@@ -5040,7 +5040,7 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 			end
 		end
 	end)
-	show(true)
+	show(false)
 	log("UI_READY", "Interface autonome creee avec carte meilleur oeuf deplacable.")
 	return gui
 end
