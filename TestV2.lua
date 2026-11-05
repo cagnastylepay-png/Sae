@@ -179,8 +179,9 @@ function O.ShouldRelocate()
  local message=O.Relocation
  if not O.Ready or not O.IdentityReady or not message or not message.relocate
   or message.placeId~=tostring(game.PlaceId)or message.jobId~=game.JobId then return false end
- -- Never leave until Render has accepted the latest complete egg snapshot.
- return message.mode=="roam" and O.EggAckRevision==O.EggRevision and O.EggRevision>0
+ -- Wait 30 seconds after sending data, and require Render to accept the latest snapshot.
+ return message.mode=="roam" and O.HopNotBefore~=nil and os.clock()>=O.HopNotBefore
+  and O.EggAckRevision==O.EggRevision and O.EggRevision>0
   and not O.EggDirty and not O.PlayerDirty and not O.Syncing
 end
 function O.IsCandidateServer(server,avoid)
@@ -311,7 +312,10 @@ task.spawn(function()
       local message=O.Header("eggs.snapshot","EggReporter",O.EggRevision)
       message.cycleId=cycle;message.observedAt=os.date("!%Y-%m-%dT%H:%M:%SZ")
       message.cycleEndsAt=O.Cycle.NextNightTime(O.Clock.Now())
-      if O.Send(message,"eggs",rows)then O.EggFingerprint=fingerprint;O.ForceEggs=false;O.PendingAt=O.PendingAt or now end
+      if O.Send(message,"eggs",rows)then
+       O.HopNotBefore=os.clock()+30
+       O.EggFingerprint=fingerprint;O.ForceEggs=false;O.PendingAt=O.PendingAt or now
+      end
      end
      O.EggDirty=false;O.LastEggs=now
     end
