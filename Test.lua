@@ -2471,7 +2471,9 @@ local function selectBest()
 end
 
 stopAutomation = function(reason, pause)
-	queuePaused = pause ~= false
+	queuePaused = pause ~= false and not automaticMode
+	if automaticMode then stopAfterFlight = false end
+	FusionModules.QueueResumeAt = os.clock() + 3
 	autoEnabled = false
     if FusionModules.Reporting then FusionModules.Reporting.MarkSettingsDirty()end
 	generation += 1
@@ -2479,7 +2481,7 @@ stopAutomation = function(reason, pause)
 	stopMovement(true)
 	setStatus(reason or "Arrete", Color3.fromRGB(255, 150, 120))
 	if renderControls then renderControls() end
-	log("STOP", "%s | RemoteEnCours=%s", reason or "utilisateur", tostring(inFlightRequest and not inFlightRequest.done))
+	log("STOP", "%s | RemoteEnCours=%s | RepriseAuto=%s", reason or "utilisateur", tostring(inFlightRequest and not inFlightRequest.done), tostring(automaticMode))
 end
 
 local function activityValid(token, character)
@@ -3566,6 +3568,12 @@ startAutomation = function(billions)
 end
 
 wakeQueue = function()
+ if automaticMode and queuePaused then
+  queuePaused=false;stopAfterFlight=false
+  log("QUEUE_RESUME","File remise en lecture automatiquement (mode AUTO)")
+  if FusionModules.Reporting then FusionModules.Reporting.MarkSettingsDirty()end
+ end
+ if os.clock() < (FusionModules.QueueResumeAt or 0) then return end
  if not FusionModules.Helpers.ShouldRun()then return end
 	if FusionModules.Pending() or inventoryPlacementBusy or placementRequest or serverHopPending or destroyed or not ready or autoEnabled or queuePaused or (not automaticMode and next(queuedEggs) == nil) then return end
 	if inFlightRequest and not inFlightRequest.done then return end
