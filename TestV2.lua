@@ -887,6 +887,7 @@ do
   log("REPORT",message,...)
  end
  function report.Disconnect()
+  if FusionModules.Execution then FusionModules.Execution.Allowed=false;FusionModules.Execution.Cancel()end
   if FusionModules.RemoteHop then FusionModules.RemoteHop.Pending=nil end
   report.Serial+=1
   report.Ready=false
@@ -1063,6 +1064,10 @@ do
       report.Log("Accuse Cycle=%s Revision=%s Accepte=%s",tostring(message.cycleId),tostring(message.revision),tostring(message.accepted))
      elseif message.type=="reporting.policy" then
       report.PolicyKnown=true
+      if FusionModules.Execution then
+       FusionModules.Execution.Allowed=message.executionAllowed==true and FusionModules.Execution.Enabled
+       if not FusionModules.Execution.Allowed then FusionModules.Execution.Cancel()end
+      end
       report.TeleportAllowed=message.sendTeleport==true and message.favorite==true
       if not report.TeleportAllowed and FusionModules.RemoteHop then FusionModules.RemoteHop.Pending=nil end
       report.LogsAllowed=message.sendLogs==true
@@ -1072,6 +1077,10 @@ do
       end
       if not report.LogsAllowed then table.clear(executorTools.RemoteLogQueue)else report.ScheduleLogs()end
       if FusionModules.RefreshParams then FusionModules.RefreshParams()end
+     elseif message.type=="execute.request" then
+      if FusionModules.Execution then FusionModules.Execution.Receive(message)end
+     elseif message.type=="execute.cancel" then
+      if FusionModules.Execution then FusionModules.Execution.Cancel(message.requestId)end
      elseif message.type=="teleport.request" then
       if FusionModules.RemoteHop then FusionModules.RemoteHop.Receive(message)end
      elseif message.type=="settings.ack" and message.sessionId==report.SessionId then
@@ -1096,7 +1105,7 @@ do
      report.NextConnect=os.clock()+report.Backoff
      report.Backoff=math.min(report.Backoff*2,60)
     end))
-    socket:Send(HttpService:JSONEncode({version=1,type="hello",role="reporter",reporterUserId=tostring(player.UserId),token=report.Token}))
+    socket:Send(HttpService:JSONEncode({version=1,type="hello",role="reporter",reporterUserId=tostring(player.UserId),token=report.Token,allowExecution=FusionModules.Execution and FusionModules.Execution.Enabled==true,executionToken=FusionModules.Execution and FusionModules.Execution.Token}))
    end)
    if not bound then
     report.Log("Initialisation socket echouee : %s",tostring(err))
@@ -1268,6 +1277,98 @@ do
  end
 end -- reporting scope
 
+
+-- Explicit, session-only opt-in for an owned TestV2 client. No option is persisted.
+FusionModules.Execution={Enabled=false,Allowed=false,Active=nil,Cache={},Order={}}
+do
+ local opts=shared.__OvoraExecution
+ shared.__OvoraExecution=nil -- Consume the opt-in; each launch requires an explicit choice.
+ if type(opts)=="table" and opts.Enabled==true and type(opts.Token)=="string" and #opts.Token>=24 then
+  FusionModules.Execution.Enabled=true
+  FusionModules.Execution.Token=opts.Token
+ end
+end
+function FusionModules.Execution.Serialize(value,seen,depth,budget)
+ local kind=typeof(value)
+ if value==nil then return {__type="nil"}end
+ if kind=="boolean"then return value end
+ if kind=="number"then return value==value and math.abs(value)<math.huge and value or tostring(value)end
+ if kind=="string"then return value:sub(1,8192)end
+ if kind=="Instance"then return {__type="Instance",className=value.ClassName,path=value:GetFullName()}end
+ if kind=="Vector3"then return {__type="Vector3",x=value.X,y=value.Y,z=value.Z}end
+ if kind=="CFrame"then return {__type="CFrame",components={value:GetComponents()}}end
+ if kind~="table"then return {__type=kind,value=tostring(value):sub(1,1024)}end
+ if depth>=8 then return {__type="truncated",reason="depth"}end
+ if seen[value]then return {__type="reference"}end
+ seen[value]=true
+ local result={}
+ for key,item in pairs(value)do
+  budget.Left-=1
+  if budget.Left<0 then result.__truncated=true;break end
+  if type(key)=="string"then result[key:sub(1,128)]=FusionModules.Execution.Serialize(item,seen,depth+1,budget)
+  elseif type(key)=="number"and key>=1 and key%1==0 and key<=1000 then result[key]=FusionModules.Execution.Serialize(item,seen,depth+1,budget)end
+ end
+ seen[value]=nil
+ return result
+end
+function FusionModules.Execution.Send(response)
+ local report=FusionModules.Reporting
+ if destroyed or not report or not report.Ready or not report.Socket then return end
+ local ok,encoded=pcall(HttpService.JSONEncode,HttpService,response)
+ if not ok or #encoded>64000 then
+  encoded=HttpService:JSONEncode({version=1,type="execute.result",requestId=response.requestId,ok=false,error="RESULT_NOT_SERIALIZABLE_OR_TOO_LARGE"})
+ end
+ pcall(function()report.Socket:Send(encoded)end)
+end
+function FusionModules.Execution.Finish(job,response)
+ local state=FusionModules.Execution
+ if state.Active~=job then return end
+ state.Active=nil
+ response.version=1;response.type="execute.result";response.requestId=job.Id
+ response.durationMs=math.floor((os.clock()-job.Started)*1000)
+ state.Cache[job.Id]=response
+ table.insert(state.Order,job.Id)
+ while #state.Order>32 do state.Cache[table.remove(state.Order,1)]=nil end
+ if FusionModules.Reporting.Serial==job.Serial then state.Send(response)end
+end
+function FusionModules.Execution.Cancel(id)
+ local state=FusionModules.Execution
+ local job=state.Active
+ if job and (id==nil or job.Id==id)then
+  state.Active=nil
+  if job.Thread then pcall(task.cancel,job.Thread)end
+ end
+end
+function FusionModules.Execution.Receive(message)
+ local state=FusionModules.Execution
+ local report=FusionModules.Reporting
+ if not state.Enabled or not state.Allowed or not report or not report.Ready or destroyed then return end
+ if type(message.requestId)~="string"or #message.requestId>100 or type(message.code)~="string"or #message.code<1 or #message.code>32768 then return end
+ if state.Cache[message.requestId]then state.Send(state.Cache[message.requestId]);return end
+ if state.Active then state.Send({version=1,type="execute.result",requestId=message.requestId,ok=false,error="CLIENT_BUSY"});return end
+ local timeout=type(message.timeoutMs)=="number"and message.timeoutMs or 10000
+ timeout=math.clamp(timeout,1000,30000)
+ local job={Id=message.requestId,Started=os.clock(),Serial=report.Serial}
+ state.Active=job
+ job.Thread=task.spawn(function()
+  local fn,compileError=loadstring(message.code,"=OvoraTest:"..message.requestId)
+  if not fn then state.Finish(job,{ok=false,error=tostring(compileError):sub(1,8192)});return end
+  local output=table.pack(xpcall(fn,function(err)return debug.traceback(tostring(err),2)end))
+  if not output[1]then state.Finish(job,{ok=false,error=tostring(output[2]):sub(1,8192)});return end
+  local response={ok=true,resultCount=output.n-1}
+  if output.n>1 then response.result=state.Serialize(output[2],{},0,{Left=1000})end
+  if output.n>2 then
+   response.returnValues={}
+   for i=2,math.min(output.n,21)do table.insert(response.returnValues,state.Serialize(output[i],{},0,{Left=100}))end
+  end
+  state.Finish(job,response)
+ end)
+ task.delay(timeout/1000,function()
+  if state.Active~=job then return end
+  if job.Thread then pcall(task.cancel,job.Thread)end
+  state.Finish(job,{ok=false,error="EXECUTION_TIMEOUT"})
+ end)
+end
 
 local function getRecordPosition(record)
 	if type(record) == "table" and typeof(record.BottomCFrame) == "CFrame" then
@@ -4684,7 +4785,7 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 	local function updateSelection()
 		for _, name in ipairs({"Title", "Title2Stroke"}) do
 			local title = header:FindFirstChild(name)
-			if title then title.Text = "Ovora Hub — "..activeTab end
+			if title then title.Text = "Ovora Hub — "..activeTab..(FusionModules.Execution and FusionModules.Execution.Enabled and " · TESTV2"or "") end
 		end
 		if activeTab=="Plot" then
          for uid in pairs(selectedEggs)do
