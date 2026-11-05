@@ -22,9 +22,16 @@ toggle.Name="ObserverToggle";toggle.Size=UDim2.fromOffset(68,34);toggle.Position
 toggle.Text="ON";toggle.TextSize=16;toggle.Font=Enum.Font.GothamBold
 toggle.TextColor3=Color3.new(1,1,1);toggle.BackgroundColor3=Color3.fromRGB(70,175,90);toggle.Parent=gui
 local toggleCorner=Instance.new("UICorner");toggleCorner.CornerRadius=UDim.new(0,8);toggleCorner.Parent=toggle
+local statusText=Instance.new("TextLabel")
+statusText.Name="ObserverStatus";statusText.Size=UDim2.fromOffset(250,54)
+statusText.Position=UDim2.new(1,-260,0,110);statusText.BackgroundTransparency=0.2
+statusText.BackgroundColor3=Color3.fromRGB(20,25,35);statusText.TextColor3=Color3.new(1,1,1)
+statusText.Font=Enum.Font.Gotham;statusText.TextSize=12;statusText.TextWrapped=true
+statusText.Text="Initialisation de l'observateur";statusText.Parent=gui
 gui.Parent=player:WaitForChild("PlayerGui")
 function O.Status(status,good)
  if O.Destroyed then return end
+ statusText.Text=O.Enabled and tostring(status)or "Observateur OFF"
  toggle.Text=O.Enabled and "ON"or "OFF"
  toggle.BackgroundColor3=O.Enabled and Color3.fromRGB(70,175,90)or Color3.fromRGB(95,100,110)
  if not O.Enabled then
@@ -163,12 +170,13 @@ function O.Eggs()
 end
 function O.Refresh()
  if not O.Enabled or O.Syncing then return end
+ O.Phase="Synchronisation des oeufs"
  local cycle=tostring(O.Cycle.ActivePeriodIndexAt(O.Clock.Now()))
  O.Syncing=true
  task.spawn(function()
   local success=pcall(O.EggState.SyncFieldEggs)
   O.Syncing=false;O.EggDirty=true;O.ForceEggs=true
-  if success then O.SnapshotCycle=cycle else O.NextSync=os.clock()+10 end
+  if success then O.SnapshotCycle=cycle else O.NextSync=os.clock()+10;O.Status("Snapshot indisponible : nouvel essai dans 10 s",false)end
  end)
 end
 local function markPlayers()O.PlayerDirty=true end
@@ -217,20 +225,21 @@ function O.Relocate()
  local serial=O.Serial
  O.HopBusy=true;O.NextHop=os.clock()+30
  task.spawn(function()
-  local success=pcall(function()
+  local success,failure=pcall(function()
    local env=type(getgenv)=="function"and getgenv()or getfenv()
    local requestFn=env.request or env.http_request or (env.syn and env.syn.request)
    local avoid={[game.JobId]=true}
    for _,id in ipairs(O.Relocation.avoidJobIds or {})do avoid[id]=true end
-   local candidates,fallback,cursor={},{},nil
+   O.Status("Recherche de serveur : 2 a 5 joueurs, sinon 6",false)
+   local candidates,fallback,cursor={},{},O.SearchCursor
    for _=1,3 do
     if not O.ShouldRelocate(serial)then return end
-    local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100"
+    local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Desc&excludeFullGames=true&limit=100"
     if cursor then url=url.."&cursor="..Http:UrlEncode(cursor)end
     local body
     if requestFn then
      local response=requestFn({Url=url,Method="GET"})
-     if response.StatusCode~=200 then error("Liste serveurs indisponible")end
+     if type(response)~="table"or tonumber(response.StatusCode)~=200 then error("Liste serveurs indisponible : HTTP "..tostring(type(response)=="table"and response.StatusCode or "?"))end
      body=response.Body
     else body=game:HttpGet(url)end
     local data=Http:JSONDecode(body)
@@ -239,11 +248,13 @@ function O.Relocate()
      if tier then table.insert(tier=="preferred"and candidates or fallback,{id=server.id,playing=server.playing})end
     end
     cursor=data.nextPageCursor
+    O.SearchCursor=cursor
     if #candidates>0 or not cursor then break end
    end
    if #candidates==0 then candidates=fallback end
    local destination=#candidates>0 and candidates[math.random(1,#candidates)]or nil
-   if not destination or not O.ShouldRelocate(serial)then return end
+   if not O.ShouldRelocate(serial)then return end
+   if not destination then O.Status("Aucun serveur disponible avec au moins 2 joueurs ; nouvel essai dans 30 s",false);return end
    local queue=env.queue_on_teleport or env.queueonteleport or (env.syn and env.syn.queue_on_teleport)
    if type(queue)~="function"then O.Status("Rechargement automatique indisponible",false);return end
    if not O.Queued then
@@ -257,7 +268,9 @@ function O.Relocate()
    task.wait(25)
   end)
   O.HopBusy=false
-  if not success then O.Status("Nouvelle tentative de serveur",false)end
+  if not success and serial==O.Serial then
+   O.LastError=tostring(failure);O.Status("Teleportation : "..tostring(failure):sub(1,140),false)
+  end
  end)
 end
 O.Connect(Teleport.TeleportInitFailed,function(target)
@@ -300,15 +313,15 @@ function O.OpenSocket()
    O.Send({version=1,type="hello",role="reporter",reporterUserId=tostring(player.UserId),observerOnly=true})
   end)
   if serial~=O.Serial or O.Destroyed or not O.Enabled then return end
-  if not success then O.Disconnect()end
+  if not success then O.Disconnect();O.Status("Socket : "..tostring(failure):sub(1,140),false)end
  end)
 end
 O.Initialized=true
 O.Refresh()
-task.spawn(function()
- while not O.Destroyed do
-  if O.Enabled then
+function O.Step()
+ if not O.Enabled then return end
   local now=os.clock()
+  O.Phase="Lecture du cycle"
   local cycle=tostring(O.Cycle.ActivePeriodIndexAt(O.Clock.Now()))
   if cycle~=O.CurrentCycle then O.CurrentCycle=cycle;O.Tried={};O.Refresh()end
   if not O.Syncing and O.SnapshotCycle~=cycle and now>=(O.NextSync or 0)then O.Refresh()end
@@ -317,6 +330,7 @@ task.spawn(function()
   if O.PendingAt and now-O.PendingAt>25 then O.PendingAt=nil;O.Disconnect()end
   if O.Ready and game.JobId~=""then
    if O.PlayerDirty and now-(O.LastPlayers or 0)>=1 then
+    O.Phase="Lecture des joueurs"
     local rows=O.Players();local fingerprint=Http:JSONEncode(rows)
     if O.ForcePlayers or fingerprint~=O.PlayerFingerprint then
      O.PlayerRevision=O.PlayerRevision+1
@@ -327,6 +341,7 @@ task.spawn(function()
     O.PlayerDirty=false;O.LastPlayers=now
    end
    if O.IdentityReady and O.SnapshotCycle==cycle and not O.Syncing and O.EggDirty and now-(O.LastEggs or 0)>=1 then
+    O.Phase="Lecture des oeufs"
     local rows=O.Eggs()
     if rows then
      local fingerprint=cycle..Http:JSONEncode(rows)
@@ -341,7 +356,16 @@ task.spawn(function()
     end
    end
   end
+  O.Phase="Selection du prochain serveur"
   O.Relocate()
+end
+task.spawn(function()
+ while not O.Destroyed do
+  local success,failure=xpcall(O.Step,debug.traceback)
+  if not success then
+   O.LastError=tostring(failure)
+   O.Status(tostring(O.Phase or "Observateur").." : "..tostring(failure):sub(1,140),false)
+   task.wait(2)
   end
   task.wait(0.5)
  end
