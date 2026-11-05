@@ -1375,6 +1375,7 @@ local function startReturnImmediately(ctx, source)
 	local character, humanoid, root = getCharacterParts()
 	if character ~= ctx.character or not humanoid or not root then return end
 	ctx.returnKickAt = os.clock()
+    if FusionModules.BatCombat then FusionModules.BatCombat.Stop()end
 	ctx.hadCarry = true
 	setPhase(ctx, "RETURN", "Prise confirmee : retour immediat")
 	move(ctx.home, {Radius = CONFIG.ReturnDistance})
@@ -1992,8 +1993,99 @@ local function waitForClaim(ctx)
 	return false, "annule"
 end
 
+
+-- Native bat Tool activation only; combat remains subject to the game's validators.
+FusionModules.BatCombat={NextCheckAt=0,NextSwingAt=0,NextScanAt=0,Tool=nil,EquippedByScript=false,Count=0}
+function FusionModules.BatCombat.Stop()
+ local state=FusionModules.BatCombat
+ local tool=state.Tool
+ if tool then
+  pcall(function()
+   tool:Deactivate()
+   local backpack=player:FindFirstChildOfClass("Backpack")
+   if state.EquippedByScript and backpack and tool.Parent==player.Character then tool.Parent=backpack end
+  end)
+ end
+ if state.Count>0 then
+  log("ACTION","Frappes batte terminees : %s | %d activation(s) demandee(s)",tostring(state.GearName),state.Count)
+ end
+ state.Tool=nil;state.EquippedByScript=false;state.Count=0;state.GearName=nil
+end
+function FusionModules.BatCombat.FindBest(character,backpack)
+ local state=FusionModules.BatCombat
+ if not state.Directory then return nil end
+ local best,bestData,bestName
+ for _,container in pairs({character,backpack})do
+  if container then for _,tool in ipairs(container:GetChildren())do
+   if tool:IsA("Tool")then
+    local name=tool:GetAttribute("GearName")
+    local config=type(name)=="string"and state.Directory[name]
+    local data=config and config.BatControllerData
+    if type(data)=="table" and type(data.Force)=="number" and type(data.RangeBonus)=="number" and type(data.Duration)=="number" then
+     if not bestData or data.Force>bestData.Force
+      or (data.Force==bestData.Force and data.RangeBonus>bestData.RangeBonus)
+      or (data.Force==bestData.Force and data.RangeBonus==bestData.RangeBonus and data.Duration>bestData.Duration)
+      or (data.Force==bestData.Force and data.RangeBonus==bestData.RangeBonus and data.Duration==bestData.Duration and name<bestName)then
+      best,bestData,bestName=tool,data,name
+     end
+    end
+   end
+  end end
+ end
+ return best,bestName
+end
+function FusionModules.BatCombat.Step()
+ local state=FusionModules.BatCombat
+ local ctx=currentCycle
+ local preparing=not ctx and state.ApproachUid~=nil and autoActivity=="TO_FARM"
+ if destroyed or not autoEnabled or serverHopPending or (not ctx and not preparing) or (ctx and not validCycle(ctx)) then state.Stop();return end
+ local carry=readCarry()
+ local uid=ctx and ctx.uid or state.ApproachUid
+ local character,humanoid,root=getCharacterParts()
+ if not character or not humanoid or not root or humanoid.Health<=0 or not carry or carry.IsCarrying
+  or (ctx and ctx.claimed) or ownsEgg(uid) then state.Stop();return end
+ for _,child in ipairs(character:GetChildren())do
+  if child:IsA("Tool")and child:GetAttribute("ItemType")=="AssetEgg"then state.Stop();return end
+ end
+ if ctx and (ctx.phase=="CONFIRM_CLAIM" or ((ctx.remoteAccepted or ctx.sawCarry or ctx.hadCarry) and not ctx.carryLostAt and not ctx.watchForReappearance and not ctx.reacquiring))then state.Stop();return end
+ local now=os.clock()
+ if now<state.NextCheckAt then return end
+ state.NextCheckAt=now+.1
+ if motionBlockReason(ctx or {character=character})then return end
+ local backpack=player:FindFirstChildOfClass("Backpack")
+ if not state.Tool or (state.Tool.Parent~=backpack and state.Tool.Parent~=character) or now>=state.NextScanAt then
+  state.NextScanAt=now+1
+  local best,name=state.FindBest(character,backpack)
+  if best~=state.Tool then state.Stop();state.Tool=best;state.GearName=name end
+ end
+ local tool=state.Tool
+ if not tool then return end
+ if tool.Parent~=character then
+  humanoid:EquipTool(tool)
+  state.EquippedByScript=true
+ end
+ if tool.Parent~=character or now<state.NextSwingAt or isSafe(root.Position)==true then return end
+ -- Respect the authoritative replicated cooldown, including a previous manual click.
+ local cooldownEnd=tool:GetAttribute("CooldownEndTime")
+ if type(cooldownEnd)=="number"and Workspace:GetServerTimeNow()<cooldownEnd then return end
+ carry=readCarry()
+ if not carry or carry.IsCarrying or (ctx and not validCycle(ctx))then state.Stop();return end
+ local interval=.7
+ if GameplayBalance then
+  interval=math.max(interval,tonumber(GameplayBalance.BatClient and GameplayBalance.BatClient.CLIENT_COOLDOWN)or 0,tonumber(GameplayBalance.BatServer and GameplayBalance.BatServer.PLAYER_COOLDOWN)or 0)
+ end
+ state.NextSwingAt=now+interval
+ tool:Activate()
+ state.Count+=1
+ if state.Count==1 then
+  local record=ctx and ctx.record or records[uid]
+  log("ACTION","Frappes batte en cours : %s | Vol de %s",tostring(state.GearName),FusionModules.Helpers.DescribeEgg(record))
+ end
+end
 local function cleanupCycle(ctx)
 	if currentCycle ~= ctx then return end
+    FusionModules.BatCombat.Stop()
+    FusionModules.BatCombat.ApproachUid=nil
 	recordFlightResult(ctx, false)
 	if timingEnabled then
 		local now = os.clock()
@@ -3300,6 +3392,7 @@ local function worker(token)
 		if selected then
 			searchWaitForEgg = false
 			serverSearchState = automaticMode and "Oeuf eligible : collecte" or "OFF"
+            FusionModules.BatCombat.ApproachUid=not recovering and selected.Uid or nil
 			local exited, exitReason = measureAction("SORTIE_TAPIS", leaveTreadmill, token)
 			if not exited then stopAutomation("Sortie tapis : " .. tostring(exitReason)); return end
 			if not autoEnabled or generation ~= token then return end
@@ -3496,6 +3589,11 @@ local function initialize()
     end)
 	EggSaleRemote = remotes.PetSatchel.SellSelection
 	GameplayBalance = loadModule("Shared.Flags.GameplayBalance")
+    do
+     local ok,gears=pcall(function()return require(ReplicatedStorage.Data.Gears)end)
+     if ok and type(gears)=="table"then FusionModules.BatCombat.Directory=gears.Directory
+     else log("ERROR","Catalogue des battes indisponible : %s",tostring(gears))end
+    end
 	local resetWall = loadModule("Client.AreaEggResetWall")
 	connect(resetWall.Changed, function(sealed)
 		if sealed == true and not destroyed then
@@ -3859,6 +3957,18 @@ do
   FusionModules.RemoteHop.Try()
  end)
 end
+
+connect(RunService.Heartbeat,function()
+ if not FusionModules.BatCombat then return end
+ local ok,err=pcall(FusionModules.BatCombat.Step)
+ if not ok then
+  FusionModules.BatCombat.NextCheckAt=os.clock()+1
+  if FusionModules.BatCombat.LastError~=tostring(err)then
+   FusionModules.BatCombat.LastError=tostring(err)
+   log("ERROR","Batte automatique : %s",tostring(err))
+  end
+ end
+end)
 
 -- FOXIN reference logic: direct Workspace models, matching names, zero Velocity,
 -- MoveTo at the current root position, every 0.2 seconds. Always active.
