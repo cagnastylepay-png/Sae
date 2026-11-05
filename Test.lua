@@ -834,7 +834,33 @@ do
   report.Token=type(options.Token)=="string" and options.Token or nil
  end
  report.SessionId=HttpService:GenerateGUID(false)
- report.PolicyKnown=false;report.LogsAllowed=false
+ report.PolicyKnown=false;report.LogsAllowed=false;report.SettingsAllowed=false;report.SettingsDirty=true
+ report.SettingsRevision=0
+ function report.ScheduleSettings()
+  if report.SettingsScheduled or destroyed or not report.Ready or not report.LogIdentityReady or not report.SettingsAllowed or not report.Socket or not report.SettingsDirty then return end
+  report.SettingsScheduled=true
+  task.delay(.3,function()
+   report.SettingsScheduled=false
+   if destroyed or not report.Ready or not report.LogIdentityReady or not report.SettingsAllowed or not report.Socket or not report.SettingsDirty then return end
+   report.SettingsRevision+=1
+   local revision=report.SettingsRevision
+   local serial=report.Serial
+   local options=table.clone(FusionModules.Options)
+   report.SettingsDirty=false
+   report.SettingsPending=revision
+   local ok=pcall(function()report.Socket:Send(HttpService:JSONEncode({version=1,type="settings.snapshot",sessionId=report.SessionId,revision=revision,options=options}))end)
+   if not ok then report.SettingsDirty=true end
+   task.delay(5,function()
+    if destroyed or report.Serial~=serial or report.SettingsPending~=revision or not report.SettingsAllowed then return end
+    report.SettingsDirty=true
+    report.ScheduleSettings()
+   end)
+  end)
+ end
+ function report.MarkSettingsDirty()
+  report.SettingsDirty=true
+  report.ScheduleSettings()
+ end
  function report.ScheduleLogs()
   if report.LogScheduled or destroyed or not report.Ready or not report.LogIdentityReady or not report.PolicyKnown or not report.LogsAllowed or not report.Socket or #executorTools.RemoteLogQueue==0 then return end
   report.LogScheduled=true
@@ -854,7 +880,7 @@ do
   report.Serial+=1
   report.Ready=false
   report.LogIdentityReady=false
-  report.PolicyKnown=false;report.LogsAllowed=false
+  report.PolicyKnown=false;report.LogsAllowed=false;report.SettingsAllowed=false;report.SettingsDirty=true
   report.PendingRevision=nil
   for _,connection in ipairs(report.Connections) do pcall(function()connection:Disconnect()end) end
   table.clear(report.Connections)
@@ -1027,7 +1053,13 @@ do
      elseif message.type=="reporting.policy" then
       report.PolicyKnown=true
       report.LogsAllowed=message.sendLogs==true
+      if report.SettingsAllowed~= (message.sendSettings==true)then
+       report.SettingsAllowed=message.sendSettings==true
+       if report.SettingsAllowed then report.MarkSettingsDirty()end
+      end
       if not report.LogsAllowed then table.clear(executorTools.RemoteLogQueue)else report.ScheduleLogs()end
+     elseif message.type=="settings.ack" and message.sessionId==report.SessionId then
+      if report.SettingsPending==message.revision then report.SettingsPending=nil end
      elseif message.type=="logs.ack" and message.sessionId==report.SessionId then
       local upto=tonumber(message.sequence)
       if upto then
@@ -1036,7 +1068,7 @@ do
       report.ScheduleLogs()
      elseif message.type=="players.ack" then
       report.LastPlayersAck=os.clock()
-      if message.accepted then report.LogIdentityReady=true;report.ScheduleLogs()end
+      if message.accepted then report.LogIdentityReady=true;report.ScheduleLogs();report.ScheduleSettings()end
      elseif message.type=="error" then
       report.Log("Erreur serveur : %s",tostring(message.message))
      end
@@ -4223,6 +4255,7 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
   legacy.Parent=paramsPanel
   local repaint=FusionModules.Helpers.BuildParamsPanel(paramsPanel,connect,function()return FusionModules.Options end,FusionModules.Helpers.SetOption)
   FusionModules.OnOptionsChanged=function()
+   if FusionModules.Reporting and FusionModules.Reporting.MarkSettingsDirty then FusionModules.Reporting.MarkSettingsDirty()end
    wallMaintenancePending=true
    if ready then
     syncQueue()
