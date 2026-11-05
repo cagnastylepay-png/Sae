@@ -1,5 +1,5 @@
 -- Ovora observer: passive reporting and typed server relocation only.
-local O={Connections={},Enabled=true,Serial=0,Destroyed=false,Ready=false,IdentityReady=false,EggDirty=true,PlayerDirty=true,
+local O={Connections={},Destroyed=false,Ready=false,IdentityReady=false,EggDirty=true,PlayerDirty=true,
  EggRevision=0,PlayerRevision=0,NextConnect=0,Backoff=2,NextHop=0,Tried={}}
 local Players=game:GetService("Players")
 local Http=game:GetService("HttpService")
@@ -17,27 +17,9 @@ icon.Name="Status";icon.Size=UDim2.fromOffset(44,44);icon.Position=UDim2.new(1,-
 icon.BackgroundColor3=Color3.fromRGB(210,160,45);icon.Text="OV";icon.TextSize=17
 icon.TextColor3=Color3.new(1,1,1);icon.Font=Enum.Font.GothamBold;icon.Parent=gui
 local corner=Instance.new("UICorner");corner.CornerRadius=UDim.new(1,0);corner.Parent=icon
-local toggle=Instance.new("TextButton")
-toggle.Name="ObserverToggle";toggle.Size=UDim2.fromOffset(68,34);toggle.Position=UDim2.new(1,-132,0,65)
-toggle.Text="ON";toggle.TextSize=16;toggle.Font=Enum.Font.GothamBold
-toggle.TextColor3=Color3.new(1,1,1);toggle.BackgroundColor3=Color3.fromRGB(70,175,90);toggle.Parent=gui
-local toggleCorner=Instance.new("UICorner");toggleCorner.CornerRadius=UDim.new(0,8);toggleCorner.Parent=toggle
-local statusText=Instance.new("TextLabel")
-statusText.Name="ObserverStatus";statusText.Size=UDim2.fromOffset(250,54)
-statusText.Position=UDim2.new(1,-260,0,110);statusText.BackgroundTransparency=0.2
-statusText.BackgroundColor3=Color3.fromRGB(20,25,35);statusText.TextColor3=Color3.new(1,1,1)
-statusText.Font=Enum.Font.Gotham;statusText.TextSize=12;statusText.TextWrapped=true
-statusText.Text="Initialisation de l'observateur";statusText.Parent=gui
 gui.Parent=player:WaitForChild("PlayerGui")
 function O.Status(status,good)
  if O.Destroyed then return end
- statusText.Text=O.Enabled and tostring(status)or "Observateur OFF"
- toggle.Text=O.Enabled and "ON"or "OFF"
- toggle.BackgroundColor3=O.Enabled and Color3.fromRGB(70,175,90)or Color3.fromRGB(95,100,110)
- if not O.Enabled then
-  icon:SetAttribute("Status","Observateur OFF");icon.BackgroundColor3=Color3.fromRGB(95,100,110)
-  return
- end
  icon:SetAttribute("Status",status)
  icon.BackgroundColor3=good and Color3.fromRGB(70,175,90) or Color3.fromRGB(210,160,45)
 end
@@ -48,23 +30,11 @@ function O.Connect(signal,callback)
 end
 function O.Disconnect()
  O.Ready=false;O.IdentityReady=false;O.Connecting=false;O.EggAckRevision=nil;O.Relocation=nil
- O.Destination=nil;O.DestinationRequest=nil;O.DestinationRequestedAt=nil
  local socket=O.Socket;O.Socket=nil
  if socket then pcall(function()socket:Close()end)end
  O.NextConnect=os.clock()+O.Backoff;O.Backoff=math.min(60,O.Backoff*2)
  O.Status("Reconnexion",false)
 end
-function O.SetEnabled(enabled)
- if O.Destroyed or O.Enabled==enabled then return end
- O.Enabled=enabled;O.Serial=O.Serial+1
- O.Disconnect();O.PendingAt=nil
- O.PlayerDirty=true;O.EggDirty=true;O.ForcePlayers=true;O.ForceEggs=true
- if enabled then
-  O.NextConnect=0;O.NextHop=0;O.Backoff=2;O.Status("Connexion",false)
-  if O.Initialized then O.Refresh()end
- else O.Status("Observateur OFF",false)end
-end
-O.Connect(toggle.Activated,function()O.SetEnabled(not O.Enabled)end)
 function O.Destroy()
  if O.Destroyed then return end
  O.Destroyed=true
@@ -102,7 +72,7 @@ function O.Encode(message,key,rows)
  return Http:JSONEncode(message):sub(1,-2)..',"'..key..'":['..table.concat(encoded,",")..']}'
 end
 function O.Send(message,key,rows)
- if not O.Enabled or not O.Socket then return false end
+ if not O.Socket then return false end
  local success=pcall(function()
   O.Socket:Send(key and O.Encode(message,key,rows)or Http:JSONEncode(message))
  end)
@@ -170,14 +140,13 @@ function O.Eggs()
  return eggs
 end
 function O.Refresh()
- if not O.Enabled or O.Syncing then return end
- O.Phase="Synchronisation des oeufs"
+ if O.Syncing then return end
  local cycle=tostring(O.Cycle.ActivePeriodIndexAt(O.Clock.Now()))
  O.Syncing=true
  task.spawn(function()
   local success=pcall(O.EggState.SyncFieldEggs)
   O.Syncing=false;O.EggDirty=true;O.ForceEggs=true
-  if success then O.SnapshotCycle=cycle else O.NextSync=os.clock()+10;O.Status("Snapshot indisponible : nouvel essai dans 10 s",false)end
+  if success then O.SnapshotCycle=cycle else O.NextSync=os.clock()+10 end
  end)
 end
 local function markPlayers()O.PlayerDirty=true end
@@ -206,81 +175,68 @@ if O.Save and type(O.Save.Watch)=="function"then
  local signal=safe(O.Save.Watch,"SpeedPower");O.Connect(signal,markPlayers)
 end
 for _,name in ipairs({"FieldRefreshed","FieldShifted","FieldGone","RarityRevealed"})do O.Connect(O.EggState[name],markEggs)end
-function O.ShouldRelocate(serial)
+function O.ShouldRelocate()
  local message=O.Relocation
- if not O.Enabled or (serial~=nil and serial~=O.Serial)or not O.Ready or not O.IdentityReady or not message or not message.relocate
+ if not O.Ready or not O.IdentityReady or not message or not message.relocate
   or message.placeId~=tostring(game.PlaceId)or message.jobId~=game.JobId then return false end
  -- Never leave until Render has accepted the latest complete egg snapshot.
  return message.mode=="roam" and O.EggAckRevision==O.EggRevision and O.EggRevision>0
   and not O.EggDirty and not O.PlayerDirty and not O.Syncing
 end
-function O.AcceptDestination(message)
-     if message.requestId~=O.DestinationRequest then return end
-     O.DestinationRequest=nil;O.DestinationRequestedAt=nil
-     if message.placeId~=tostring(game.PlaceId)or message.jobId~=game.JobId or not O.ShouldRelocate()then return end
-     local target=message.target
-     if type(target)~="table"then
-      O.NextHop=os.clock()+math.clamp(tonumber(message.retryAfter)or 5,5,300)
-      O.Status(message.status and ("Recherche Render : "..tostring(message.status))or "Render poursuit la recherche (2 a 5 joueurs)",false)
-      return
-     end
-     if target.placeId~=tostring(game.PlaceId)or type(target.jobId)~="string"or target.jobId==game.JobId
-      or type(target.playing)~="number"or target.playing<2 or target.playing>5
-      or type(target.leaseId)~="string"or type(target.expiresAt)~="number"or type(message.serverTime)~="number"then return end
-     local remaining=(target.expiresAt-message.serverTime)/1000
-     if remaining<=0 or remaining>180 then return end
-     target.Deadline=os.clock()+remaining;O.Destination=target;O.NextHop=0
-end
-function O.RequestDestination()
- if O.DestinationRequest or not O.ShouldRelocate()or os.clock()<O.NextHop then return end
- local id=Http:GenerateGUID(false)
- O.DestinationRequest=id;O.DestinationRequestedAt=os.clock()
- O.Status("Render recherche un serveur de 2 a 5 joueurs",false)
- if not O.Send({version=1,type="observer.next",requestId=id})then O.DestinationRequest=nil end
-end
-function O.FailDestination(detail)
- local lease=O.CurrentLease
- O.CurrentLease=nil;O.Destination=nil;O.HopBusy=false
- O.NextHop=os.clock()+10
- if lease then O.Send({version=1,type="observer.result",leaseId=lease.leaseId,failed=true})end
- O.LastError=tostring(detail)
- O.Status("Teleportation refusee : "..O.LastError.."; autre serveur via Render",false)
-end
 function O.Relocate()
  if O.HopBusy or os.clock()<O.NextHop or not O.ShouldRelocate()then return end
- local destination=O.Destination
- if not destination then O.RequestDestination();return end
- if os.clock()>=destination.Deadline or O.Tried[destination.jobId]then O.Destination=nil;O.RequestDestination();return end
- for _,id in ipairs(O.Relocation.avoidJobIds or {})do
-  if id==destination.jobId then O.Destination=nil;O.Send({version=1,type="observer.result",leaseId=destination.leaseId,failed=true});O.NextHop=os.clock()+5;return end
- end
- local serial=O.Serial
- O.HopBusy=true;O.CurrentLease=destination
+ O.HopBusy=true;O.NextHop=os.clock()+30
  task.spawn(function()
-  local success,failure=pcall(function()
+  local success=pcall(function()
    local env=type(getgenv)=="function"and getgenv()or getfenv()
+   local requestFn=env.request or env.http_request or (env.syn and env.syn.request)
+   local avoid={[game.JobId]=true}
+   for _,id in ipairs(O.Relocation.avoidJobIds or {})do avoid[id]=true end
+   local candidates,cursor={},nil
+   for _=1,3 do
+    if not O.ShouldRelocate()then return end
+    local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100"
+    if cursor then url=url.."&cursor="..Http:UrlEncode(cursor)end
+    local body
+    if requestFn then
+     local response=requestFn({Url=url,Method="GET"})
+     if response.StatusCode~=200 then error("Liste serveurs indisponible")end
+     body=response.Body
+    else body=game:HttpGet(url)end
+    local data=Http:JSONDecode(body)
+    for _,server in ipairs(data.data or {})do
+     if type(server.id)=="string"and not avoid[server.id]and not O.Tried[server.id]
+      and type(server.playing)=="number"and type(server.maxPlayers)=="number"
+      and server.playing<=math.min(7,server.maxPlayers)-2 then
+      table.insert(candidates,{id=server.id,playing=server.playing,tie=math.random()})
+     end
+    end
+    cursor=data.nextPageCursor
+    if #candidates>0 or not cursor then break end
+   end
+   local destination=#candidates>0 and candidates[math.random(1,#candidates)]or nil
+   if not destination or not O.ShouldRelocate()then return end
    local queue=env.queue_on_teleport or env.queueonteleport or (env.syn and env.syn.queue_on_teleport)
-   if type(queue)~="function"then error("Rechargement automatique indisponible")end
+   if type(queue)~="function"then O.Status("Rechargement automatique indisponible",false);return end
    if not O.Queued then
     queue('loadstring(game:HttpGet("https://raw.githubusercontent.com/cagnastylepay-png/Sae/main/TestV2.lua"))()')
     O.Queued=true
    end
-   if not O.ShouldRelocate(serial)or O.Destination~=destination then O.HopBusy=false;return end
-   O.Tried[destination.jobId]=true;O.LastDestination=destination.jobId
-   O.Status("Teleportation Render : "..destination.playing.." joueurs observes",false)
-   Teleport:TeleportToPlaceInstance(game.PlaceId,destination.jobId,player)
-   task.wait(30)
-   if not O.Destroyed and serial==O.Serial and O.CurrentLease==destination then O.FailDestination("Connexion non terminee apres 30 s")end
+   if not O.ShouldRelocate()then return end
+   for _,id in ipairs(O.Relocation.avoidJobIds or {})do if id==destination.id then return end end
+   O.Tried[destination.id]=true;O.Status("Changement de serveur",false)
+   Teleport:TeleportToPlaceInstance(game.PlaceId,destination.id,player)
+   task.wait(25)
   end)
-  if not success and serial==O.Serial then O.FailDestination(failure)end
+  O.HopBusy=false
+  if not success then O.Status("Nouvelle tentative de serveur",false)end
  end)
 end
-O.Connect(Teleport.TeleportInitFailed,function(target,result,message)
- if target==player then O.FailDestination(tostring(result)..": "..tostring(message))end
+O.Connect(Teleport.TeleportInitFailed,function(target)
+ if target==player then O.HopBusy=false;O.NextHop=os.clock()+30 end
 end)
 function O.OpenSocket()
- if not O.Enabled or O.Connecting or O.Destroyed then return end
- local serial=O.Serial
+ if O.Connecting or O.Destroyed then return end
  O.Connecting=true;O.LastAck=os.clock()
  task.spawn(function()
   local success=pcall(function()
@@ -289,11 +245,11 @@ function O.OpenSocket()
    local connector=api and (api.connect or api.Connect)
    if type(connector)~="function"then error("WebSocket indisponible")end
    local socket=connector("wss://m4gix-ws.onrender.com/sae/ws")
-   if O.Destroyed or not O.Enabled or serial~=O.Serial then socket:Close();return end
+   if O.Destroyed then socket:Close();return end
    O.Socket=socket
    O.Connect(socket.OnClose,function()if O.Socket==socket then O.Disconnect()end end)
    O.Connect(socket.OnMessage,function(raw)
-    if O.Destroyed or not O.Enabled or serial~=O.Serial or O.Socket~=socket then return end
+    if O.Destroyed or O.Socket~=socket then return end
     local decoded,message=pcall(Http.JSONDecode,Http,raw)
     if not decoded or type(message)~="table"or message.version~=1 then return end
     if message.type=="hello.ack"then
@@ -305,29 +261,22 @@ function O.OpenSocket()
      if message.accepted==true and message.sessionId==O.Session and message.revision==O.EggRevision then
       O.EggAckRevision=message.revision;O.Status("Observation transmise",true)
      end
-    elseif message.type=="observer.destination"then
-     O.AcceptDestination(message)
     elseif message.type=="observer.relocate"then
      O.Relocation=message
-     if message.mode=="hold"then
-      O.Destination=nil;O.DestinationRequest=nil;O.DestinationRequestedAt=nil
-      O.Status("En attente du favori : maintien du serveur",true)
+     if message.mode=="hold"then O.Status("En attente du favori : maintien du serveur",true)
      elseif message.mode=="roam"then O.Status("Exploration des serveurs",true)end
     elseif message.type=="error"then O.Disconnect()
     end
    end)
-   O.Send({version=1,type="hello",role="reporter",reporterUserId=tostring(player.UserId),observerOnly=true,observerRouting="render"})
+   O.Send({version=1,type="hello",role="reporter",reporterUserId=tostring(player.UserId),observerOnly=true})
   end)
-  if serial~=O.Serial or O.Destroyed or not O.Enabled then return end
-  if not success then O.Disconnect();O.Status("Socket : "..tostring(failure):sub(1,140),false)end
+  if not success then O.Disconnect()end
  end)
 end
-O.Initialized=true
 O.Refresh()
-function O.Step()
- if not O.Enabled then return end
+task.spawn(function()
+ while not O.Destroyed do
   local now=os.clock()
-  O.Phase="Lecture du cycle"
   local cycle=tostring(O.Cycle.ActivePeriodIndexAt(O.Clock.Now()))
   if cycle~=O.CurrentCycle then O.CurrentCycle=cycle;O.Tried={};O.Refresh()end
   if not O.Syncing and O.SnapshotCycle~=cycle and now>=(O.NextSync or 0)then O.Refresh()end
@@ -336,7 +285,6 @@ function O.Step()
   if O.PendingAt and now-O.PendingAt>25 then O.PendingAt=nil;O.Disconnect()end
   if O.Ready and game.JobId~=""then
    if O.PlayerDirty and now-(O.LastPlayers or 0)>=1 then
-    O.Phase="Lecture des joueurs"
     local rows=O.Players();local fingerprint=Http:JSONEncode(rows)
     if O.ForcePlayers or fingerprint~=O.PlayerFingerprint then
      O.PlayerRevision=O.PlayerRevision+1
@@ -347,7 +295,6 @@ function O.Step()
     O.PlayerDirty=false;O.LastPlayers=now
    end
    if O.IdentityReady and O.SnapshotCycle==cycle and not O.Syncing and O.EggDirty and now-(O.LastEggs or 0)>=1 then
-    O.Phase="Lecture des oeufs"
     local rows=O.Eggs()
     if rows then
      local fingerprint=cycle..Http:JSONEncode(rows)
@@ -362,21 +309,7 @@ function O.Step()
     end
    end
   end
-  if O.DestinationRequestedAt and now-O.DestinationRequestedAt>20 then
-   O.DestinationRequest=nil;O.DestinationRequestedAt=nil;O.NextHop=now+5
-   O.Status("Attente de Render : nouvelle demande dans 5 s",false)
-  end
-  O.Phase="Destination fournie par Render"
   O.Relocate()
-end
-task.spawn(function()
- while not O.Destroyed do
-  local success,failure=xpcall(O.Step,debug.traceback)
-  if not success then
-   O.LastError=tostring(failure)
-   O.Status(tostring(O.Phase or "Observateur").." : "..tostring(failure):sub(1,140),false)
-   task.wait(2)
-  end
   task.wait(0.5)
  end
 end)
