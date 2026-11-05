@@ -2475,12 +2475,38 @@ function FusionModules.Helpers.PlotEggCountdown(record)
  if not ok or type(seconds)~="number" or seconds~=seconds or seconds==math.huge or seconds==-math.huge then return nil,false end
  return math.max(0,math.ceil(seconds)),grown==true
 end
+function FusionModules.Helpers.PlotEggListTime(record)
+ if type(record)~="table" or type(record.Uid)~="string" then return nil,false end
+ local pg=player:FindFirstChildOfClass("PlayerGui")
+ local gui=pg and pg:FindFirstChild("GrowingEggs")
+ local frame=gui and gui:FindFirstChild("Frame")
+ local list=frame and frame:FindFirstChild("ScrollingFrame")
+ local row=list and list:FindFirstChild(record.Uid)
+ local spacer=row and row:FindFirstChild("Spacer")
+ if not spacer then return nil,false end
+ local button=spacer:FindFirstChild("Open")
+ if button and button.Visible and button.Active then return 0,true end
+ local progress=spacer:FindFirstChild("Progress")
+ local label=progress and progress:FindFirstChild("TextLabel")
+ if not label then return nil,false end
+ local text=string.lower(label.Text)
+ if string.find(text,"ready",1,true) or string.find(text,"prêt",1,true) or string.find(text,"pret",1,true) then return 0,true end
+ local h=tonumber(string.match(text,"(%d+)%s*h"))
+ local m=tonumber(string.match(text,"(%d+)%s*m"))
+ local sec=tonumber(string.match(text,"(%d+)%s*s"))
+ if h or m or sec then return (h or 0)*3600+(m or 0)*60+(sec or 0),false end
+ return nil,false
+end
 function FusionModules.Helpers.PlotEggTimeText(record)
- local seconds,grown=FusionModules.Helpers.PlotEggCountdown(record)
- if grown then return "Pret a ouvrir",true end
- if not seconds then return "Temps indisponible",false end
- if seconds>=3600 then return string.format("%dh %02dm %02ds",math.floor(seconds/3600),math.floor(seconds/60)%60,seconds%60),false end
- return string.format("%dm %02ds",math.floor(seconds/60),seconds%60),false
+ local seconds,grown=FusionModules.Helpers.PlotEggListTime(record)
+ if seconds==nil then seconds,grown=FusionModules.Helpers.PlotEggCountdown(record)end
+ if grown then return "Prêt",true end
+ if not seconds then return "—",false end
+ local minutes=math.ceil(seconds/60)
+ if minutes<1 then return "<1m",false end
+ if seconds<60 then return "<1m",false end
+ if minutes>=60 then return string.format("%dh%02dm",math.floor(minutes/60),minutes%60),false end
+ return tostring(minutes).."m",false
 end
 function FusionModules.Helpers.OpenSelectedPlotEggs(selection)
  if hatchInProgress or inventoryPlacementBusy or placementRequest or FusionModules.Pending() or currentCycle or serverHopPending then
