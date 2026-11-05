@@ -73,7 +73,7 @@ local FusionModules = {}
 FusionModules.Helpers = {}
 FusionModules.Options={AutoEggs=true,AutoEggsMin=2e9,AutoEggsMax=999e9,
  AutoTreadmill=true,AutoSell=true,AutoSellMin=0,AutoSellMax=2e9,
- AutoFuse=true,AutoFuseMin=0,AutoFuseMax=1e33,AutoOpen=true,AutoOpenMin=0,AutoOpenMax=20e9,AutoPlace=true,AutoPlaceMin=2e9,AutoPlaceMax=1e33,AutoPapillon=true,AutoIndex=true}
+ AutoFuse=true,AutoFuseMin=0,AutoFuseMax=1e33,AutoOpen=true,AutoOpenMin=0,AutoOpenMax=20e9,AutoPlace=true,AutoPlaceMin=2e9,AutoPlaceMax=1e33,AutoPapillon=true,AutoIndex=true,QueueNearest=false}
 
 function FusionModules.Helpers.InIncomeRange(key,rate)
  return type(rate)=="number"and rate==rate and rate<math.huge
@@ -128,7 +128,7 @@ local refreshFlightLog
 local stopAfterFlight = false
 local queuedEggs = {}
 function FusionModules.Helpers.ShouldRun()
- for key,value in pairs(FusionModules.Options)do if type(value)=="boolean"and value then return true end end
+ for key,value in pairs(FusionModules.Options)do if key~="QueueNearest"and type(value)=="boolean"and value then return true end end
  return next(queuedEggs)~=nil
 end
 local removedFromAuto = {}
@@ -2123,17 +2123,26 @@ local function snapshot(snapshotData)
     if FusionModules.Reporting then FusionModules.Reporting.MarkDirty(.75) end
 end
 
+function FusionModules.Helpers.QueueDistance(record,position)
+ if not position or type(record)~="table" or typeof(record.BottomCFrame)~="CFrame" then return math.huge end
+ return distanceXZ(record.BottomCFrame.Position,position)
+end
+function FusionModules.Helpers.QueueBefore(a,b)
+ if FusionModules.Options.QueueNearest and a.Distance~=b.Distance then return a.Distance<b.Distance end
+ if a.Rate~=b.Rate then return a.Rate>b.Rate end
+ if a.Distance~=b.Distance then return a.Distance<b.Distance end
+ return a.Uid<b.Uid
+end
 local function queueOrder()
 	local result = {}
+    local _,_,root=getCharacterParts()
 	for uid, entry in pairs(queuedEggs) do
 		entry.Uid = uid
 		entry.Rate = getRatePerSecond(records[uid] or entry.Record) or entry.Rate or 0
+        entry.Distance=FusionModules.Helpers.QueueDistance(records[uid]or entry.Record,root and root.Position)
 		table.insert(result, entry)
 	end
-	table.sort(result, function(a, b)
-		if a.Rate ~= b.Rate then return a.Rate > b.Rate end
-		return a.Uid < b.Uid
-	end)
+	table.sort(result,FusionModules.Helpers.QueueBefore)
 	return result
 end
 
@@ -2275,6 +2284,7 @@ end
 
 local function selectBest()
 	local best, bestRate = nil, -math.huge
+    local bestPriority
 	local _, _, root = getCharacterParts()
 	for uid, entry in pairs(queuedEggs) do
 		local cached = records[uid] or entry.Record
@@ -2285,11 +2295,10 @@ local function selectBest()
 				local rate = getRatePerSecond(latest)
 				if rate == nil and FusionModules.Helpers.IsAlwaysEligibleRarity(latest) then rate = 0 end
 				if rate then
-					if rate > bestRate or (rate == bestRate and root and best
-						and distanceXZ(latest.BottomCFrame.Position, root.Position)
-						< distanceXZ(best.BottomCFrame.Position, root.Position)) then
-						best, bestRate = latest, rate
-					end
+					local priority={Uid=uid,Rate=rate,Distance=FusionModules.Helpers.QueueDistance(latest,root and root.Position)}
+                    if not bestPriority or FusionModules.Helpers.QueueBefore(priority,bestPriority)then
+                     best,bestRate,bestPriority=latest,rate,priority
+                    end
 				end
 			end
 		end
@@ -3778,7 +3787,10 @@ function FusionModules.Helpers.BuildParamsPanel(panel, connect, getOptions, setO
  local function refresh()
   local options=getOptions()
   for key,c in pairs(controls)do
-   if c.Toggle then c.Toggle.Text=options[key]and "ON"or "OFF";c.Toggle.BackgroundColor3=options[key]and Color3.fromRGB(102,210,65)or Color3.fromRGB(150,58,58)end
+   if c.Toggle then
+    c.Toggle.Text=key=="QueueNearest"and(options[key]and "Proche"or "Revenu")or(options[key]and "ON"or "OFF")
+    c.Toggle.BackgroundColor3=(key=="QueueNearest"or options[key])and Color3.fromRGB(102,210,65)or Color3.fromRGB(150,58,58)
+   end
    if c.Input then
     c.Input.Text=formatNumber(options[key]).."/s"
     local ceiling=math.max(100e9,options[c.Root.."Max"],1)
@@ -3788,7 +3800,7 @@ function FusionModules.Helpers.BuildParamsPanel(panel, connect, getOptions, setO
  end
  local order=0
  for _,spec in ipairs({
-  {"AutoEggs","AutoEggs",true},{"AutoIndex","AutoIndex — Manquants"},
+  {"AutoEggs","AutoEggs",true},{"QueueNearest","Tri de la file"},{"AutoIndex","AutoIndex — Manquants"},
   {"AutoTreadmill","AutoTreadmill"},{"AutoPapillon","AutoPapillon"},
   {"AutoSell","AutoSell",true},{"AutoFuse","AutoFuse",true},
   {"AutoOpen","AutoOpen",true},{"AutoPlace","AutoPlace",true}
