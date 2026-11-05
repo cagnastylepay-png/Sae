@@ -263,6 +263,8 @@ function O.OpenSocket()
      end
     elseif message.type=="observer.relocate"then
      O.Relocation=message
+     if message.mode=="hold"then O.Status("En attente du favori : maintien du serveur",true)
+     elseif message.mode=="roam"then O.Status("Exploration des serveurs",true)end
     elseif message.type=="error"then O.Disconnect()
     end
    end)
