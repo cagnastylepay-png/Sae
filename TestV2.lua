@@ -175,7 +175,6 @@ if O.Save and type(O.Save.Watch)=="function"then
  local signal=safe(O.Save.Watch,"SpeedPower");O.Connect(signal,markPlayers)
 end
 for _,name in ipairs({"FieldRefreshed","FieldShifted","FieldGone","RarityRevealed"})do O.Connect(O.EggState[name],markEggs)end
-O.Connect(O.EggState.ResetCountdown,function()O.Refresh()end)
 function O.ShouldRelocate()
  local message=O.Relocation
  if not message or not message.relocate or message.placeId~=tostring(game.PlaceId)or message.jobId~=game.JobId then return false end
@@ -227,6 +226,7 @@ function O.Relocate()
     O.Queued=true
    end
    if not O.ShouldRelocate()then return end
+   for _,id in ipairs(O.Relocation.avoidJobIds or {})do if id==destination.id then return end end
    O.Tried[destination.id]=true;O.Status("Changement de serveur",false)
    Teleport:TeleportToPlaceInstance(game.PlaceId,destination.id,player)
    task.wait(25)
