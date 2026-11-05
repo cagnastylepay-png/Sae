@@ -1105,7 +1105,7 @@ do
      report.NextConnect=os.clock()+report.Backoff
      report.Backoff=math.min(report.Backoff*2,60)
     end))
-    socket:Send(HttpService:JSONEncode({version=1,type="hello",role="reporter",reporterUserId=tostring(player.UserId),token=report.Token,allowExecution=FusionModules.Execution and FusionModules.Execution.Enabled==true,executionToken=FusionModules.Execution and FusionModules.Execution.Token}))
+    socket:Send(HttpService:JSONEncode({version=1,type="hello",role="reporter",reporterUserId=tostring(player.UserId),token=report.Token,allowExecution=FusionModules.Execution and FusionModules.Execution.Enabled==true}))
    end)
    if not bound then
     report.Log("Initialisation socket echouee : %s",tostring(err))
@@ -1283,9 +1283,8 @@ FusionModules.Execution={Enabled=false,Allowed=false,Active=nil,Cache={},Order={
 do
  local opts=shared.__OvoraExecution
  shared.__OvoraExecution=nil -- Consume the opt-in; each launch requires an explicit choice.
- if type(opts)=="table" and opts.Enabled==true and type(opts.Token)=="string" and #opts.Token>=24 then
+ if type(opts)=="table" and opts.Enabled==true then
   FusionModules.Execution.Enabled=true
-  FusionModules.Execution.Token=opts.Token
  end
 end
 function FusionModules.Execution.Serialize(value,seen,depth,budget)
