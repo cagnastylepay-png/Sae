@@ -2457,12 +2457,23 @@ local function hatchReadyEggsOnWallClose(token)
 end
 
 function FusionModules.Helpers.PlotEggCountdown(record)
- if type(record)~="table" or record.Placement==nil or not EggGrowthPolicy then return nil,false end
- local ok,grown=pcall(EggGrowthPolicy.IsReady,record,0)
- if ok and grown then return 0,true end
- local valid,seconds=pcall(EggGrowthPolicy.GetRemainingGrowthSeconds,record,0)
- if not valid or type(seconds)~="number" or seconds~=seconds or seconds==math.huge then return nil,false end
- return math.max(0,math.ceil(seconds)),false
+ if type(record)~="table" or record.Placement==nil or not EggRecords or not ServerClock then return nil,false end
+ local ok,seconds,grown=pcall(function()
+  -- Use the live owner record, like GrowingEggListController (Save.Decode lacks runtime growth fields).
+  local current=record
+  if type(record.Uid)=="string" then
+   local readOK,latest=pcall(EggState.ReadOwnedEgg,player.UserId,record.Uid)
+   if readOK and type(latest)=="table" and latest.Placement~=nil then current=latest end
+  end
+  if current.Placement.ReadyAt~=nil then return 0,true end
+  local now=ServerClock.Now()
+  local multiplier=current.GrowthSpeedMultiplier
+  local credit=EggRecords.CurrentNightCredit(current,now,multiplier)
+  if EggRecords.GrowthAlpha(current,now,multiplier,credit,player)>=1 then return 0,true end
+  return EggRecords.GrowthSecondsRemaining(current,now,multiplier,credit,player),false
+ end)
+ if not ok or type(seconds)~="number" or seconds~=seconds or seconds==math.huge or seconds==-math.huge then return nil,false end
+ return math.max(0,math.ceil(seconds)),grown==true
 end
 function FusionModules.Helpers.PlotEggTimeText(record)
  local seconds,grown=FusionModules.Helpers.PlotEggCountdown(record)
@@ -4486,7 +4497,14 @@ local launcherScale=mainCard:FindFirstChild("ResolutionScale")or Instance.new("U
 			card.holder.LayoutOrder = index
 			paintEggCard(card.visual, record)
             if not card.countdown then
-             card.countdown=card.visual.Weight:Clone()
+             card.countdown=Instance.new("TextLabel")
+             card.countdown.FontFace=card.visual.Weight.FontFace
+             card.countdown.TextStrokeColor3=Color3.new(0,0,0)
+             card.countdown.TextStrokeTransparency=0
+             card.countdown.ZIndex=card.visual.Weight.ZIndex+1
+             card.countdown.AutoLocalize=false
+             card.countdown.TextTruncate=Enum.TextTruncate.None
+             card.countdown.TextWrapped=false
              card.countdown.Name="OpenCountdown"
              card.countdown.Position=UDim2.fromScale(.05,.20)
              card.countdown.Size=UDim2.fromScale(.90,.15)
