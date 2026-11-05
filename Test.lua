@@ -227,7 +227,7 @@ local function log(stage, message, ...)
 	end
 	local line = string.format("[Auto_SAE][%04d][%.3f][%s][%s] %s",
 		sequence, os.clock(), stage, currentCycle and currentCycle.uid or "-", text)
- if ({ACTION=true,FLIGHT_RESULT=true,WALL_HATCH=true,WALL_EQUIP_BEST=true,FUSION=true,PLOT_PLACE=true,INVENTORY_SELL_REQUEST=true})[stage]
+ if ({SERVER_CHANGE=true,SESSION=true,EGG_TRACK=true,ACTION=true,FLIGHT_RESULT=true,WALL_HATCH=true,WALL_EQUIP_BEST=true,FUSION=true,PLOT_PLACE=true,INVENTORY_SELL_REQUEST=true})[stage]
   and not (FusionModules.Reporting and FusionModules.Reporting.PolicyKnown and not FusionModules.Reporting.LogsAllowed)then
 	executorTools.RemoteLogSequence+=1
  table.insert(executorTools.RemoteLogQueue,{sequence=executorTools.RemoteLogSequence,at=os.date("!%Y-%m-%dT%H:%M:%SZ"),text=line:sub(1,4000)})
@@ -836,7 +836,24 @@ do
  end
  report.SessionId=HttpService:GenerateGUID(false)
  function report.AutomationActive()
-  return autoEnabled and automaticMode and (FusionModules.Options.AutoEggs or FusionModules.Options.AutoIndex) and not queuePaused and not stopAfterFlight and not destroyed and not serverHopPending
+  return ready and automaticMode and (FusionModules.Options.AutoEggs or FusionModules.Options.AutoIndex) and not queuePaused and not stopAfterFlight and not destroyed and not serverHopPending
+ end
+ function report.AutomationReason()
+  if destroyed then return "Script arrete"end
+  if not ready then return "Chargement du jeu"end
+  if serverHopPending then return "Teleportation en cours"end
+  if not automaticMode then return "Mode AUTO OFF"end
+  if queuePaused then return "File en pause"end
+  if stopAfterFlight then return "Arret demande apres le vol"end
+  if not FusionModules.Options.AutoEggs and not FusionModules.Options.AutoIndex then return "AutoEggs et Manquants OFF"end
+  return autoEnabled and "Auto actif"or "Auto actif, worker en attente"
+ end
+ function report.FlushLogs()
+  if not report.Ready or not report.LogIdentityReady or not report.LogsAllowed or not report.Socket then return false end
+  local batch={}
+  for i=1,math.min(100,#executorTools.RemoteLogQueue)do batch[i]=executorTools.RemoteLogQueue[i]end
+  if #batch==0 then return true end
+  return pcall(function()report.Socket:Send(HttpService:JSONEncode({version=1,type="logs.append",sessionId=report.SessionId,lines=batch}))end)
  end
  function report.MissingCategories()
   local result={}
@@ -871,7 +888,7 @@ do
    local options=table.clone(FusionModules.Options)
    report.SettingsDirty=false
    report.SettingsPending=revision
-   local ok=pcall(function()report.Socket:Send(HttpService:JSONEncode({version=1,type="settings.snapshot",sessionId=report.SessionId,revision=revision,options=options,automationActive=report.AutomationActive(),visitedJobIds=report.VisitedJobs(),missingCategories=report.MissingCategories()}))end)
+   local ok=pcall(function()report.Socket:Send(HttpService:JSONEncode({version=1,type="settings.snapshot",sessionId=report.SessionId,revision=revision,options=options,automationActive=report.AutomationActive(),automationReason=report.AutomationReason(),visitedJobIds=report.VisitedJobs(),missingCategories=report.MissingCategories()}))end)
    if not ok then report.SettingsDirty=true end
    task.delay(5,function()
     if destroyed or report.Serial~=serial or report.SettingsPending~=revision or not report.SettingsAllowed then return end
@@ -1227,6 +1244,23 @@ do
 
  function report.Start()
   if not report.Enabled then return end
+  log("SERVER_CHANGE","Arrive sur le serveur %s",game.JobId)
+  task.spawn(function()
+   local ok,target=pcall(function()return game:GetService("TeleportService"):GetTeleportSetting("OvoraRemoteArrival")end)
+   if not ok or type(target)~="table"or target.jobId~=game.JobId then return end
+   pcall(function()game:GetService("TeleportService"):SetTeleportSetting("OvoraRemoteArrival",nil)end)
+   local description=string.format("%s [Poids=%s kg; Revenu=%s/s]",tostring(target.name or target.uid),type(target.weightKg)=="number"and formatNumber(target.weightKg)or "inconnu",type(target.incomePerSecond)=="number"and formatNumber(target.incomePerSecond)or "inconnu")
+   log("SERVER_CHANGE","Arrive depuis %s pour %s",tostring(target.fromJobId),description)
+   local synced=pcall(EggState.SyncFieldEggs)
+   if destroyed then return end
+   if not synced then log("SERVER_CHANGE","Verification de la cible impossible : snapshot indisponible pour %s",description);return end
+   local read,record=pcall(EggState.ReadFieldEgg,target.uid)
+   if not read then log("SERVER_CHANGE","Verification de la cible impossible pour %s",description)
+   elseif not record then log("EGG_TRACK","Oeuf disparu a l'arrivee : %s Serveur=%s",description,game.JobId)
+   elseif record.CarrierUserId or record.State=="Carried"or record.State=="Claimed"then log("EGG_TRACK","Oeuf indisponible a l'arrivee : %s Etat=%s",description,tostring(record.State))
+   else log("EGG_TRACK","Oeuf toujours disponible a l'arrivee : %s",description)end
+  end)
+
   task.spawn(function()
    local ok,projection=pcall(function()return require(ReplicatedStorage.Client.SpeedPowerProjection)end)
    if not destroyed and ok and type(projection)=="table" then
@@ -1253,6 +1287,8 @@ do
   task.spawn(function()
    while not destroyed and report.Enabled do
     local ok,err=pcall(function()
+     local state=tostring(report.AutomationActive())..":"..report.AutomationReason()
+     if state~=report.LastAutomationState then report.LastAutomationState=state;report.MarkSettingsDirty()end
      if report.Connecting and os.clock()-(report.ConnectingAt or 0)>65 then
       report.Serial+=1
       report.Connecting=false
@@ -3885,6 +3921,15 @@ end
 
 -- Render sends data-only destinations. Revalidate favorite status, Auto and income locally.
 FusionModules.RemoteHop={Pending=nil,Processing=false,RetryAt=0}
+function FusionModules.RemoteHop.Note(key,text,target)
+ local hop=FusionModules.RemoteHop
+ if hop.LastNote==key then return end
+ hop.LastNote=key
+ if target then
+  text=text..string.format(" : %s [Poids=%s kg; Revenu=%s/s] Serveur=%s",tostring(target.name or target.category or target.uid),type(target.weightKg)=="number"and formatNumber(target.weightKg)or "inconnu",type(target.incomePerSecond)=="number"and formatNumber(target.incomePerSecond)or "inconnu",tostring(target.jobId))
+ end
+ log("SERVER_CHANGE","%s",text)
+end
 function FusionModules.RemoteHop.Validate(target)
  local report=FusionModules.Reporting
  if destroyed or not ready or not report or not report.Ready or not report.TeleportAllowed or not report.SettingsAllowed or not report.AutomationActive() then return false end
@@ -3893,14 +3938,22 @@ function FusionModules.RemoteHop.Validate(target)
  if type(rate)~="number" or rate~=rate or rate<0 or rate>=math.huge then return false end
   local missing=FusionModules.Options.AutoIndex and report.MissingCategories()[target.category]==true
  if not missing and not (FusionModules.Options.AutoEggs and rate>=FusionModules.Options.AutoEggsMin and rate<=FusionModules.Options.AutoEggsMax)then return false end
- if visitedServers[target.jobId] or target.carrierUserId or target.state=="Carried" or target.observationOnly then return false end
+ if visitedServers[target.jobId] or target.carrierUserId or target.state=="Carried" or target.state=="Claimed" or target.observationOnly then return false end
  return true
 end
 function FusionModules.RemoteHop.Receive(message)
  local hop=FusionModules.RemoteHop
- if type(message)~="table" or not FusionModules.RemoteHop.Validate(message.target) then hop.Pending=nil;return end
+ if type(message)~="table"or not message.target then
+  if hop.Pending then hop.Note("cancel:"..tostring(hop.Pending.Id),"Cible annulee par Render (oeuf disparu, expire ou conditions modifiees)",hop.Pending.Target)end
+  hop.Pending=nil;return
+ end
+ if not FusionModules.RemoteHop.Validate(message.target)then
+  hop.Note("refused:"..tostring(message.requestId),"Demande refusee localement : "..FusionModules.Reporting.AutomationReason().." ; verifier seuil, index, serveur visite ou oeuf indisponible",message.target)
+  hop.Pending=nil;return
+ end
  local expiry,serverTime=message.target.expiresAt,message.serverTime
  if type(expiry)~="number" or type(serverTime)~="number" or expiry<=serverTime or expiry-serverTime>1200000 then hop.Pending=nil;return end
+ hop.Note("received:"..tostring(message.requestId),"Cible recue de Render",message.target)
  hop.Pending={Target=message.target,Deadline=os.clock()+(expiry-serverTime)/1000,Id=message.requestId}
  hop.Try()
 end
@@ -3908,12 +3961,18 @@ function FusionModules.RemoteHop.Try()
  local hop=FusionModules.RemoteHop
  if hop.Processing or serverHopPending or not hop.Pending or os.clock()<hop.RetryAt then return false end
  local request=hop.Pending
- if os.clock()>=request.Deadline or not hop.Validate(request.Target) then hop.Pending=nil;return false end
+ if os.clock()>=request.Deadline or not hop.Validate(request.Target)then
+  hop.Note("invalid:"..tostring(request.Id),os.clock()>=request.Deadline and "Cible expiree avant le depart"or "Conditions locales non remplies avant le depart",request.Target)
+  hop.Pending=nil;return false
+ end
  local immediate=request.Target.incomePerSecond>=FusionModules.Options.TeleportInstantMin
  if not immediate then
-  if next(queuedEggs)~=nil or currentCycle or inventoryPlacementBusy or placementRequest or hatchInProgress or FusionModules.Pending() or (inFlightRequest and not inFlightRequest.done) then return false end
+  if next(queuedEggs)~=nil or currentCycle or inventoryPlacementBusy or placementRequest or hatchInProgress or FusionModules.Pending() or (inFlightRequest and not inFlightRequest.done)then
+   hop.Note("waiting:"..tostring(request.Id),"Teleportation en attente : file locale ou action en cours",request.Target)
+   return false
+  end
   local carry=readCarry()
-  if not carry or carry.IsCarrying then return false end
+  if not carry or carry.IsCarrying then hop.Note("carrying:"..tostring(request.Id),"Teleportation en attente : oeuf porte ou etat du portage indisponible",request.Target);return false end
  end
  hop.Processing=true
  task.spawn(function()
@@ -3941,7 +4000,9 @@ function FusionModules.RemoteHop.Try()
    FusionModules.Reporting.MarkSettingsDirty()
    local description=string.format("%s [Poids=%s kg; Revenu=%s/s]",tostring(target.name or target.category or target.uid),(type(target.weightKg)=="number"and formatNumber(target.weightKg)or "inconnu"),formatNumber(target.incomePerSecond))
    setStatus("Teleportation vers "..description)
-   log("ACTION","Teleportation %s vers %s Serveur=%s",immediate and "immediate"or "file vide",description,target.jobId)
+   log("SERVER_CHANGE","Quitter le serveur %s -> %s pour %s Mode=%s",game.JobId,target.jobId,description,immediate and "immediat"or "file vide")
+   pcall(function()game:GetService("TeleportService"):SetTeleportSetting("OvoraRemoteArrival",{jobId=target.jobId,fromJobId=game.JobId,uid=target.uid,name=target.name,weightKg=target.weightKg,incomePerSecond=target.incomePerSecond})end)
+   FusionModules.Reporting.FlushLogs()
    local connection
    local resumed=false
    local function resume(detail)
@@ -3951,7 +4012,8 @@ function FusionModules.RemoteHop.Try()
     serverHopPending=false;hop.Processing=false;hop.RetryAt=os.clock()+30
     hop.Pending=nil
     autoActivity="IDLE"
-    log("ACTION","Teleportation echouee : %s",tostring(detail))
+    log("SERVER_CHANGE","Teleportation echouee vers %s pour %s : %s",target.jobId,description,tostring(detail))
+    pcall(function()game:GetService("TeleportService"):SetTeleportSetting("OvoraRemoteArrival",nil)end)
     if automaticMode and not queuePaused and not stopAfterFlight then wakeQueue()end
     FusionModules.Reporting.MarkSettingsDirty()
    end
