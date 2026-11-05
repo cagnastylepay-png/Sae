@@ -73,7 +73,7 @@ local FusionModules = {}
 FusionModules.Helpers = {}
 FusionModules.Options={AutoEggs=true,AutoEggsMin=2e9,AutoEggsMax=999e9,
  AutoTreadmill=true,AutoSell=true,AutoSellMin=0,AutoSellMax=2e9,
- AutoFuse=true,AutoFuseMin=0,AutoFuseMax=1e33,AutoOpen=true,AutoOpenMin=0,AutoOpenMax=20e9,AutoPlace=true,AutoPlaceMin=2e9,AutoPlaceMax=1e33,AutoPapillon=true,AutoIndex=true,QueueNearest=false,TeleportInstantMin=100e9}
+ AutoFuse=true,AutoFuseMin=0,AutoFuseMax=1e33,AutoOpen=true,AutoOpenMin=0,AutoOpenMax=20e9,AutoPlace=true,AutoPlaceMin=2e9,AutoPlaceMax=1e33,AutoPapillon=true,AutoIndex=true,QueueNearest=false,TeleportInstantMin=50e9}
 
 function FusionModules.Helpers.InIncomeRange(key,rate)
  return type(rate)=="number"and rate==rate and rate<math.huge
