@@ -1,10 +1,9 @@
--- Ovora observer: passive reporting and typed server relocation only.
+-- Ovora observer: passive reporting only; no automatic teleportation.
 local O={Connections={},Destroyed=false,Ready=false,IdentityReady=false,EggDirty=true,PlayerDirty=true,
- EggRevision=0,PlayerRevision=0,NextConnect=0,Backoff=2,NextHop=0,Tried={}}
+ EggRevision=0,PlayerRevision=0,NextConnect=0,Backoff=2}
 local Players=game:GetService("Players")
 local Http=game:GetService("HttpService")
 local RS=game:GetService("ReplicatedStorage")
-local Teleport=game:GetService("TeleportService")
 local player=Players.LocalPlayer
 if not player then return end
 if shared.__AutoSAEController and type(shared.__AutoSAEController.Destroy)=="function" then
@@ -29,7 +28,7 @@ function O.Connect(signal,callback)
  if ok then table.insert(O.Connections,connection)end
 end
 function O.Disconnect()
- O.Ready=false;O.IdentityReady=false;O.Connecting=false;O.EggAckRevision=nil;O.Relocation=nil
+ O.Ready=false;O.IdentityReady=false;O.Connecting=false;O.EggAckRevision=nil
  local socket=O.Socket;O.Socket=nil
  if socket then pcall(function()socket:Close()end)end
  O.NextConnect=os.clock()+O.Backoff;O.Backoff=math.min(60,O.Backoff*2)
@@ -175,75 +174,6 @@ if O.Save and type(O.Save.Watch)=="function"then
  local signal=safe(O.Save.Watch,"SpeedPower");O.Connect(signal,markPlayers)
 end
 for _,name in ipairs({"FieldRefreshed","FieldShifted","FieldGone","RarityRevealed"})do O.Connect(O.EggState[name],markEggs)end
-function O.ShouldRelocate()
- local message=O.Relocation
- if not O.Ready or not O.IdentityReady or not message or not message.relocate
-  or message.placeId~=tostring(game.PlaceId)or message.jobId~=game.JobId then return false end
- -- Wait 5 seconds after sending data, and require Render to accept the latest snapshot.
- return message.mode=="roam" and O.HopNotBefore~=nil and os.clock()>=O.HopNotBefore
-  and O.EggAckRevision==O.EggRevision and O.EggRevision>0
-  and not O.EggDirty and not O.PlayerDirty and not O.Syncing
-end
-function O.IsCandidateServer(server,avoid)
- if type(server)~="table"or type(server.id)~="string"or server.id==""or server.id==game.JobId
-  or avoid[server.id]or O.Tried[server.id]then return false end
- local count,capacity=server.playing,server.maxPlayers
- if type(count)~="number"or type(capacity)~="number"or count~=math.floor(count)
-  or count<1 or count>math.min(7,capacity)-2 then return false end
- if type(server.fps)=="number"and server.fps<=0 then return false end
- return true
-end
-function O.Relocate()
- if O.HopBusy or os.clock()<O.NextHop or not O.ShouldRelocate()then return end
- O.HopBusy=true;O.NextHop=os.clock()+30
- task.spawn(function()
-  local success=pcall(function()
-   local env=type(getgenv)=="function"and getgenv()or getfenv()
-   local requestFn=env.request or env.http_request or (env.syn and env.syn.request)
-   local avoid={[game.JobId]=true}
-   for _,id in ipairs(O.Relocation.avoidJobIds or {})do avoid[id]=true end
-   local candidates,cursor={},nil
-   for _=1,3 do
-    if not O.ShouldRelocate()then return end
-    local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
-    if cursor then url=url.."&cursor="..Http:UrlEncode(cursor)end
-    local body
-    if requestFn then
-     local response=requestFn({Url=url,Method="GET"})
-     if response.StatusCode~=200 then error("Liste serveurs indisponible")end
-     body=response.Body
-    else body=game:HttpGet(url)end
-    local data=Http:JSONDecode(body)
-    for _,server in ipairs(data.data or {})do
-     if O.IsCandidateServer(server,avoid)then
-      table.insert(candidates,{id=server.id,playing=server.playing,observedAt=os.clock()})
-     end
-    end
-    cursor=data.nextPageCursor
-    if #candidates>0 or not cursor then break end
-   end
-   local destination=#candidates>0 and candidates[math.random(1,#candidates)]or nil
-   if not destination or not O.ShouldRelocate()or os.clock()-destination.observedAt>15 then return end
-   local queue=env.queue_on_teleport or env.queueonteleport or (env.syn and env.syn.queue_on_teleport)
-   if type(queue)~="function"then O.Status("Rechargement automatique indisponible",false);return end
-   if not O.Queued then
-    queue('loadstring(game:HttpGet("https://raw.githubusercontent.com/cagnastylepay-png/Sae/main/TestV2.lua"))()')
-    O.Queued=true
-   end
-   if not O.ShouldRelocate()then return end
-   for _,id in ipairs(O.Relocation.avoidJobIds or {})do if id==destination.id then return end end
-   if os.clock()-destination.observedAt>15 then return end
-   O.Tried[destination.id]=true;O.Status("Changement de serveur",false)
-   Teleport:TeleportToPlaceInstance(game.PlaceId,destination.id,player)
-   task.wait(25)
-  end)
-  O.HopBusy=false
-  if not success then O.Status("Nouvelle tentative de serveur",false)end
- end)
-end
-O.Connect(Teleport.TeleportInitFailed,function(target)
- if target==player then O.HopBusy=false;O.NextHop=os.clock()+30 end
-end)
 function O.OpenSocket()
  if O.Connecting or O.Destroyed then return end
  O.Connecting=true;O.LastAck=os.clock()
@@ -270,10 +200,6 @@ function O.OpenSocket()
      if message.accepted==true and message.sessionId==O.Session and message.revision==O.EggRevision then
       O.EggAckRevision=message.revision;O.Status("Observation transmise",true)
      end
-    elseif message.type=="observer.relocate"then
-     O.Relocation=message
-     if message.mode=="hold"then O.Status("En attente du favori : maintien du serveur",true)
-     elseif message.mode=="roam"then O.Status("Exploration des serveurs",true)end
     elseif message.type=="error"then O.Disconnect()
     end
    end)
@@ -287,7 +213,7 @@ task.spawn(function()
  while not O.Destroyed do
   local now=os.clock()
   local cycle=tostring(O.Cycle.ActivePeriodIndexAt(O.Clock.Now()))
-  if cycle~=O.CurrentCycle then O.CurrentCycle=cycle;O.Tried={};O.Refresh()end
+  if cycle~=O.CurrentCycle then O.CurrentCycle=cycle;O.Refresh()end
   if not O.Syncing and O.SnapshotCycle~=cycle and now>=(O.NextSync or 0)then O.Refresh()end
   if not O.Socket and not O.Connecting and now>=O.NextConnect then O.OpenSocket()end
   if O.Connecting and now-O.LastAck>20 then O.Disconnect()end
@@ -313,7 +239,6 @@ task.spawn(function()
       message.cycleId=cycle;message.observedAt=os.date("!%Y-%m-%dT%H:%M:%SZ")
       message.cycleEndsAt=O.Cycle.NextNightTime(O.Clock.Now())
       if O.Send(message,"eggs",rows)then
-       O.HopNotBefore=os.clock()+5
        O.EggFingerprint=fingerprint;O.ForceEggs=false;O.PendingAt=O.PendingAt or now
       end
      end
@@ -321,7 +246,6 @@ task.spawn(function()
     end
    end
   end
-  O.Relocate()
   task.wait(0.5)
  end
 end)
