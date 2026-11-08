@@ -227,7 +227,8 @@ local function log(stage, message, ...)
 	end
 	local line = string.format("[Auto_SAE][%04d][%.3f][%s][%s] %s",
 		sequence, os.clock(), stage, currentCycle and currentCycle.uid or "-", text)
- if ({SERVER_CHANGE=true,SESSION=true,EGG_TRACK=true,ACTION=true,FLIGHT_RESULT=true,WALL_HATCH=true,WALL_EQUIP_BEST=true,FUSION=true,PLOT_PLACE=true,INVENTORY_SELL_REQUEST=true})[stage]
+ -- Render receives terminal flight results only; detailed diagnostics stay local.
+ if stage=="FLIGHT_RESULT"
   and not (FusionModules.Reporting and FusionModules.Reporting.PolicyKnown and not FusionModules.Reporting.LogsAllowed)then
 	executorTools.RemoteLogSequence+=1
  table.insert(executorTools.RemoteLogQueue,{sequence=executorTools.RemoteLogSequence,at=os.date("!%Y-%m-%dT%H:%M:%SZ"),text=line:sub(1,4000)})
